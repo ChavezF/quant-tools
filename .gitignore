@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Virtualenvs
+.venv/
+venv/
+.env
+.env.local
+
+# State and runtime data
+state/
+reports/
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
