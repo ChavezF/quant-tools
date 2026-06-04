@@ -24,56 +24,24 @@ Usage:
 """
 import argparse
 import json
-import os
 import sys
 from datetime import datetime, date
-from pathlib import Path
-import numpy as np
-import yfinance as yf
 
-SCRIPTS_DIR = Path("/home/chavez_f/.hermes/skills/openclaw-imports/public-dot-com/scripts")
-QUANT_DIR = Path("/home/chavez_f/.openclaw/workspace/quant-tools/scripts")
-sys.path.insert(0, str(SCRIPTS_DIR))
-sys.path.insert(0, str(QUANT_DIR))
-from config import get_api_secret, get_account_id
-
-from public_api_sdk import (
-    PublicApiClient, PublicApiClientConfiguration,
-    OrderInstrument, InstrumentType, OptionChainRequest, OptionExpirationsRequest,
+from common import (
+    STATE_DIR,
+    configure_public_imports,
+    get_public_client,
+    greeks_to_dict,
+    parse_osi_expiration,
 )
-from public_api_sdk.auth_config import ApiKeyAuthConfig
 
-STATE_DIR = Path("/home/chavez_f/.openclaw/workspace/quant-tools/state")
+configure_public_imports()
+
 STATE_FILE = STATE_DIR / "positions.json"
 
 
 def get_client():
-    secret = get_api_secret()
-    if not secret:
-        print("Error: PUBLIC_COM_SECRET missing.", file=sys.stderr)
-        sys.exit(1)
-    return PublicApiClient(
-        ApiKeyAuthConfig(api_secret_key=secret),
-        config=PublicApiClientConfiguration(default_account_number=get_account_id() or ""),
-    )
-
-
-def parse_osi_strike(osi: str) -> float:
-    try:
-        return int(osi[-8:]) / 1000.0
-    except (ValueError, IndexError):
-        return 0.0
-
-
-def parse_osi_expiration(osi: str) -> str:
-    """Extract YYYY-MM-DD from OSI symbol like AAPL260116C00270000"""
-    # Find the 6-digit date at the end of the underlying
-    for i in range(len(osi)):
-        if osi[i:].isdigit() and len(osi[i:]) >= 9:
-            if i + 6 < len(osi) and osi[i+6] in ('C', 'P'):
-                date_str = osi[i:i+6]
-                return f"20{date_str[:2]}-{date_str[2:4]}-{date_str[4:6]}"
-    return ""
+    return get_public_client()
 
 
 def load_state() -> dict:
@@ -118,13 +86,7 @@ def fetch_greeks(client, osi: str) -> dict:
         res = client.get_option_greeks(osi_symbols=[osi])
         if res and res.greeks:
             gv = res.greeks[0].greeks
-            return {
-                "delta": float(gv.delta) if gv.delta is not None else 0.0,
-                "gamma": float(gv.gamma) if gv.gamma is not None else 0.0,
-                "theta": float(gv.theta) if gv.theta is not None else 0.0,
-                "vega": float(gv.vega) if gv.vega is not None else 0.0,
-                "iv": float(gv.implied_volatility) if gv.implied_volatility is not None else 0.0,
-            }
+            return greeks_to_dict(gv)
     except Exception:
         pass
     return {"delta": 0, "gamma": 0, "theta": 0, "vega": 0, "iv": 0}

@@ -22,38 +22,21 @@ Usage:
 import argparse
 import json
 import sys
-from datetime import datetime, date, timedelta
-from pathlib import Path
+from datetime import datetime, timedelta
 import numpy as np
 import yfinance as yf
 
-SCRIPTS_DIR = Path("/home/chavez_f/.hermes/skills/openclaw-imports/public-dot-com/scripts")
-sys.path.insert(0, str(SCRIPTS_DIR))
-from config import get_api_secret, get_account_id
+from common import configure_public_imports, get_public_client, parse_osi_strike
+
+configure_public_imports()
 
 from public_api_sdk import (
-    PublicApiClient, PublicApiClientConfiguration,
     OrderInstrument, InstrumentType, OptionChainRequest, OptionExpirationsRequest,
 )
-from public_api_sdk.auth_config import ApiKeyAuthConfig
 
 
 def get_client():
-    secret = get_api_secret()
-    if not secret:
-        print("Error: PUBLIC_COM_SECRET missing.", file=sys.stderr)
-        sys.exit(1)
-    return PublicApiClient(
-        ApiKeyAuthConfig(api_secret_key=secret),
-        config=PublicApiClientConfiguration(default_account_number=get_account_id() or ""),
-    )
-
-
-def parse_osi_strike(osi: str) -> float:
-    try:
-        return int(osi[-8:]) / 1000.0
-    except (ValueError, IndexError):
-        return 0.0
+    return get_public_client()
 
 
 def get_current_iv(client, symbol: str, spot: float) -> float:
@@ -90,8 +73,8 @@ def get_current_iv(client, symbol: str, spot: float) -> float:
         if not calls or not puts:
             return 0.0
         # Find ATM call and put
-        atm_call = min(calls, key=lambda c: abs(parse_osi_strike(c.instrument.symbol) - spot), default=None)
-        atm_put = min(puts, key=lambda p: abs(parse_osi_strike(p.instrument.symbol) - spot), default=None)
+        atm_call = min(calls, key=lambda c: abs((parse_osi_strike(c.instrument.symbol) or 0.0) - spot), default=None)
+        atm_put = min(puts, key=lambda p: abs((parse_osi_strike(p.instrument.symbol) or 0.0) - spot), default=None)
         if not atm_call or not atm_put:
             return 0.0
         cb = float(atm_call.bid) if atm_call.bid else 0

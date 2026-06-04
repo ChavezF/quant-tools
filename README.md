@@ -21,8 +21,11 @@ quant-tools/
 
 All scripts **must** be run with `/usr/bin/python3.12` — the system `python3`
 is 3.14 and won't import `public_api_sdk`.
+`scripts/quant.py` uses the current interpreter by default; set `QUANT_PYTHON`
+when you need to force the production runtime:
 
 ```bash
+export QUANT_PYTHON=/usr/bin/python3.12
 cd /home/chavez_f/.openclaw/workspace/quant-tools/scripts
 /usr/bin/python3.12 quant.py macro --watchlist SPY QQQ NVDA AAPL MSFT TSLA
 /usr/bin/python3.12 quant.py scan --watchlist SPY QQQ NVDA --strategies csp bull_put --min-dte 21 --max-dte 45

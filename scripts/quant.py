@@ -17,12 +17,13 @@ Examples:
   ./quant.py all --watchlist SPY QQQ NVDA AAPL MSFT TSLA
 """
 import argparse
+import os
 import sys
 import subprocess
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
-PY = "/usr/bin/python3.12"
+PY = os.environ.get("QUANT_PYTHON", sys.executable)
 
 
 def run(script: str, *args: str) -> int:

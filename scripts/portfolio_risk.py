@@ -23,30 +23,16 @@ import argparse
 import json
 import sys
 from datetime import datetime
-from pathlib import Path
 import numpy as np
 import yfinance as yf
 
-SCRIPTS_DIR = Path("/home/chavez_f/.hermes/skills/openclaw-imports/public-dot-com/scripts")
-sys.path.insert(0, str(SCRIPTS_DIR))
-from config import get_api_secret, get_account_id
+from common import configure_public_imports, get_public_client, greeks_to_dict, underlying_from_position
 
-from public_api_sdk import (
-    PublicApiClient, PublicApiClientConfiguration,
-    OrderInstrument, InstrumentType,
-)
-from public_api_sdk.auth_config import ApiKeyAuthConfig
+configure_public_imports()
 
 
 def get_client():
-    secret = get_api_secret()
-    if not secret:
-        print("Error: PUBLIC_COM_SECRET missing.", file=sys.stderr)
-        sys.exit(1)
-    return PublicApiClient(
-        ApiKeyAuthConfig(api_secret_key=secret),
-        config=PublicApiClientConfiguration(default_account_number=get_account_id() or ""),
-    )
+    return get_public_client()
 
 
 def fetch_portfolio(client) -> dict:
@@ -80,17 +66,7 @@ def fetch_portfolio(client) -> dict:
 
 def fetch_underlying_for_position(pos: dict) -> str:
     """Extract underlying symbol from option OSI."""
-    if pos["type"] != "OPTION":
-        return pos["symbol"]
-    # OSI: SYMBOL + YYMMDD + C/P + 8-digit strike
-    sym = pos["symbol"]
-    # Find where the date starts (6 digits)
-    for i in range(len(sym)):
-        if sym[i:].isdigit() and len(sym[i:]) >= 9:
-            # Check if next char is C or P
-            if i + 6 < len(sym) and sym[i+6] in ('C', 'P'):
-                return sym[:i]
-    return sym
+    return underlying_from_position(pos)
 
 
 def fetch_osi_strike(osi: str) -> float:
@@ -109,13 +85,7 @@ def get_greeks_for_option(client, osi: str) -> dict:
         res = client.get_option_greeks(osi_symbols=[osi])
         if res and res.greeks:
             gv = res.greeks[0].greeks
-            return {
-                "delta": float(gv.delta) if gv.delta is not None else 0.0,
-                "gamma": float(gv.gamma) if gv.gamma is not None else 0.0,
-                "theta": float(gv.theta) if gv.theta is not None else 0.0,
-                "vega": float(gv.vega) if gv.vega is not None else 0.0,
-                "iv": float(gv.implied_volatility) if gv.implied_volatility is not None else 0.0,
-            }
+            return greeks_to_dict(gv)
     except Exception as e:
         pass
     return {"delta": 0, "gamma": 0, "theta": 0, "vega": 0, "iv": 0}
@@ -356,13 +326,7 @@ def main():
                     osi = g.symbol
                     gv = g.greeks
                     if osi in pos_lookup:
-                        pos_lookup[osi]["greeks"] = {
-                            "delta": float(gv.delta) if gv.delta is not None else 0.0,
-                            "gamma": float(gv.gamma) if gv.gamma is not None else 0.0,
-                            "theta": float(gv.theta) if gv.theta is not None else 0.0,
-                            "vega": float(gv.vega) if gv.vega is not None else 0.0,
-                            "iv": float(gv.implied_volatility) if gv.implied_volatility is not None else 0.0,
-                        }
+                        pos_lookup[osi]["greeks"] = greeks_to_dict(gv)
         except Exception as e:
             print(f"Greeks batch failed: {e}", file=sys.stderr)
 

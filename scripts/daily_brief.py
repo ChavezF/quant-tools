@@ -17,25 +17,13 @@ Usage:
   ./daily_brief.py --send --dry-run       # print what would be sent
 """
 import argparse
-import json
-import sys
 import subprocess
 from datetime import datetime
-from pathlib import Path
 import yfinance as yf
-import numpy as np
 
-SCRIPTS_DIR = Path("/home/chavez_f/.hermes/skills/openclaw-imports/public-dot-com/scripts")
-QUANT_DIR = Path("/home/chavez_f/.openclaw/workspace/quant-tools/scripts")
-sys.path.insert(0, str(SCRIPTS_DIR))
-sys.path.insert(0, str(QUANT_DIR))
-from config import get_api_secret, get_account_id
+from common import configure_public_imports
 
-from public_api_sdk import (
-    PublicApiClient, PublicApiClientConfiguration,
-    OrderInstrument, InstrumentType,
-)
-from public_api_sdk.auth_config import ApiKeyAuthConfig
+configure_public_imports()
 
 from options_screener import (
     get_client, fetch_quote, fetch_option_expirations,

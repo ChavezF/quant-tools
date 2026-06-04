@@ -19,22 +19,17 @@ Usage:
 """
 import argparse
 import json
-import os
 import sys
-import math
-import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
-SCRIPTS_DIR = Path("/home/chavez_f/.hermes/skills/openclaw-imports/public-dot-com/scripts")
-sys.path.insert(0, str(SCRIPTS_DIR))
-from config import get_api_secret, get_account_id
+from common import configure_public_imports, get_public_client, parse_osi_strike
+
+configure_public_imports()
 
 from public_api_sdk import (
-    PublicApiClient, PublicApiClientConfiguration,
     OrderInstrument, InstrumentType, OptionChainRequest,
 )
-from public_api_sdk.auth_config import ApiKeyAuthConfig
 
 import yfinance as yf
 import numpy as np
@@ -45,14 +40,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 def get_client():
-    secret = get_api_secret()
-    if not secret:
-        print("Error: PUBLIC_COM_SECRET missing.", file=sys.stderr)
-        sys.exit(1)
-    return PublicApiClient(
-        ApiKeyAuthConfig(api_secret_key=secret),
-        config=PublicApiClientConfiguration(default_account_number=get_account_id() or ""),
-    )
+    return get_public_client()
 
 
 def fetch_quote(client, symbol: str) -> dict:
@@ -83,13 +71,6 @@ def fetch_option_expirations(client, symbol: str) -> list[str]:
     except Exception as e:
         print(f"  ! expirations failed: {e}", file=sys.stderr)
     return []
-
-
-def parse_osi_strike(osi: str) -> float:
-    try:
-        return int(osi[-8:]) / 1000.0
-    except (ValueError, IndexError):
-        return None
 
 
 def fetch_chain_with_greeks(client, symbol: str, expiration: str, spot: float,
