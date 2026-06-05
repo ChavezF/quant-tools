@@ -108,6 +108,7 @@ def main():
     p_daily.add_argument("--profit-target-pct", type=float)
     p_daily.add_argument("--dte-warning", type=int)
     p_daily.add_argument("--top", type=int, default=10)
+    p_daily.add_argument("--skip-discovery", action="store_true")
     p_daily.add_argument("--skip-risk", action="store_true")
     p_daily.add_argument("--skip-brief", action="store_true")
     p_daily.add_argument("--skip-alerts", action="store_true")
@@ -125,6 +126,27 @@ def main():
     p_alerts.add_argument("--profit-target-pct", type=float, default=50.0)
     p_alerts.add_argument("--dte-warning", type=int, default=21)
     p_alerts.add_argument("--json", action="store_true")
+
+    p_discover = sub.add_parser("discover", help="Discover symbols worth scanning")
+    p_discover.add_argument("--symbols", nargs="+")
+    p_discover.add_argument("--watchlist-name", default="discovery")
+    p_discover.add_argument("--min-price", type=float)
+    p_discover.add_argument("--min-avg-volume", type=float)
+    p_discover.add_argument("--top", type=int)
+    p_discover.add_argument("--json", action="store_true")
+
+    p_tickets = sub.add_parser("tickets", help="Build execution tickets from an action plan")
+    p_tickets.add_argument("--plan", required=True)
+    p_tickets.add_argument("--approve-only", action="store_true")
+    p_tickets.add_argument("--json", action="store_true")
+
+    p_dashboard = sub.add_parser("dashboard", help="Generate static HTML dashboard from reports")
+    p_dashboard.add_argument("--report-dir")
+    p_dashboard.add_argument("--plan")
+    p_dashboard.add_argument("--alerts")
+    p_dashboard.add_argument("--tickets")
+    p_dashboard.add_argument("--manifest")
+    p_dashboard.add_argument("--output")
 
     p_earn = sub.add_parser("earnings", help="Earnings IV scanner")
     p_earn.add_argument("--watchlist", nargs="+", required=True)
@@ -236,6 +258,7 @@ def main():
     elif args.cmd == "plan":
         cmd = [
             "action_plan.py",
+            *(["--config", args.config] if args.config else []),
             "--candidates", args.candidates,
             "--account-nav", str(risk_value("account_nav")),
             "--max-trade-risk-pct", str(risk_value("max_trade_risk_pct")),
@@ -296,6 +319,7 @@ def main():
         if args.report_dir:
             cmd += ["--report-dir", args.report_dir]
         for flag_name, flag in [
+            ("skip_discovery", "--skip-discovery"),
             ("skip_risk", "--skip-risk"),
             ("skip_brief", "--skip-brief"),
             ("skip_alerts", "--skip-alerts"),
@@ -322,6 +346,46 @@ def main():
             cmd += ["--journal", resolve_project_path(journal)]
         if args.json:
             cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "discover":
+        cmd = ["opportunity_discovery.py"]
+        if args.config:
+            cmd += ["--config", args.config]
+        if args.symbols:
+            cmd += ["--symbols", *args.symbols]
+        if args.watchlist_name:
+            cmd += ["--watchlist-name", args.watchlist_name]
+        for attr, flag in [
+            ("min_price", "--min-price"),
+            ("min_avg_volume", "--min-avg-volume"),
+            ("top", "--top"),
+        ]:
+            value = getattr(args, attr)
+            if value is not None:
+                cmd += [flag, str(value)]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "tickets":
+        cmd = ["execution_tickets.py", "--plan", args.plan]
+        if args.approve_only:
+            cmd += ["--approve-only"]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "dashboard":
+        cmd = ["dashboard.py"]
+        for attr, flag in [
+            ("report_dir", "--report-dir"),
+            ("plan", "--plan"),
+            ("alerts", "--alerts"),
+            ("tickets", "--tickets"),
+            ("manifest", "--manifest"),
+            ("output", "--output"),
+        ]:
+            value = getattr(args, attr)
+            if value:
+                cmd += [flag, value]
         return run(*cmd)
     elif args.cmd == "earnings":
         return run("earnings_iv_scanner.py",

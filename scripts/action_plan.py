@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from candidate_scoring import score_results
+from correlation_risk import correlation_penalty
 from performance_profiles import build_profiles, lookup_profile, profile_note
 from pretrade_check import RiskLimits, evaluate_report
 from trade_journal import DEFAULT_STATE_FILE, journal_stats, load_state
+from toolkit_config import add_config_argument, load_config
 
 
 def strategy_stats_map(journal_state: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
@@ -44,6 +46,7 @@ def apply_performance_overlay(
     decision: dict[str, Any],
     stats_by_strategy: dict[str, dict[str, Any]],
     profiles: dict[str, Any] | None = None,
+    correlation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     out = dict(decision)
     strategy = str(out.get("strategy") or "").upper()
@@ -77,12 +80,18 @@ def apply_performance_overlay(
         adjusted = "APPROVE"
         multiplier = max(multiplier, 0.75)
 
+    if correlation and correlation.get("penalty", 0) > 0:
+        if adjusted == "APPROVE":
+            adjusted = "REDUCE"
+        multiplier = max(0.0, multiplier * (1 - float(correlation["penalty"])))
+
     out["action_decision"] = adjusted
     out["action_size_multiplier"] = multiplier
     out["performance_note"] = note
     out["profile_scope"] = profile_scope
     out["profile_signal"] = profile_signal
     out["profile_note"] = profile_note(profile_scope, profile)
+    out["correlation"] = correlation or {}
     return out
 
 
@@ -91,15 +100,21 @@ def build_action_plan(
     portfolio_report: dict[str, Any] | None,
     journal_state: dict[str, Any] | None,
     limits: RiskLimits,
+    correlation_groups: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     score_results(screener_report)
     risk_report = evaluate_report(screener_report, portfolio_report, limits)
     stats_by_strategy = strategy_stats_map(journal_state)
     profiles = build_profiles(journal_state.get("trades", [])) if journal_state else {}
-    actions = [
-        apply_performance_overlay(decision, stats_by_strategy, profiles)
-        for decision in risk_report.get("decisions", [])
-    ]
+    actions = []
+    for decision in risk_report.get("decisions", []):
+        corr = correlation_penalty(
+            str(decision.get("ticker") or ""),
+            portfolio_report,
+            correlation_groups or {},
+            limits.account_nav,
+        )
+        actions.append(apply_performance_overlay(decision, stats_by_strategy, profiles, corr))
 
     approved = [a for a in actions if a["action_decision"] == "APPROVE"]
     reduced = [a for a in actions if a["action_decision"] == "REDUCE"]
@@ -159,6 +174,7 @@ def print_action_plan(plan: dict[str, Any], top: int) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    add_config_argument(ap)
     ap.add_argument("--candidates", required=True, help="Path to options_screener JSON report")
     ap.add_argument("--portfolio", help="Optional path to portfolio_risk --json output")
     ap.add_argument("--journal", default=str(DEFAULT_STATE_FILE), help="Path to trade journal state")
@@ -172,6 +188,7 @@ def main() -> None:
     ap.add_argument("--min-pop-pct", type=float, default=RiskLimits.min_pop_pct)
     ap.add_argument("--top", type=int, default=10)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--correlation-groups", help="Optional JSON file containing correlation_groups")
     args = ap.parse_args()
 
     limits = RiskLimits(
@@ -188,8 +205,12 @@ def main() -> None:
     portfolio_report = json.loads(Path(args.portfolio).read_text()) if args.portfolio else None
     journal_path = Path(args.journal)
     journal_state = load_state(journal_path) if journal_path.exists() else None
+    cfg = load_config(args.config)
+    correlation_groups = cfg.get("correlation_groups", {})
+    if args.correlation_groups:
+        correlation_groups = json.loads(Path(args.correlation_groups).read_text())
 
-    plan = build_action_plan(screener_report, portfolio_report, journal_state, limits)
+    plan = build_action_plan(screener_report, portfolio_report, journal_state, limits, correlation_groups)
     if args.json:
         print(json.dumps(plan, indent=2, default=str))
         return

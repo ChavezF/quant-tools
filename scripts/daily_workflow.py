@@ -3,7 +3,7 @@
 daily_workflow.py - run the saved daily quant workflow.
 
 Pipeline:
-  scan -> risk -> plan -> brief
+  discovery -> scan -> risk -> plan -> alerts -> tickets -> dashboard -> brief
 
 Each run writes into reports/YYYYMMDD-HHMMSS/ so the morning process is
 repeatable and auditable.
@@ -88,6 +88,17 @@ def build_scan_cmd(cfg: dict[str, Any], args: argparse.Namespace, scan_report: P
     ]
 
 
+def build_discovery_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    disc_cfg = cfg.get("discovery", {})
+    return [
+        PY, str(SCRIPTS_DIR / "opportunity_discovery.py"),
+        *(["--config", args.config] if args.config else []),
+        "--watchlist-name", str(disc_cfg.get("watchlist_name", "discovery")),
+        "--top", str(disc_cfg.get("top", 20)),
+        "--json",
+    ]
+
+
 def build_risk_cmd(args: argparse.Namespace, watchlist: list[str] | None) -> list[str]:
     cmd = [PY, str(SCRIPTS_DIR / "portfolio_risk.py"), "--json"]
     if args.target_watchlist:
@@ -102,6 +113,7 @@ def build_plan_cmd(cfg: dict[str, Any], args: argparse.Namespace, scan_report: P
     journal = args.journal or cfg.get("journal", {}).get("path")
     cmd = [
         PY, str(SCRIPTS_DIR / "action_plan.py"),
+        *(["--config", args.config] if args.config else []),
         "--candidates", str(scan_report),
         "--account-nav", str(args.account_nav if args.account_nav is not None else risk_cfg["account_nav"]),
         "--max-trade-risk-pct", str(args.max_trade_risk_pct if args.max_trade_risk_pct is not None else risk_cfg["max_trade_risk_pct"]),
@@ -148,6 +160,14 @@ def build_alerts_cmd(cfg: dict[str, Any], args: argparse.Namespace, plan_report:
     return cmd
 
 
+def build_tickets_cmd(plan_report: Path) -> list[str]:
+    return [PY, str(SCRIPTS_DIR / "execution_tickets.py"), "--plan", str(plan_report), "--json"]
+
+
+def build_dashboard_cmd(run_dir: Path) -> list[str]:
+    return [PY, str(SCRIPTS_DIR / "dashboard.py"), "--report-dir", str(run_dir)]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     add_config_argument(ap)
@@ -175,6 +195,7 @@ def main() -> None:
     ap.add_argument("--profit-target-pct", type=float)
     ap.add_argument("--dte-warning", type=int)
     ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("--skip-discovery", action="store_true")
     ap.add_argument("--skip-risk", action="store_true")
     ap.add_argument("--skip-brief", action="store_true")
     ap.add_argument("--skip-alerts", action="store_true")
@@ -185,6 +206,7 @@ def main() -> None:
 
     cfg = load_config(args.config)
     run_dir = ensure_report_dir(args.report_dir)
+    discovery_report = run_dir / "discovery.json"
     scan_report = run_dir / "scan.json"
     risk_report = run_dir / "risk.json"
     plan_report = run_dir / "plan.json"
@@ -195,14 +217,23 @@ def main() -> None:
         "created_at": datetime.now().isoformat(),
         "run_dir": str(run_dir),
         "reports": {
+            "discovery": str(discovery_report) if not args.skip_discovery else None,
             "scan": str(scan_report),
             "risk": str(risk_report) if not args.skip_risk else None,
             "plan": str(plan_report),
             "brief": str(run_dir / "brief.out") if not args.skip_brief else None,
             "alerts": str(run_dir / "alerts.json") if not args.skip_alerts else None,
+            "tickets": str(run_dir / "tickets.json"),
+            "dashboard": str(run_dir / "dashboard.html"),
         },
         "steps": [],
     }
+
+    if not args.skip_discovery:
+        discovery_meta = run_command("discovery", build_discovery_cmd(cfg, args), run_dir, dry_run=args.dry_run)
+        manifest["steps"].append(discovery_meta)
+        if not args.dry_run and discovery_meta["returncode"] == 0:
+            discovery_report.write_text(Path(discovery_meta["stdout"]).read_text())
 
     scan_cmd = build_scan_cmd(cfg, args, scan_report)
     manifest["steps"].append(run_command("scan", scan_cmd, run_dir, dry_run=args.dry_run))
@@ -238,11 +269,27 @@ def main() -> None:
             if alerts_meta["returncode"] == 0:
                 alerts_report.write_text(Path(alerts_meta["stdout"]).read_text())
 
+    tickets_report = run_dir / "tickets.json"
+    if args.dry_run:
+        manifest["steps"].append(run_command("tickets", build_tickets_cmd(plan_report), run_dir, dry_run=True))
+    elif plan_report.exists():
+        tickets_meta = run_command("tickets", build_tickets_cmd(plan_report), run_dir, dry_run=False)
+        manifest["steps"].append(tickets_meta)
+        if tickets_meta["returncode"] == 0:
+            tickets_report.write_text(Path(tickets_meta["stdout"]).read_text())
+
     if not args.skip_brief:
         brief_cmd = build_brief_cmd(args, watchlist)
         manifest["steps"].append(run_command("brief", brief_cmd, run_dir, dry_run=args.dry_run))
 
-    write_json(manifest_path, manifest)
+    if args.dry_run:
+        manifest["steps"].append(run_command("dashboard", build_dashboard_cmd(run_dir), run_dir, dry_run=True))
+        write_json(manifest_path, manifest)
+    else:
+        write_json(manifest_path, manifest)
+        dashboard_meta = run_command("dashboard", build_dashboard_cmd(run_dir), run_dir, dry_run=False)
+        manifest["steps"].append(dashboard_meta)
+        write_json(manifest_path, manifest)
 
     print(f"\nDaily workflow report dir: {run_dir}")
     for name, path in manifest["reports"].items():

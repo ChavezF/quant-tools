@@ -14,6 +14,8 @@ if str(SCRIPTS) not in sys.path:
 from cache_utils import cached, read_cache
 from candidate_scoring import score_results
 from common import parse_osi_expiration, parse_osi_parts, parse_osi_strike
+from data_reliability import quote_is_stale, retry_call, utc_now_iso
+from correlation_risk import correlation_penalty
 from execution_quality import execution_quality
 from performance_profiles import build_profiles, lookup_profile
 from pretrade_check import RiskLimits, evaluate_report
@@ -22,6 +24,9 @@ from toolkit_config import deep_merge
 from trade_journal import add_trade, close_trade, default_state, journal_stats
 from action_plan import build_action_plan
 from alerts import build_alerts
+from dashboard import build_dashboard
+from execution_tickets import build_tickets
+from opportunity_discovery import score_discovery_metrics
 
 
 def sample_scan_report():
@@ -229,6 +234,76 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertIn("profit_target", kinds)
         self.assertIn("dte_warning", kinds)
 
+    def test_correlation_penalty_for_group_overlap(self):
+        portfolio = {"portfolio": {"positions": [{"symbol": "AAPL", "current_value": 12000}]}}
+        groups = {"mega_cap_tech": ["AAPL", "MSFT", "NVDA"]}
+        penalty = correlation_penalty("NVDA", portfolio, groups, account_nav=30000, warning_pct=0.25)
+        self.assertGreater(penalty["penalty"], 0)
+        self.assertEqual(penalty["dominant_group"], "mega_cap_tech")
+
+    def test_execution_ticket_builder(self):
+        plan = {
+            "actions": [
+                {
+                    "action_decision": "APPROVE",
+                    "ticker": "SPY",
+                    "strategy": "BULL_PUT",
+                    "action_size_multiplier": 1.0,
+                    "score": 72,
+                    "max_loss": 380,
+                    "capital_required": 380,
+                    "checks": [],
+                    "candidate": {
+                        "strategy": "BULL_PUT",
+                        "expiration": "2026-07-17",
+                        "dte": 43,
+                        "short_strike": 475,
+                        "long_strike": 470,
+                        "execution": {
+                            "suggested_limit_credit": 1.1,
+                            "do_not_chase_below": 1.0,
+                            "execution_grade": "B",
+                        },
+                    },
+                }
+            ]
+        }
+        tickets = build_tickets(plan)
+        self.assertEqual(len(tickets), 1)
+        self.assertEqual(tickets[0]["order_action"], "SELL_SPREAD_TO_OPEN")
+        self.assertEqual(tickets[0]["strikes"], "475/470")
+
+    def test_dashboard_renders_core_sections(self):
+        plan = {
+            "summary": {"approve": 1, "reduce": 0, "reject": 0},
+            "actions": [
+                {
+                    "action_decision": "APPROVE",
+                    "ticker": "SPY",
+                    "strategy": "BULL_PUT",
+                    "score": 72,
+                    "action_size_multiplier": 1.0,
+                    "profile_signal": "NORMAL",
+                    "correlation": {"note": "ok"},
+                    "candidate": {
+                        "execution": {
+                            "suggested_limit_credit": 1.1,
+                            "do_not_chase_below": 1.0,
+                            "execution_grade": "B",
+                        }
+                    },
+                }
+            ],
+        }
+        alerts = {"summary": {"high": 1}, "alerts": [{"priority": "HIGH", "kind": "candidate", "title": "SPY", "detail": "Approved"}]}
+        tickets = {"tickets": [{"decision": "APPROVE", "ticker": "SPY", "strategy": "BULL_PUT", "expiration": "2026-07-17"}]}
+        manifest = {"created_at": "2026-06-05T12:00:00", "reports": {"plan": "plan.json"}}
+        html = build_dashboard(plan=plan, alerts=alerts, tickets=tickets, manifest=manifest, base=Path("."))
+        self.assertIn("Quant Tools Dashboard", html)
+        self.assertIn("Action Plan", html)
+        self.assertIn("Execution Tickets", html)
+        self.assertIn("SPY", html)
+
     def test_config_deep_merge(self):
         merged = deep_merge({"a": {"b": 1, "c": 2}, "x": 3}, {"a": {"b": 9}})
         self.assertEqual(merged["a"]["b"], 9)
@@ -256,6 +331,39 @@ class CoreWorkflowTests(unittest.TestCase):
                 self.assertEqual(read_cache("unit", "SPY", ttl_seconds=60), {"value": 42})
             finally:
                 cache_utils.CACHE_DIR = original
+
+    def test_retry_call_and_staleness(self):
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("temporary")
+            return "ok"
+
+        value, meta = retry_call(flaky, source="unit", retries=1, base_delay=0, jitter=0)
+        self.assertEqual(value, "ok")
+        self.assertTrue(meta.ok)
+        self.assertEqual(meta.attempts, 2)
+        self.assertFalse(quote_is_stale(utc_now_iso(), max_age_seconds=60))
+        self.assertTrue(quote_is_stale(None, max_age_seconds=60))
+
+    def test_discovery_scoring_prefers_liquid_clean_setups(self):
+        strong = score_discovery_metrics({
+            "price": 120,
+            "avg_volume": 8_000_000,
+            "rv_21d_pct": 35,
+            "trend_3m_pct": 8,
+            "days_to_earnings": 30,
+        })
+        weak = score_discovery_metrics({
+            "price": 10,
+            "avg_volume": 100_000,
+            "rv_21d_pct": 5,
+            "trend_3m_pct": -40,
+            "days_to_earnings": 2,
+        })
+        self.assertGreater(strong["discovery_score"], weak["discovery_score"])
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
 {
   "watchlists": {
     "core": ["SPY", "QQQ", "NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "META", "AMD"],
-    "earnings": ["NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "META", "GOOGL"]
+    "earnings": ["NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "META", "GOOGL"],
+    "discovery": ["SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "AMD", "TSLA", "AMZN", "META", "GOOGL", "NFLX", "XOM", "CVX", "JPM", "GS", "BAC", "HD", "WMT", "PFE", "JNJ", "KO", "MCD", "SBUX"]
   },
   "scan": {
     "strategies": ["csp", "cc", "bull_put"],
@@ -33,5 +34,22 @@
     "min_score": 68,
     "profit_target_pct": 50,
     "dte_warning": 21
+  },
+  "data_reliability": {
+    "retries": 2,
+    "base_delay_seconds": 0.25,
+    "quote_max_age_seconds": 900
+  },
+  "discovery": {
+    "watchlist_name": "discovery",
+    "min_price": 20,
+    "min_avg_volume": 2000000,
+    "top": 20
+  },
+  "correlation_groups": {
+    "index_beta": ["SPY", "QQQ", "IWM", "DIA"],
+    "mega_cap_tech": ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "NFLX"],
+    "energy": ["XOM", "CVX"],
+    "banks": ["JPM", "GS", "BAC"]
   }
 }

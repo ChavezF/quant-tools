@@ -35,6 +35,8 @@ cd /home/chavez_f/code/quant-tools/scripts
 /usr/bin/python3.12 quant.py journal profiles --section ticker_strategy
 /usr/bin/python3.12 quant.py plan --candidates reports/scan.json --portfolio reports/risk.json --journal state/trades.json --account-nav 30000
 /usr/bin/python3.12 quant.py alerts --plan reports/plan.json --journal state/trades.json
+/usr/bin/python3.12 quant.py tickets --plan reports/plan.json
+/usr/bin/python3.12 quant.py dashboard --report-dir reports/latest
 /usr/bin/python3.12 quant.py iv-rank --tickers SPY QQQ NVDA AAPL MSFT TSLA AMD
 /usr/bin/python3.12 quant.py brief --watchlist SPY QQQ NVDA AAPL MSFT TSLA
 ```
@@ -58,8 +60,10 @@ loads `config.json` automatically when present, or you can pass a specific file:
 
 ```bash
 /usr/bin/python3.12 quant.py --config config.example.json scan --ranked
+/usr/bin/python3.12 quant.py --config config.example.json discover --top 20
 /usr/bin/python3.12 quant.py --config config.example.json plan --candidates reports/scan.json --portfolio reports/risk.json
 /usr/bin/python3.12 quant.py --config config.example.json daily --dry-run
+/usr/bin/python3.12 quant.py --config config.example.json dashboard --report-dir reports/latest
 ```
 
 ## Project vs skill — what's where

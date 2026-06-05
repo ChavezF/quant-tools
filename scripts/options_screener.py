@@ -26,6 +26,7 @@ from pathlib import Path
 from cache_utils import cached
 from common import configure_public_imports, get_public_client, parse_osi_strike
 from candidate_scoring import score_results
+from data_reliability import quote_is_stale, retry_call, utc_now_iso
 from scan_optimizer import parse_wing_widths, select_expirations
 from toolkit_config import add_config_argument, load_config
 
@@ -47,8 +48,17 @@ def get_client():
     return get_public_client()
 
 
-def fetch_quote(client, symbol: str) -> dict:
-    try:
+def reliability_kwargs(cfg: dict) -> dict:
+    return {
+        "retries": int(cfg.get("retries", 2)),
+        "base_delay": float(cfg.get("base_delay_seconds", 0.25)),
+    }
+
+
+def fetch_quote(client, symbol: str, reliability_cfg: dict | None = None) -> dict:
+    reliability_cfg = reliability_cfg or {}
+
+    def _call():
         res = client.get_quotes(instruments=[{"symbol": symbol, "type": "EQUITY"}])
         if res:
             q = res[0]
@@ -58,38 +68,57 @@ def fetch_quote(client, symbol: str) -> dict:
                 "ask": float(q.ask) if q.ask else None,
                 "prev_close": float(q.previous_close) if hasattr(q, 'previous_close') and q.previous_close else None,
                 "volume": int(q.volume) if hasattr(q, 'volume') and q.volume else 0,
+                "as_of": utc_now_iso(),
             }
-    except Exception as e:
-        print(f"  ! quote failed: {e}", file=sys.stderr)
-    return {}
+        return {}
+
+    value, meta = retry_call(_call, source=f"public.quote.{symbol}", **reliability_kwargs(reliability_cfg))
+    if not meta.ok:
+        print(f"  ! quote failed: {meta.error}", file=sys.stderr)
+    quote = value or {}
+    quote["_meta"] = meta.to_dict()
+    max_age = int(reliability_cfg.get("quote_max_age_seconds", 900))
+    quote["stale"] = quote_is_stale(quote.get("as_of"), max_age)
+    return quote
 
 
-def fetch_option_expirations(client, symbol: str) -> list[str]:
+def fetch_option_expirations(client, symbol: str, reliability_cfg: dict | None = None) -> list[str]:
     """Use the dedicated expirations endpoint. Returns list of YYYY-MM-DD strings."""
     from public_api_sdk import OptionExpirationsRequest
-    try:
+
+    reliability_cfg = reliability_cfg or {}
+
+    def _call():
         req = OptionExpirationsRequest(instrument=OrderInstrument(symbol=symbol, type=InstrumentType.EQUITY))
         res = client.get_option_expirations(req)
         if res and hasattr(res, 'expirations') and res.expirations:
             return [str(e) for e in res.expirations if e]
-    except Exception as e:
-        print(f"  ! expirations failed: {e}", file=sys.stderr)
-    return []
+        return []
+
+    value, meta = retry_call(_call, source=f"public.expirations.{symbol}", **reliability_kwargs(reliability_cfg))
+    if not meta.ok:
+        print(f"  ! expirations failed: {meta.error}", file=sys.stderr)
+    return value or []
 
 
 def fetch_chain_with_greeks(client, symbol: str, expiration: str, spot: float,
-                            max_legs: int = 50) -> dict:
+                            max_legs: int = 50, reliability_cfg: dict | None = None) -> dict:
     """
     Pull the chain and selectively fetch Greeks for strikes within
     ±10% of spot. Returns dict {'calls': {strike: {...}}, 'puts': {...}}.
     """
-    try:
+    reliability_cfg = reliability_cfg or {}
+
+    def _chain_call():
         ch = client.get_option_chain(OptionChainRequest(
             instrument=OrderInstrument(symbol=symbol, type=InstrumentType.EQUITY),
             expiration_date=expiration,
         ))
-    except Exception as e:
-        print(f"  ! chain failed: {e}", file=sys.stderr)
+        return ch
+
+    ch, meta = retry_call(_chain_call, source=f"public.chain.{symbol}.{expiration}", **reliability_kwargs(reliability_cfg))
+    if not meta.ok or ch is None:
+        print(f"  ! chain failed: {meta.error}", file=sys.stderr)
         return {"calls": {}, "puts": {}}
 
     calls = ch.calls or []
@@ -121,7 +150,13 @@ def fetch_chain_with_greeks(client, symbol: str, expiration: str, spot: float,
         # Cap to avoid massive requests
         atm_osis = atm_osis[:max_legs * 2]
         try:
-            greeks_res = client.get_option_greeks(osi_symbols=atm_osis)
+            greeks_res, greeks_meta = retry_call(
+                lambda: client.get_option_greeks(osi_symbols=atm_osis),
+                source=f"public.greeks.{symbol}.{expiration}",
+                **reliability_kwargs(reliability_cfg),
+            )
+            if not greeks_meta.ok:
+                print(f"  ! greeks batch failed (will proceed without): {greeks_meta.error}", file=sys.stderr)
             if greeks_res and hasattr(greeks_res, 'greeks') and greeks_res.greeks:
                 for g in greeks_res.greeks:
                     osi = getattr(g, 'symbol', None)
@@ -408,6 +443,7 @@ def main():
     cfg = load_config(args.config)
     scan_cfg = cfg.get("scan", {})
     cache_cfg = cfg.get("cache", {})
+    reliability_cfg = cfg.get("data_reliability", {})
     metrics_ttl = 0 if args.no_cache or not cache_cfg.get("enabled", True) else int(cache_cfg.get("underlying_metrics_ttl_seconds", 900))
     max_expirations = args.max_expirations if args.max_expirations is not None else int(scan_cfg.get("max_expirations", 1))
     wing_widths = parse_wing_widths(args.wing_widths or scan_cfg.get("wing_widths", [5.0]))
@@ -422,7 +458,7 @@ def main():
     for symbol in args.watchlist:
         symbol = symbol.upper()
         print(f"\n--- {symbol} ---", file=sys.stderr)
-        quote = fetch_quote(client, symbol)
+        quote = fetch_quote(client, symbol, reliability_cfg=reliability_cfg)
         spot = quote.get("last") or quote.get("bid")
         if not spot:
             metrics = fetch_underlying_metrics(symbol, ttl_seconds=metrics_ttl)
@@ -438,7 +474,7 @@ def main():
               f"earnings={metrics.get('earnings', {}).get('next', 'n/a')}",
               file=sys.stderr)
 
-        expirations = fetch_option_expirations(client, symbol)
+        expirations = fetch_option_expirations(client, symbol, reliability_cfg=reliability_cfg)
         if not expirations:
             continue
         selected_expirations = select_expirations(expirations, args.min_dte, args.max_dte, max_expirations)
@@ -453,11 +489,15 @@ def main():
             "expiration": selected_expirations[0][0],
             "dte": selected_expirations[0][1],
             "expirations_scanned": [{"expiration": exp, "dte": dte} for exp, dte in selected_expirations],
+            "data_quality": {
+                "quote": quote.get("_meta", {}),
+                "quote_stale": quote.get("stale", True),
+            },
             "strategies": {},
         }
         aggregated = {strat: [] for strat in args.strategies}
         for exp, dte in selected_expirations:
-            chain = fetch_chain_with_greeks(client, symbol, exp, spot)
+            chain = fetch_chain_with_greeks(client, symbol, exp, spot, reliability_cfg=reliability_cfg)
             if not chain["calls"] and not chain["puts"]:
                 print(f"  ! empty chain for {exp}", file=sys.stderr)
                 continue

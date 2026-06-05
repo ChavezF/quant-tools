@@ -15,6 +15,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "watchlists": {
         "core": ["SPY", "QQQ", "NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "META", "AMD"],
         "earnings": ["NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "META", "GOOGL"],
+        "discovery": ["SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "AMD", "TSLA", "AMZN", "META"],
     },
     "scan": {
         "strategies": ["csp", "cc"],
@@ -46,6 +47,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "min_score": 68.0,
         "profit_target_pct": 50.0,
         "dte_warning": 21,
+    },
+    "data_reliability": {
+        "retries": 2,
+        "base_delay_seconds": 0.25,
+        "quote_max_age_seconds": 900,
+    },
+    "discovery": {
+        "watchlist_name": "discovery",
+        "min_price": 20.0,
+        "min_avg_volume": 2_000_000,
+        "top": 20,
+    },
+    "correlation_groups": {
+        "index_beta": ["SPY", "QQQ", "IWM", "DIA"],
+        "mega_cap_tech": ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "NFLX"],
+        "energy": ["XOM", "CVX"],
+        "banks": ["JPM", "GS", "BAC"],
     },
 }
 
