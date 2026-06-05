@@ -26,7 +26,7 @@ when you need to force the production runtime:
 
 ```bash
 export QUANT_PYTHON=/usr/bin/python3.12
-cd /home/chavez_f/.openclaw/workspace/quant-tools/scripts
+cd /home/chavez_f/code/quant-tools/scripts
 /usr/bin/python3.12 quant.py macro --watchlist SPY QQQ NVDA AAPL MSFT TSLA
 /usr/bin/python3.12 quant.py scan --watchlist SPY QQQ NVDA --strategies csp bull_put --min-dte 21 --max-dte 45
 /usr/bin/python3.12 quant.py scan --watchlist SPY QQQ NVDA --strategies csp bull_put --ranked
@@ -80,8 +80,9 @@ runtime state.
 `hermes cron` job `f834cc501dbf` ("morning-market-brief") calls
 `~/.hermes/scripts/cron_brief.py` → `scripts/daily_brief.py --send` every
 weekday 8:30 AM ET. Mode: `--no-agent` (pure script, no LLM). Workdir is this
-project root. **DST-naive** — schedule is `30 12 * * 1-5` UTC in summer, needs
-to be bumped to `30 13 * * 1-5` in November.
+project root. **Schedule is local time** — `30 8 * * 1-5` in the system tz
+(America/New_York). DST just works (8:30 AM stays 8:30 AM through EST↔EDT).
+Do not bump in November.
 
 ## Safety
 

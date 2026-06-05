@@ -47,6 +47,8 @@ def main():
     p_scan.add_argument("--min-oi", type=int)
     p_scan.add_argument("--no-cache", action="store_true")
     p_scan.add_argument("--ranked", action="store_true")
+    p_scan.add_argument("--json", action="store_true", help="Emit screener output as JSON (pipe into pretrade/plan)")
+    p_scan.add_argument("--report", help="Path to write the screener JSON report")
 
     p_risk = sub.add_parser("risk", help="Portfolio risk")
     p_risk.add_argument("--target-watchlist", nargs="+")
@@ -159,7 +161,9 @@ def main():
                    "--target-delta", str(target_delta),
                    "--min-oi", str(min_oi),
                    *(["--no-cache"] if args.no_cache else []),
-                   *(["--ranked"] if args.ranked else []))
+                   *(["--ranked"] if args.ranked else []),
+                   *(["--json"] if args.json else []),
+                   *(["--report", args.report] if args.report else []))
     elif args.cmd == "risk":
         cmd = ["portfolio_risk.py"]
         if args.target_watchlist:
