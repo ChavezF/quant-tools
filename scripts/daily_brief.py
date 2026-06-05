@@ -19,6 +19,7 @@ Usage:
 import argparse
 import subprocess
 from datetime import datetime
+import sys
 import yfinance as yf
 
 from common import configure_public_imports
