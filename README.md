@@ -29,6 +29,10 @@ export QUANT_PYTHON=/usr/bin/python3.12
 cd /home/chavez_f/.openclaw/workspace/quant-tools/scripts
 /usr/bin/python3.12 quant.py macro --watchlist SPY QQQ NVDA AAPL MSFT TSLA
 /usr/bin/python3.12 quant.py scan --watchlist SPY QQQ NVDA --strategies csp bull_put --min-dte 21 --max-dte 45
+/usr/bin/python3.12 quant.py scan --watchlist SPY QQQ NVDA --strategies csp bull_put --ranked
+/usr/bin/python3.12 quant.py pretrade --candidates reports/scan.json --account-nav 30000
+/usr/bin/python3.12 quant.py journal add --ticker SPY --strategy BULL_PUT --entry-credit 1.20 --capital-at-risk 380 --score 66 --thesis "defined risk, acceptable liquidity"
+/usr/bin/python3.12 quant.py plan --candidates reports/scan.json --portfolio reports/risk.json --journal state/trades.json --account-nav 30000
 /usr/bin/python3.12 quant.py iv-rank --tickers SPY QQQ NVDA AAPL MSFT TSLA AMD
 /usr/bin/python3.12 quant.py brief --watchlist SPY QQQ NVDA AAPL MSFT TSLA
 ```
@@ -37,9 +41,23 @@ cd /home/chavez_f/.openclaw/workspace/quant-tools/scripts
 
 ```bash
 /usr/bin/python3.12 ~/.hermes/skills/mlops/quant-trading-toolkit/scripts/verify_toolkit.py
+python -m unittest discover -s tests
 ```
 
-Runs 11 smoke tests across all tools. Last verified: 2026-06-04, all PASS.
+The skill verifier runs 11 smoke tests across all tools. The local unit tests
+cover OSI parsing, candidate scoring, pre-trade checks, journal P&L math, config
+merging, and cache round-trips.
+
+## Config
+
+Defaults live in `config.example.json`. Copy it to `config.json` for local
+watchlists, scan defaults, journal path, and risk limits. The unified runner
+loads `config.json` automatically when present, or you can pass a specific file:
+
+```bash
+/usr/bin/python3.12 quant.py --config config.example.json scan --ranked
+/usr/bin/python3.12 quant.py --config config.example.json plan --candidates reports/scan.json --portfolio reports/risk.json
+```
 
 ## Project vs skill — what's where
 

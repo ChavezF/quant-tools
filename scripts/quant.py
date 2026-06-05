@@ -21,6 +21,7 @@ import os
 import sys
 import subprocess
 from pathlib import Path
+from toolkit_config import add_config_argument, load_config, resolve_project_path
 
 SCRIPT_DIR = Path(__file__).parent
 PY = os.environ.get("QUANT_PYTHON", sys.executable)
@@ -33,17 +34,53 @@ def run(script: str, *args: str) -> int:
 
 def main():
     ap = argparse.ArgumentParser()
+    add_config_argument(ap)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_scan = sub.add_parser("scan", help="Options screener")
-    p_scan.add_argument("--watchlist", nargs="+", required=True)
-    p_scan.add_argument("--strategies", nargs="+", default=["csp", "cc"])
-    p_scan.add_argument("--min-dte", type=int, default=14)
-    p_scan.add_argument("--max-dte", type=int, default=45)
-    p_scan.add_argument("--target-delta", type=float, default=0.30)
+    p_scan.add_argument("--watchlist", nargs="+")
+    p_scan.add_argument("--watchlist-name", default="core")
+    p_scan.add_argument("--strategies", nargs="+")
+    p_scan.add_argument("--min-dte", type=int)
+    p_scan.add_argument("--max-dte", type=int)
+    p_scan.add_argument("--target-delta", type=float)
+    p_scan.add_argument("--min-oi", type=int)
+    p_scan.add_argument("--no-cache", action="store_true")
+    p_scan.add_argument("--ranked", action="store_true")
 
     p_risk = sub.add_parser("risk", help="Portfolio risk")
     p_risk.add_argument("--target-watchlist", nargs="+")
+
+    p_pre = sub.add_parser("pretrade", help="Risk-check scored candidates before execution")
+    p_pre.add_argument("--candidates", required=True, help="Path to options_screener JSON report")
+    p_pre.add_argument("--portfolio", help="Optional path to portfolio_risk --json output")
+    p_pre.add_argument("--account-nav", type=float)
+    p_pre.add_argument("--max-trade-risk-pct", type=float)
+    p_pre.add_argument("--max-trade-bp-pct", type=float)
+    p_pre.add_argument("--max-single-ticker-pct", type=float)
+    p_pre.add_argument("--max-portfolio-delta-abs", type=float)
+    p_pre.add_argument("--min-score", type=float)
+    p_pre.add_argument("--min-liquidity-score", type=float)
+    p_pre.add_argument("--min-pop-pct", type=float)
+    p_pre.add_argument("--json", action="store_true")
+
+    p_plan = sub.add_parser("plan", help="Build ranked action plan from scan/risk/journal reports")
+    p_plan.add_argument("--candidates", required=True, help="Path to options_screener JSON report")
+    p_plan.add_argument("--portfolio", help="Optional path to portfolio_risk --json output")
+    p_plan.add_argument("--journal", help="Optional path to trade journal state")
+    p_plan.add_argument("--account-nav", type=float)
+    p_plan.add_argument("--max-trade-risk-pct", type=float)
+    p_plan.add_argument("--max-trade-bp-pct", type=float)
+    p_plan.add_argument("--max-single-ticker-pct", type=float)
+    p_plan.add_argument("--max-portfolio-delta-abs", type=float)
+    p_plan.add_argument("--min-score", type=float)
+    p_plan.add_argument("--min-liquidity-score", type=float)
+    p_plan.add_argument("--min-pop-pct", type=float)
+    p_plan.add_argument("--top", type=int, default=10)
+    p_plan.add_argument("--json", action="store_true")
+
+    p_journal = sub.add_parser("journal", help="Trade journal add/list/close/stats")
+    p_journal.add_argument("journal_args", nargs=argparse.REMAINDER)
 
     p_earn = sub.add_parser("earnings", help="Earnings IV scanner")
     p_earn.add_argument("--watchlist", nargs="+", required=True)
@@ -97,19 +134,79 @@ def main():
     p_all.add_argument("--num-events", type=int, default=8)
 
     args = ap.parse_args()
+    cfg = load_config(args.config)
+    scan_cfg = cfg["scan"]
+    risk_cfg = cfg["risk_limits"]
+
+    def risk_value(name: str):
+        return getattr(args, name) if getattr(args, name) is not None else risk_cfg[name]
 
     if args.cmd == "scan":
+        watchlist = args.watchlist or cfg["watchlists"].get(args.watchlist_name)
+        if not watchlist:
+            raise SystemExit(f"Unknown watchlist: {args.watchlist_name}")
+        strategies = args.strategies or scan_cfg["strategies"]
+        min_dte = args.min_dte if args.min_dte is not None else scan_cfg["min_dte"]
+        max_dte = args.max_dte if args.max_dte is not None else scan_cfg["max_dte"]
+        target_delta = args.target_delta if args.target_delta is not None else scan_cfg["target_delta"]
+        min_oi = args.min_oi if args.min_oi is not None else scan_cfg["min_oi"]
         return run("options_screener.py",
-                   "--watchlist", *args.watchlist,
-                   "--strategies", *args.strategies,
-                   "--min-dte", str(args.min_dte),
-                   "--max-dte", str(args.max_dte),
-                   "--target-delta", str(args.target_delta))
+                   *(["--config", args.config] if args.config else []),
+                   "--watchlist", *watchlist,
+                   "--strategies", *strategies,
+                   "--min-dte", str(min_dte),
+                   "--max-dte", str(max_dte),
+                   "--target-delta", str(target_delta),
+                   "--min-oi", str(min_oi),
+                   *(["--no-cache"] if args.no_cache else []),
+                   *(["--ranked"] if args.ranked else []))
     elif args.cmd == "risk":
         cmd = ["portfolio_risk.py"]
         if args.target_watchlist:
             cmd += ["--target-watchlist", *args.target_watchlist]
         return run(*cmd)
+    elif args.cmd == "pretrade":
+        cmd = [
+            "pretrade_check.py",
+            "--candidates", args.candidates,
+            "--account-nav", str(risk_value("account_nav")),
+            "--max-trade-risk-pct", str(risk_value("max_trade_risk_pct")),
+            "--max-trade-bp-pct", str(risk_value("max_trade_bp_pct")),
+            "--max-single-ticker-pct", str(risk_value("max_single_ticker_pct")),
+            "--max-portfolio-delta-abs", str(risk_value("max_portfolio_delta_abs")),
+            "--min-score", str(risk_value("min_score")),
+            "--min-liquidity-score", str(risk_value("min_liquidity_score")),
+            "--min-pop-pct", str(risk_value("min_pop_pct")),
+        ]
+        if args.portfolio:
+            cmd += ["--portfolio", args.portfolio]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "plan":
+        cmd = [
+            "action_plan.py",
+            "--candidates", args.candidates,
+            "--account-nav", str(risk_value("account_nav")),
+            "--max-trade-risk-pct", str(risk_value("max_trade_risk_pct")),
+            "--max-trade-bp-pct", str(risk_value("max_trade_bp_pct")),
+            "--max-single-ticker-pct", str(risk_value("max_single_ticker_pct")),
+            "--max-portfolio-delta-abs", str(risk_value("max_portfolio_delta_abs")),
+            "--min-score", str(risk_value("min_score")),
+            "--min-liquidity-score", str(risk_value("min_liquidity_score")),
+            "--min-pop-pct", str(risk_value("min_pop_pct")),
+            "--top", str(args.top),
+        ]
+        if args.portfolio:
+            cmd += ["--portfolio", args.portfolio]
+        journal = args.journal or cfg.get("journal", {}).get("path")
+        if journal:
+            cmd += ["--journal", resolve_project_path(journal)]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "journal":
+        return run("trade_journal.py", *args.journal_args)
     elif args.cmd == "earnings":
         return run("earnings_iv_scanner.py",
                    "--watchlist", *args.watchlist,

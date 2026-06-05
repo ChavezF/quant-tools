@@ -1,0 +1,30 @@
+{
+  "watchlists": {
+    "core": ["SPY", "QQQ", "NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "META", "AMD"],
+    "earnings": ["NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "META", "GOOGL"]
+  },
+  "scan": {
+    "strategies": ["csp", "cc", "bull_put"],
+    "min_dte": 21,
+    "max_dte": 45,
+    "target_delta": 0.3,
+    "min_oi": 50
+  },
+  "risk_limits": {
+    "account_nav": 30000,
+    "max_trade_risk_pct": 0.05,
+    "max_trade_bp_pct": 0.2,
+    "max_single_ticker_pct": 0.25,
+    "max_portfolio_delta_abs": 250,
+    "min_score": 55,
+    "min_liquidity_score": 45,
+    "min_pop_pct": 55
+  },
+  "journal": {
+    "path": "state/trades.json"
+  },
+  "cache": {
+    "enabled": true,
+    "underlying_metrics_ttl_seconds": 900
+  }
+}

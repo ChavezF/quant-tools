@@ -23,7 +23,10 @@ import sys
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
+from cache_utils import cached
 from common import configure_public_imports, get_public_client, parse_osi_strike
+from candidate_scoring import score_results
+from toolkit_config import add_config_argument, load_config
 
 configure_public_imports()
 
@@ -173,7 +176,7 @@ def fetch_chain_with_greeks(client, symbol: str, expiration: str, spot: float,
 # yfinance helpers
 # ---------------------------------------------------------------------------
 
-def fetch_underlying_metrics(symbol: str) -> dict:
+def fetch_underlying_metrics_uncached(symbol: str) -> dict:
     try:
         t = yf.Ticker(symbol)
         hist = t.history(period="6mo", auto_adjust=True)
@@ -200,6 +203,18 @@ def fetch_underlying_metrics(symbol: str) -> dict:
     except Exception as e:
         print(f"  ! yfinance failed: {e}", file=sys.stderr)
         return {}
+
+
+def fetch_underlying_metrics(symbol: str, ttl_seconds: int = 0) -> dict:
+    if ttl_seconds <= 0:
+        return fetch_underlying_metrics_uncached(symbol)
+    return cached(
+        "underlying_metrics",
+        ttl_seconds,
+        lambda: fetch_underlying_metrics_uncached(symbol),
+        symbol.upper(),
+        "6mo",
+    )
 
 
 def _next_earnings(t: yf.Ticker) -> dict:
@@ -372,6 +387,7 @@ def screen_bull_put(chain: dict, spot: float, dte: int,
 
 def main():
     ap = argparse.ArgumentParser()
+    add_config_argument(ap)
     ap.add_argument("--watchlist", nargs="+", required=True)
     ap.add_argument("--strategies", nargs="+", default=["csp", "cc"],
                     choices=["csp", "cc", "bull_put"])
@@ -379,9 +395,15 @@ def main():
     ap.add_argument("--max-dte", type=int, default=45)
     ap.add_argument("--target-delta", type=float, default=0.30)
     ap.add_argument("--min-oi", type=int, default=50)
+    ap.add_argument("--no-cache", action="store_true")
+    ap.add_argument("--ranked", action="store_true",
+                    help="Score all candidates and print a unified ranked list")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--report", type=str)
     args = ap.parse_args()
+    cfg = load_config(args.config)
+    cache_cfg = cfg.get("cache", {})
+    metrics_ttl = 0 if args.no_cache or not cache_cfg.get("enabled", True) else int(cache_cfg.get("underlying_metrics_ttl_seconds", 900))
 
     client = get_client()
     all_results = {
@@ -396,13 +418,13 @@ def main():
         quote = fetch_quote(client, symbol)
         spot = quote.get("last") or quote.get("bid")
         if not spot:
-            metrics = fetch_underlying_metrics(symbol)
+            metrics = fetch_underlying_metrics(symbol, ttl_seconds=metrics_ttl)
             spot = metrics.get("last_close")
         if not spot:
             print(f"  ! no spot price, skipping", file=sys.stderr)
             continue
 
-        metrics = fetch_underlying_metrics(symbol)
+        metrics = fetch_underlying_metrics(symbol, ttl_seconds=metrics_ttl)
         rv = metrics.get("rv_21d_pct", 0)
         iv_rank = metrics.get("iv_rank_proxy_pct", 0)
         print(f"  spot=${spot:.2f}  RV21d={rv:.1f}%  IV-rank-prox={iv_rank:.0f}  "
@@ -458,10 +480,16 @@ def main():
             ticker_results["strategies"][strat] = res
         all_results["tickers"][symbol] = ticker_results
 
+    if args.ranked:
+        score_results(all_results)
+
     if args.json:
         print(json.dumps(all_results, indent=2, default=str))
     else:
-        print_report(all_results)
+        if args.ranked:
+            print_ranked_report(all_results)
+        else:
+            print_report(all_results)
 
     if args.report:
         Path(args.report).parent.mkdir(parents=True, exist_ok=True)
@@ -510,6 +538,30 @@ def print_report(results: dict):
                     print(f"  ${r['short_strike']:>6.2f} ${r['long_strike']:>6.2f} "
                           f"${r['credit']:>7.2f} ${r['max_loss']:>8.2f} "
                           f"{r['ratio']:>5.2f} {r['pop_pct']:>5.1f}% {r['ann_roc_pct']:>6.2f}%")
+
+
+def print_ranked_report(results: dict):
+    print_report(results)
+
+    ranked = results.get("ranked_candidates", [])
+    if not ranked:
+        print("\n  No ranked candidates.")
+        return
+
+    print(f"\n\n{'#'*78}")
+    print("# UNIFIED RANKING — score combines premium, POP, liquidity, risk/reward, IV, timing")
+    print(f"{'#'*78}\n")
+    print(f"  {'Score':>5} {'Verdict':<10} {'Ticker':<6} {'Strategy':<9} "
+          f"{'ROC':>7} {'POP':>6} {'Liq':>5} {'Risk':>5}  Rationale")
+    print(f"  {'-'*5} {'-'*10} {'-'*6} {'-'*9} {'-'*7} {'-'*6} {'-'*5} {'-'*5}  {'-'*30}")
+    for row in ranked[:20]:
+        components = row.get("score_components", {})
+        roc = row.get("ann_roc_pct", 0) or 0
+        pop = row.get("pop_pct", 0) or 0
+        print(f"  {row['score']:>5.1f} {row['verdict']:<10} {row['ticker']:<6} "
+              f"{row.get('strategy', ''):<9} {roc:>6.1f}% {pop:>5.1f}% "
+              f"{components.get('liquidity', 0):>5.0f} {components.get('risk_reward', 0):>5.0f}  "
+              f"{' | '.join(row.get('score_rationale', []))}")
 
 
 if __name__ == "__main__":
