@@ -15,15 +15,18 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from execution_quality import attach_execution_quality, execution_quality
+
 
 @dataclass(frozen=True)
 class ScoreWeights:
     premium: float = 0.22
     probability: float = 0.20
-    liquidity: float = 0.18
+    liquidity: float = 0.13
     risk_reward: float = 0.16
     volatility: float = 0.14
     timing: float = 0.10
+    execution: float = 0.05
 
 
 DEFAULT_WEIGHTS = ScoreWeights()
@@ -74,6 +77,10 @@ def liquidity_score(candidate: dict[str, Any]) -> float:
         spread_component = 55.0
 
     return round(clamp(volume_component * 0.25 + oi_component * 0.45 + spread_component * 0.30), 1)
+
+
+def execution_score(candidate: dict[str, Any]) -> float:
+    return float(execution_quality(candidate).get("execution_score", 45.0))
 
 
 def premium_score(candidate: dict[str, Any]) -> float:
@@ -169,6 +176,7 @@ def score_candidate(
         "risk_reward": risk_reward_score(candidate),
         "volatility": volatility_score(metrics, candidate),
         "timing": timing_score(dte, metrics),
+        "execution": round(execution_score(candidate), 1),
     }
     score = (
         components["premium"] * weights.premium
@@ -177,8 +185,9 @@ def score_candidate(
         + components["risk_reward"] * weights.risk_reward
         + components["volatility"] * weights.volatility
         + components["timing"] * weights.timing
+        + components["execution"] * weights.execution
     )
-    scored = dict(candidate)
+    scored = attach_execution_quality(candidate)
     scored.update({
         "ticker": ticker,
         "score": round(score, 1),

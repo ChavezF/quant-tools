@@ -45,6 +45,8 @@ def main():
     p_scan.add_argument("--max-dte", type=int)
     p_scan.add_argument("--target-delta", type=float)
     p_scan.add_argument("--min-oi", type=int)
+    p_scan.add_argument("--max-expirations", type=int)
+    p_scan.add_argument("--wing-widths", nargs="+", type=float)
     p_scan.add_argument("--no-cache", action="store_true")
     p_scan.add_argument("--ranked", action="store_true")
     p_scan.add_argument("--json", action="store_true", help="Emit screener output as JSON (pipe into pretrade/plan)")
@@ -81,8 +83,48 @@ def main():
     p_plan.add_argument("--top", type=int, default=10)
     p_plan.add_argument("--json", action="store_true")
 
+    p_daily = sub.add_parser("daily", help="Run saved daily workflow into timestamped reports")
+    p_daily.add_argument("--watchlist", nargs="+")
+    p_daily.add_argument("--watchlist-name", default="core")
+    p_daily.add_argument("--strategies", nargs="+")
+    p_daily.add_argument("--min-dte", type=int)
+    p_daily.add_argument("--max-dte", type=int)
+    p_daily.add_argument("--target-delta", type=float)
+    p_daily.add_argument("--min-oi", type=int)
+    p_daily.add_argument("--max-expirations", type=int)
+    p_daily.add_argument("--wing-widths", nargs="+", type=float)
+    p_daily.add_argument("--target-watchlist", nargs="+")
+    p_daily.add_argument("--journal")
+    p_daily.add_argument("--report-dir")
+    p_daily.add_argument("--account-nav", type=float)
+    p_daily.add_argument("--max-trade-risk-pct", type=float)
+    p_daily.add_argument("--max-trade-bp-pct", type=float)
+    p_daily.add_argument("--max-single-ticker-pct", type=float)
+    p_daily.add_argument("--max-portfolio-delta-abs", type=float)
+    p_daily.add_argument("--min-score", type=float)
+    p_daily.add_argument("--min-liquidity-score", type=float)
+    p_daily.add_argument("--min-pop-pct", type=float)
+    p_daily.add_argument("--alert-min-score", type=float)
+    p_daily.add_argument("--profit-target-pct", type=float)
+    p_daily.add_argument("--dte-warning", type=int)
+    p_daily.add_argument("--top", type=int, default=10)
+    p_daily.add_argument("--skip-risk", action="store_true")
+    p_daily.add_argument("--skip-brief", action="store_true")
+    p_daily.add_argument("--skip-alerts", action="store_true")
+    p_daily.add_argument("--no-cache", action="store_true")
+    p_daily.add_argument("--send", action="store_true")
+    p_daily.add_argument("--dry-run", action="store_true")
+
     p_journal = sub.add_parser("journal", help="Trade journal add/list/close/stats")
     p_journal.add_argument("journal_args", nargs=argparse.REMAINDER)
+
+    p_alerts = sub.add_parser("alerts", help="Generate alerts from plan and journal state")
+    p_alerts.add_argument("--plan", help="Path to action_plan --json output")
+    p_alerts.add_argument("--journal", help="Optional path to trade journal state")
+    p_alerts.add_argument("--min-score", type=float, default=68.0)
+    p_alerts.add_argument("--profit-target-pct", type=float, default=50.0)
+    p_alerts.add_argument("--dte-warning", type=int, default=21)
+    p_alerts.add_argument("--json", action="store_true")
 
     p_earn = sub.add_parser("earnings", help="Earnings IV scanner")
     p_earn.add_argument("--watchlist", nargs="+", required=True)
@@ -152,6 +194,8 @@ def main():
         max_dte = args.max_dte if args.max_dte is not None else scan_cfg["max_dte"]
         target_delta = args.target_delta if args.target_delta is not None else scan_cfg["target_delta"]
         min_oi = args.min_oi if args.min_oi is not None else scan_cfg["min_oi"]
+        max_expirations = args.max_expirations if args.max_expirations is not None else scan_cfg.get("max_expirations", 1)
+        wing_widths = args.wing_widths or scan_cfg.get("wing_widths", [5.0])
         return run("options_screener.py",
                    *(["--config", args.config] if args.config else []),
                    "--watchlist", *watchlist,
@@ -160,6 +204,8 @@ def main():
                    "--max-dte", str(max_dte),
                    "--target-delta", str(target_delta),
                    "--min-oi", str(min_oi),
+                   "--max-expirations", str(max_expirations),
+                   "--wing-widths", *[str(w) for w in wing_widths],
                    *(["--no-cache"] if args.no_cache else []),
                    *(["--ranked"] if args.ranked else []),
                    *(["--json"] if args.json else []),
@@ -209,8 +255,74 @@ def main():
         if args.json:
             cmd += ["--json"]
         return run(*cmd)
+    elif args.cmd == "daily":
+        cmd = ["daily_workflow.py"]
+        if args.config:
+            cmd += ["--config", args.config]
+        if args.watchlist:
+            cmd += ["--watchlist", *args.watchlist]
+        if args.watchlist_name:
+            cmd += ["--watchlist-name", args.watchlist_name]
+        if args.strategies:
+            cmd += ["--strategies", *args.strategies]
+        for attr, flag in [
+            ("min_dte", "--min-dte"),
+            ("max_dte", "--max-dte"),
+            ("target_delta", "--target-delta"),
+            ("min_oi", "--min-oi"),
+            ("max_expirations", "--max-expirations"),
+            ("account_nav", "--account-nav"),
+            ("max_trade_risk_pct", "--max-trade-risk-pct"),
+            ("max_trade_bp_pct", "--max-trade-bp-pct"),
+            ("max_single_ticker_pct", "--max-single-ticker-pct"),
+            ("max_portfolio_delta_abs", "--max-portfolio-delta-abs"),
+            ("min_score", "--min-score"),
+            ("min_liquidity_score", "--min-liquidity-score"),
+            ("min_pop_pct", "--min-pop-pct"),
+            ("alert_min_score", "--alert-min-score"),
+            ("profit_target_pct", "--profit-target-pct"),
+            ("dte_warning", "--dte-warning"),
+            ("top", "--top"),
+        ]:
+            value = getattr(args, attr)
+            if value is not None:
+                cmd += [flag, str(value)]
+        if args.wing_widths:
+            cmd += ["--wing-widths", *[str(w) for w in args.wing_widths]]
+        if args.target_watchlist:
+            cmd += ["--target-watchlist", *args.target_watchlist]
+        if args.journal:
+            cmd += ["--journal", args.journal]
+        if args.report_dir:
+            cmd += ["--report-dir", args.report_dir]
+        for flag_name, flag in [
+            ("skip_risk", "--skip-risk"),
+            ("skip_brief", "--skip-brief"),
+            ("skip_alerts", "--skip-alerts"),
+            ("no_cache", "--no-cache"),
+            ("send", "--send"),
+            ("dry_run", "--dry-run"),
+        ]:
+            if getattr(args, flag_name):
+                cmd += [flag]
+        return run(*cmd)
     elif args.cmd == "journal":
         return run("trade_journal.py", *args.journal_args)
+    elif args.cmd == "alerts":
+        cmd = [
+            "alerts.py",
+            "--min-score", str(args.min_score),
+            "--profit-target-pct", str(args.profit_target_pct),
+            "--dte-warning", str(args.dte_warning),
+        ]
+        if args.plan:
+            cmd += ["--plan", args.plan]
+        journal = args.journal or cfg.get("journal", {}).get("path")
+        if journal:
+            cmd += ["--journal", resolve_project_path(journal)]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
     elif args.cmd == "earnings":
         return run("earnings_iv_scanner.py",
                    "--watchlist", *args.watchlist,

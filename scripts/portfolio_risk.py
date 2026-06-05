@@ -300,9 +300,10 @@ def main():
         for p in portfolio["positions"]:
             p["pct_of_portfolio"] = (p["current_value"] / total) * 100
         risk = compute_risk(portfolio["positions"], metrics_map)
-        print_dashboard(portfolio, risk, demo=True)
         if args.json:
             print(json.dumps({"portfolio": portfolio, "risk": risk, "demo": True}, indent=2, default=str))
+            return
+        print_dashboard(portfolio, risk, demo=True)
         return
 
     # Real portfolio: enrich with greeks for any options
@@ -336,10 +337,11 @@ def main():
             pos["greeks"] = {"delta": 0, "gamma": 0, "theta": 0, "vega": 0, "iv": 0}
 
     risk = compute_risk(portfolio["positions"], metrics_map)
-    print_dashboard(portfolio, risk, demo=False)
-
     if args.json:
         print(json.dumps({"portfolio": portfolio, "risk": risk, "demo": False}, indent=2, default=str))
+        return
+
+    print_dashboard(portfolio, risk, demo=False)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from argparse import Namespace
+from datetime import date, timedelta
 from pathlib import Path
 
 import sys
@@ -13,9 +14,14 @@ if str(SCRIPTS) not in sys.path:
 from cache_utils import cached, read_cache
 from candidate_scoring import score_results
 from common import parse_osi_expiration, parse_osi_parts, parse_osi_strike
+from execution_quality import execution_quality
+from performance_profiles import build_profiles, lookup_profile
 from pretrade_check import RiskLimits, evaluate_report
+from scan_optimizer import parse_wing_widths, select_expirations
 from toolkit_config import deep_merge
 from trade_journal import add_trade, close_trade, default_state, journal_stats
+from action_plan import build_action_plan
+from alerts import build_alerts
 
 
 def sample_scan_report():
@@ -77,7 +83,40 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertEqual(len(ranked), 2)
         self.assertGreaterEqual(ranked[0]["score"], ranked[1]["score"])
         self.assertIn("score_components", ranked[0])
+        self.assertIn("execution", ranked[0])
         self.assertIn(ranked[0]["verdict"], {"DEPLOY", "SMALL_SIZE", "WATCH", "SKIP"})
+
+    def test_execution_quality_penalizes_wide_spreads(self):
+        tight = {
+            "strategy": "CSP",
+            "credit": 1.0,
+            "bid": 0.98,
+            "ask": 1.02,
+            "volume": 500,
+            "open_interest": 1500,
+        }
+        wide = {
+            "strategy": "CSP",
+            "credit": 1.0,
+            "bid": 0.50,
+            "ask": 1.50,
+            "volume": 10,
+            "open_interest": 50,
+        }
+        self.assertGreater(execution_quality(tight)["execution_score"], execution_quality(wide)["execution_score"])
+        self.assertEqual(execution_quality(tight)["execution_grade"], "A")
+
+    def test_expiration_selection_and_wing_widths(self):
+        expirations = [
+            (date.today() + timedelta(days=21)).isoformat(),
+            (date.today() + timedelta(days=35)).isoformat(),
+            (date.today() + timedelta(days=44)).isoformat(),
+            (date.today() + timedelta(days=90)).isoformat(),
+        ]
+        selected = select_expirations(expirations, min_dte=20, max_dte=50, max_expirations=2)
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(selected[0][1], 35)
+        self.assertEqual(parse_wing_widths([5, 2.5, 5, 10]), [2.5, 5.0, 10.0])
 
     def test_pretrade_rejects_oversized_csp(self):
         report = sample_scan_report()
@@ -125,6 +164,70 @@ class CoreWorkflowTests(unittest.TestCase):
         stats = journal_stats(state["trades"])
         self.assertEqual(stats["closed_trades"], 1)
         self.assertEqual(stats["total_realized_pnl"], 75.0)
+
+    def test_performance_profiles_by_ticker_strategy(self):
+        trades = [
+            {"status": "CLOSED", "ticker": "SPY", "strategy": "BULL_PUT", "realized_pnl": -50},
+            {"status": "CLOSED", "ticker": "SPY", "strategy": "BULL_PUT", "realized_pnl": -25},
+            {"status": "CLOSED", "ticker": "SPY", "strategy": "BULL_PUT", "realized_pnl": 10},
+        ]
+        profiles = build_profiles(trades)
+        scope, profile = lookup_profile(profiles, "SPY", "BULL_PUT")
+        self.assertEqual(scope, "ticker_strategy")
+        self.assertEqual(profile["signal"], "THROTTLE")
+
+    def test_action_plan_throttles_weak_profile(self):
+        trades = [
+            {"status": "CLOSED", "ticker": "SPY", "strategy": "BULL_PUT", "realized_pnl": -50},
+            {"status": "CLOSED", "ticker": "SPY", "strategy": "BULL_PUT", "realized_pnl": -25},
+            {"status": "CLOSED", "ticker": "SPY", "strategy": "BULL_PUT", "realized_pnl": 10},
+        ]
+        portfolio = {
+            "portfolio": {"positions": [{"symbol": "SPY", "current_value": 5000}]},
+            "risk": {"net_delta_shares": 80},
+        }
+        plan = build_action_plan(sample_scan_report(), portfolio, {"trades": trades}, RiskLimits(account_nav=30000))
+        bull_put = next(row for row in plan["actions"] if row["strategy"] == "BULL_PUT")
+        self.assertEqual(bull_put["profile_signal"], "THROTTLE")
+        self.assertEqual(bull_put["action_decision"], "REDUCE")
+
+    def test_alerts_from_plan_and_journal(self):
+        plan = {
+            "actions": [
+                {
+                    "action_decision": "APPROVE",
+                    "score": 72,
+                    "ticker": "SPY",
+                    "strategy": "BULL_PUT",
+                    "action_size_multiplier": 1.0,
+                    "candidate": {
+                        "execution": {
+                            "suggested_limit_credit": 1.1,
+                            "do_not_chase_below": 1.0,
+                            "execution_grade": "B",
+                        }
+                    },
+                }
+            ]
+        }
+        journal = {
+            "trades": [
+                {
+                    "id": "OPEN-1",
+                    "status": "OPEN",
+                    "ticker": "SPY",
+                    "strategy": "BULL_PUT",
+                    "unrealized_pnl_pct": 55,
+                    "expiration": (date.today() + timedelta(days=5)).isoformat(),
+                }
+            ]
+        }
+        report = build_alerts(plan, journal, min_score=68, profit_target_pct=50, dte_warning=21)
+        kinds = {row["kind"] for row in report["alerts"]}
+        self.assertEqual(report["summary"]["high"], 3)
+        self.assertIn("candidate", kinds)
+        self.assertIn("profit_target", kinds)
+        self.assertIn("dte_warning", kinds)
 
     def test_config_deep_merge(self):
         merged = deep_merge({"a": {"b": 1, "c": 2}, "x": 3}, {"a": {"b": 9}})

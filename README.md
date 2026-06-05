@@ -29,10 +29,12 @@ export QUANT_PYTHON=/usr/bin/python3.12
 cd /home/chavez_f/code/quant-tools/scripts
 /usr/bin/python3.12 quant.py macro --watchlist SPY QQQ NVDA AAPL MSFT TSLA
 /usr/bin/python3.12 quant.py scan --watchlist SPY QQQ NVDA --strategies csp bull_put --min-dte 21 --max-dte 45
-/usr/bin/python3.12 quant.py scan --watchlist SPY QQQ NVDA --strategies csp bull_put --ranked
+/usr/bin/python3.12 quant.py scan --watchlist SPY QQQ NVDA --strategies csp bull_put --ranked --max-expirations 2 --wing-widths 2.5 5 10
 /usr/bin/python3.12 quant.py pretrade --candidates reports/scan.json --account-nav 30000
 /usr/bin/python3.12 quant.py journal add --ticker SPY --strategy BULL_PUT --entry-credit 1.20 --capital-at-risk 380 --score 66 --thesis "defined risk, acceptable liquidity"
+/usr/bin/python3.12 quant.py journal profiles --section ticker_strategy
 /usr/bin/python3.12 quant.py plan --candidates reports/scan.json --portfolio reports/risk.json --journal state/trades.json --account-nav 30000
+/usr/bin/python3.12 quant.py alerts --plan reports/plan.json --journal state/trades.json
 /usr/bin/python3.12 quant.py iv-rank --tickers SPY QQQ NVDA AAPL MSFT TSLA AMD
 /usr/bin/python3.12 quant.py brief --watchlist SPY QQQ NVDA AAPL MSFT TSLA
 ```
@@ -57,6 +59,7 @@ loads `config.json` automatically when present, or you can pass a specific file:
 ```bash
 /usr/bin/python3.12 quant.py --config config.example.json scan --ranked
 /usr/bin/python3.12 quant.py --config config.example.json plan --candidates reports/scan.json --portfolio reports/risk.json
+/usr/bin/python3.12 quant.py --config config.example.json daily --dry-run
 ```
 
 ## Project vs skill — what's where

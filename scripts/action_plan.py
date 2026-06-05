@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from candidate_scoring import score_results
+from performance_profiles import build_profiles, lookup_profile, profile_note
 from pretrade_check import RiskLimits, evaluate_report
 from trade_journal import DEFAULT_STATE_FILE, journal_stats, load_state
 
@@ -39,9 +40,14 @@ def performance_note(strategy: str, stats_by_strategy: dict[str, dict[str, Any]]
     return f"neutral live history: n={count}, win={win_rate:.1f}%, pnl=${pnl:,.0f}"
 
 
-def apply_performance_overlay(decision: dict[str, Any], stats_by_strategy: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def apply_performance_overlay(
+    decision: dict[str, Any],
+    stats_by_strategy: dict[str, dict[str, Any]],
+    profiles: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     out = dict(decision)
     strategy = str(out.get("strategy") or "").upper()
+    ticker = str(out.get("ticker") or "").upper()
     stats = stats_by_strategy.get(strategy, {})
     count = int(stats.get("count", 0) or 0)
     win_rate = float(stats.get("win_rate", 0) or 0)
@@ -57,9 +63,26 @@ def apply_performance_overlay(decision: dict[str, Any], stats_by_strategy: dict[
         elif adjusted == "REDUCE":
             multiplier = min(multiplier, 0.25)
 
+    profile_scope, profile = lookup_profile(profiles or {}, ticker, strategy)
+    profile_signal = profile.get("signal") if profile else "NO_HISTORY"
+    if profile_signal == "THROTTLE":
+        if adjusted == "APPROVE":
+            adjusted = "REDUCE"
+            multiplier = min(multiplier, 0.5)
+        elif adjusted == "REDUCE":
+            multiplier = min(multiplier, 0.25)
+    elif profile_signal == "BOOST" and adjusted == "REDUCE" and not any(
+        not check["ok"] and check["severity"] == "hard" for check in out.get("checks", [])
+    ):
+        adjusted = "APPROVE"
+        multiplier = max(multiplier, 0.75)
+
     out["action_decision"] = adjusted
     out["action_size_multiplier"] = multiplier
     out["performance_note"] = note
+    out["profile_scope"] = profile_scope
+    out["profile_signal"] = profile_signal
+    out["profile_note"] = profile_note(profile_scope, profile)
     return out
 
 
@@ -72,8 +95,9 @@ def build_action_plan(
     score_results(screener_report)
     risk_report = evaluate_report(screener_report, portfolio_report, limits)
     stats_by_strategy = strategy_stats_map(journal_state)
+    profiles = build_profiles(journal_state.get("trades", [])) if journal_state else {}
     actions = [
-        apply_performance_overlay(decision, stats_by_strategy)
+        apply_performance_overlay(decision, stats_by_strategy, profiles)
         for decision in risk_report.get("decisions", [])
     ]
 
@@ -84,6 +108,7 @@ def build_action_plan(
     return {
         "limits": risk_report["limits"],
         "journal_stats": journal_stats(journal_state.get("trades", [])) if journal_state else None,
+        "performance_profiles": profiles,
         "summary": {
             "approve": len(approved),
             "reduce": len(reduced),
@@ -109,14 +134,16 @@ def print_action_plan(plan: dict[str, Any], top: int) -> None:
 
     actionable = [a for a in plan["actions"] if a["action_decision"] in ("APPROVE", "REDUCE")]
     print(f"\n  {'Action':<8} {'Size':>4} {'Score':>5} {'Ticker':<6} {'Strategy':<9} "
-          f"{'Capital':>10} {'MaxLoss':>10}  Notes")
-    print(f"  {'-'*8} {'-'*4} {'-'*5} {'-'*6} {'-'*9} {'-'*10} {'-'*10}  {'-'*30}")
+          f"{'Limit':>7} {'Floor':>7}  Notes")
+    print(f"  {'-'*8} {'-'*4} {'-'*5} {'-'*6} {'-'*9} {'-'*7} {'-'*7}  {'-'*30}")
     for row in actionable[:top]:
+        execution = row.get("candidate", {}).get("execution", {})
         print(
             f"  {row['action_decision']:<8} {row['action_size_multiplier']:>4.2f} "
             f"{float(row.get('score') or 0):>5.1f} {row['ticker']:<6} "
-            f"{str(row.get('strategy') or ''):<9} ${row['capital_required']:>9,.0f} "
-            f"${row['max_loss']:>9,.0f}  {row['performance_note']}"
+            f"{str(row.get('strategy') or ''):<9} {execution.get('suggested_limit_credit', 0):>7.2f} "
+            f"{execution.get('do_not_chase_below', 0):>7.2f}  "
+            f"exec={execution.get('execution_grade', '?')} | {row['profile_note']}"
         )
 
     rejected = [a for a in plan["actions"] if a["action_decision"] == "REJECT"]

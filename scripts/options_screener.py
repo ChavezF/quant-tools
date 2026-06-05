@@ -26,6 +26,7 @@ from pathlib import Path
 from cache_utils import cached
 from common import configure_public_imports, get_public_client, parse_osi_strike
 from candidate_scoring import score_results
+from scan_optimizer import parse_wing_widths, select_expirations
 from toolkit_config import add_config_argument, load_config
 
 configure_public_imports()
@@ -366,6 +367,7 @@ def screen_bull_put(chain: dict, spot: float, dte: int,
             "strategy": "BULL_PUT",
             "short_strike": strike,
             "long_strike": long_strike,
+            "wing_width": wing_width,
             "dte": dte,
             "credit": credit,
             "max_loss": max_loss,
@@ -395,6 +397,8 @@ def main():
     ap.add_argument("--max-dte", type=int, default=45)
     ap.add_argument("--target-delta", type=float, default=0.30)
     ap.add_argument("--min-oi", type=int, default=50)
+    ap.add_argument("--max-expirations", type=int)
+    ap.add_argument("--wing-widths", nargs="+", type=float)
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--ranked", action="store_true",
                     help="Score all candidates and print a unified ranked list")
@@ -402,8 +406,11 @@ def main():
     ap.add_argument("--report", type=str)
     args = ap.parse_args()
     cfg = load_config(args.config)
+    scan_cfg = cfg.get("scan", {})
     cache_cfg = cfg.get("cache", {})
     metrics_ttl = 0 if args.no_cache or not cache_cfg.get("enabled", True) else int(cache_cfg.get("underlying_metrics_ttl_seconds", 900))
+    max_expirations = args.max_expirations if args.max_expirations is not None else int(scan_cfg.get("max_expirations", 1))
+    wing_widths = parse_wing_widths(args.wing_widths or scan_cfg.get("wing_widths", [5.0]))
 
     client = get_client()
     all_results = {
@@ -434,50 +441,51 @@ def main():
         expirations = fetch_option_expirations(client, symbol)
         if not expirations:
             continue
-        target_dte = (args.min_dte + args.max_dte) // 2
-        best_exp, best_dte, best_diff = None, None, 9999
-        for exp in expirations:
-            try:
-                exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
-            except ValueError:
-                continue
-            dte = (exp_date - date.today()).days
-            if dte < args.min_dte or dte > args.max_dte:
-                continue
-            if abs(dte - target_dte) < best_diff:
-                best_exp, best_dte, best_diff = exp, dte, abs(dte - target_dte)
-        if not best_exp:
+        selected_expirations = select_expirations(expirations, args.min_dte, args.max_dte, max_expirations)
+        if not selected_expirations:
             print(f"  ! no expiration in DTE {args.min_dte}-{args.max_dte}", file=sys.stderr)
             continue
-        print(f"  expiration={best_exp}  DTE={best_dte}", file=sys.stderr)
-
-        chain = fetch_chain_with_greeks(client, symbol, best_exp, spot)
-        if not chain["calls"] and not chain["puts"]:
-            print(f"  ! empty chain", file=sys.stderr)
-            continue
-        n_greeks = sum(1 for leg in chain["calls"].values() if "delta" in leg) + \
-                   sum(1 for leg in chain["puts"].values() if "delta" in leg)
-        print(f"  strikes: {len(chain['calls'])} calls, {len(chain['puts'])} puts "
-              f"({n_greeks} with greeks)", file=sys.stderr)
+        print(f"  expirations={', '.join(f'{exp}({dte}DTE)' for exp, dte in selected_expirations)}", file=sys.stderr)
 
         ticker_results = {
             "spot": spot,
             "metrics": metrics,
-            "expiration": best_exp,
-            "dte": best_dte,
+            "expiration": selected_expirations[0][0],
+            "dte": selected_expirations[0][1],
+            "expirations_scanned": [{"expiration": exp, "dte": dte} for exp, dte in selected_expirations],
             "strategies": {},
         }
-        target_d = -args.target_delta if args.strategies and "csp" in args.strategies else args.target_delta
-        for strat in args.strategies:
-            if strat == "csp":
-                res = screen_csp(chain, spot, best_dte, target_delta=-args.target_delta, min_oi=args.min_oi)
-            elif strat == "cc":
-                res = screen_cc(chain, spot, best_dte, target_delta=args.target_delta, min_oi=args.min_oi)
-            elif strat == "bull_put":
-                res = screen_bull_put(chain, spot, best_dte, short_delta=-args.target_delta, min_oi=args.min_oi)
+        aggregated = {strat: [] for strat in args.strategies}
+        for exp, dte in selected_expirations:
+            chain = fetch_chain_with_greeks(client, symbol, exp, spot)
+            if not chain["calls"] and not chain["puts"]:
+                print(f"  ! empty chain for {exp}", file=sys.stderr)
+                continue
+            n_greeks = sum(1 for leg in chain["calls"].values() if "delta" in leg) + \
+                       sum(1 for leg in chain["puts"].values() if "delta" in leg)
+            print(f"  {exp}: {len(chain['calls'])} calls, {len(chain['puts'])} puts "
+                  f"({n_greeks} with greeks)", file=sys.stderr)
+            for strat in args.strategies:
+                if strat == "csp":
+                    res = screen_csp(chain, spot, dte, target_delta=-args.target_delta, min_oi=args.min_oi)
+                elif strat == "cc":
+                    res = screen_cc(chain, spot, dte, target_delta=args.target_delta, min_oi=args.min_oi)
+                elif strat == "bull_put":
+                    res = []
+                    for width in wing_widths:
+                        res.extend(screen_bull_put(chain, spot, dte, short_delta=-args.target_delta,
+                                                   wing_width=width, min_oi=args.min_oi))
+                else:
+                    res = []
+                for row in res:
+                    row["expiration"] = exp
+                aggregated[strat].extend(res)
+        for strat, rows in aggregated.items():
+            if strat == "bull_put":
+                rows.sort(key=lambda r: (r.get("ratio", 0), r.get("ann_roc_pct", 0)), reverse=True)
             else:
-                res = []
-            ticker_results["strategies"][strat] = res
+                rows.sort(key=lambda r: r.get("ann_roc_pct", 0), reverse=True)
+            ticker_results["strategies"][strat] = rows[:5]
         all_results["tickers"][symbol] = ticker_results
 
     if args.ranked:
@@ -523,19 +531,20 @@ def print_report(results: dict):
                 continue
             print(f"\n  ▸ {strat_name.upper()} — top {len(rows)}")
             if strat_name in ("csp", "cc"):
-                print(f"  {'Strike':>8} {'Credit':>8} {'Δ':>7} {'POP':>6} {'AnnROC':>7} {'IV%':>6} {'Θ':>7} {'Vol':>5} {'OI':>6}  OSI")
+                print(f"  {'Exp':<10} {'DTE':>4} {'Strike':>8} {'Credit':>8} {'Δ':>7} {'POP':>6} {'AnnROC':>7} {'IV%':>6} {'Θ':>7} {'Vol':>5} {'OI':>6}  OSI")
                 for r in rows:
                     iv = r.get("iv_pct")
                     iv_s = f"{iv:>5.1f}%" if iv is not None else "  -- "
                     th = r.get("theta")
                     th_s = f"{th:>7.3f}" if th is not None else "    -- "
-                    print(f"  ${r['strike']:>7.2f} ${r['credit']:>7.2f} {r['delta']:>7.3f} "
+                    print(f"  {r.get('expiration',''):<10} {r.get('dte', 0):>4} ${r['strike']:>7.2f} ${r['credit']:>7.2f} {r['delta']:>7.3f} "
                           f"{r['pop_pct']:>5.1f}% {r['ann_roc_pct']:>6.2f}% {iv_s} {th_s} "
                           f"{r['volume']:>5} {r['open_interest']:>6}  {r['osi']}")
             elif strat_name == "bull_put":
-                print(f"  {'Short':>7} {'Long':>7} {'Credit':>8} {'MaxLoss':>9} {'Ratio':>6} {'POP':>6} {'AnnROC':>7}")
+                print(f"  {'Exp':<10} {'DTE':>4} {'Short':>7} {'Long':>7} {'Width':>6} {'Credit':>8} {'MaxLoss':>9} {'Ratio':>6} {'POP':>6} {'AnnROC':>7}")
                 for r in rows:
-                    print(f"  ${r['short_strike']:>6.2f} ${r['long_strike']:>6.2f} "
+                    print(f"  {r.get('expiration',''):<10} {r.get('dte', 0):>4} ${r['short_strike']:>6.2f} ${r['long_strike']:>6.2f} "
+                          f"{r.get('wing_width', 0):>6.2f} "
                           f"${r['credit']:>7.2f} ${r['max_loss']:>8.2f} "
                           f"{r['ratio']:>5.2f} {r['pop_pct']:>5.1f}% {r['ann_roc_pct']:>6.2f}%")
 
@@ -549,18 +558,18 @@ def print_ranked_report(results: dict):
         return
 
     print(f"\n\n{'#'*78}")
-    print("# UNIFIED RANKING — score combines premium, POP, liquidity, risk/reward, IV, timing")
+    print("# UNIFIED RANKING — score combines premium, POP, liquidity, execution, risk/reward, IV, timing")
     print(f"{'#'*78}\n")
     print(f"  {'Score':>5} {'Verdict':<10} {'Ticker':<6} {'Strategy':<9} "
-          f"{'ROC':>7} {'POP':>6} {'Liq':>5} {'Risk':>5}  Rationale")
-    print(f"  {'-'*5} {'-'*10} {'-'*6} {'-'*9} {'-'*7} {'-'*6} {'-'*5} {'-'*5}  {'-'*30}")
+          f"{'ROC':>7} {'POP':>6} {'Exec':>5} {'Limit':>7}  Rationale")
+    print(f"  {'-'*5} {'-'*10} {'-'*6} {'-'*9} {'-'*7} {'-'*6} {'-'*5} {'-'*7}  {'-'*30}")
     for row in ranked[:20]:
-        components = row.get("score_components", {})
         roc = row.get("ann_roc_pct", 0) or 0
         pop = row.get("pop_pct", 0) or 0
+        execution = row.get("execution", {})
         print(f"  {row['score']:>5.1f} {row['verdict']:<10} {row['ticker']:<6} "
               f"{row.get('strategy', ''):<9} {roc:>6.1f}% {pop:>5.1f}% "
-              f"{components.get('liquidity', 0):>5.0f} {components.get('risk_reward', 0):>5.0f}  "
+              f"{execution.get('execution_grade', '?'):>5} {execution.get('suggested_limit_credit', 0):>7.2f}  "
               f"{' | '.join(row.get('score_rationale', []))}")
 
 

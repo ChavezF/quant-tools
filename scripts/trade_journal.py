@@ -231,6 +231,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_stats = sub.add_parser("stats", help="Summarize realized journal performance")
     p_stats.add_argument("--json", action="store_true")
 
+    p_profiles = sub.add_parser("profiles", help="Show ticker/strategy performance profiles")
+    p_profiles.add_argument("--section", choices=["strategy", "ticker", "ticker_strategy"], default="ticker_strategy")
+    p_profiles.add_argument("--json", action="store_true")
+
     return ap
 
 
@@ -266,6 +270,14 @@ def main() -> None:
             print(json.dumps(stats, indent=2, default=str))
         else:
             print_stats(stats)
+    elif args.cmd == "profiles":
+        from performance_profiles import build_profiles, print_profiles
+
+        profiles = build_profiles(state.get("trades", []))
+        if args.json:
+            print(json.dumps(profiles, indent=2, default=str))
+        else:
+            print_profiles(profiles, args.section)
 
 
 if __name__ == "__main__":

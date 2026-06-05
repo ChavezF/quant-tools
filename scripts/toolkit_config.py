@@ -22,6 +22,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_dte": 45,
         "target_delta": 0.30,
         "min_oi": 50,
+        "max_expirations": 1,
+        "wing_widths": [5.0],
     },
     "risk_limits": {
         "account_nav": 30000.0,
@@ -39,6 +41,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cache": {
         "enabled": True,
         "underlying_metrics_ttl_seconds": 900,
+    },
+    "alerts": {
+        "min_score": 68.0,
+        "profit_target_pct": 50.0,
+        "dte_warning": 21,
     },
 }
 
