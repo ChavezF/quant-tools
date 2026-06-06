@@ -23,10 +23,14 @@ from scan_optimizer import parse_wing_widths, select_expirations
 from toolkit_config import deep_merge
 from trade_journal import add_trade, close_trade, default_state, journal_stats
 from action_plan import build_action_plan
+from adaptive_sizing import adaptive_size
 from alerts import build_alerts
 from dashboard import build_dashboard
 from execution_tickets import build_tickets
+from feedback_calibration import build_feedback_report
+from historical_analytics import build_analytics
 from opportunity_discovery import score_discovery_metrics
+from operator_summary import build_summary
 
 
 def sample_scan_report():
@@ -272,6 +276,62 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertEqual(len(tickets), 1)
         self.assertEqual(tickets[0]["order_action"], "SELL_SPREAD_TO_OPEN")
         self.assertEqual(tickets[0]["strikes"], "475/470")
+        self.assertTrue(tickets[0]["ticket_id"].startswith("QTK-"))
+
+    def test_historical_analytics_tracks_expectancy_and_drawdown(self):
+        state = {
+            "trades": [
+                {"id": "1", "status": "CLOSED", "closed_at": "2026-06-01", "ticker": "SPY", "strategy": "BULL_PUT", "score": 72, "realized_pnl": 100, "capital_at_risk": 500},
+                {"id": "2", "status": "CLOSED", "closed_at": "2026-06-02", "ticker": "SPY", "strategy": "BULL_PUT", "score": 65, "realized_pnl": -150, "capital_at_risk": 500},
+                {"id": "3", "status": "CLOSED", "closed_at": "2026-06-03", "ticker": "QQQ", "strategy": "CSP", "score": 75, "realized_pnl": 50, "capital_at_risk": 1000},
+            ]
+        }
+        report = build_analytics(state)
+        self.assertEqual(report["overall"]["count"], 3)
+        self.assertEqual(report["overall"]["expectancy"], 0.0)
+        self.assertEqual(report["drawdown"]["max_drawdown"], 150.0)
+        self.assertEqual(len(report["equity_curve"]), 3)
+
+    def test_adaptive_sizing_throttles_negative_realized_edge(self):
+        state = {
+            "trades": [
+                {
+                    "id": str(i),
+                    "status": "CLOSED",
+                    "closed_at": f"2026-06-{i + 1:02d}",
+                    "ticker": "SPY",
+                    "strategy": "BULL_PUT",
+                    "score": 65,
+                    "realized_pnl": -50,
+                    "capital_at_risk": 500,
+                }
+                for i in range(5)
+            ]
+        }
+        sizing = adaptive_size("SPY", "BULL_PUT", build_analytics(state), {"min_trades": 5})
+        self.assertLess(sizing["multiplier"], 0.75)
+        self.assertEqual(sizing["scope"], "ticker_strategy")
+
+    def test_feedback_calibration_raises_floor_above_bad_band(self):
+        trades = []
+        for i in range(5):
+            trades.append({"id": f"L{i}", "status": "CLOSED", "closed_at": f"2026-05-{i + 1:02d}", "strategy": "CSP", "ticker": "SPY", "score": 65, "realized_pnl": -20, "capital_at_risk": 500})
+            trades.append({"id": f"H{i}", "status": "CLOSED", "closed_at": f"2026-06-{i + 1:02d}", "strategy": "CSP", "ticker": "QQQ", "score": 75, "realized_pnl": 40, "capital_at_risk": 500})
+        feedback = build_feedback_report({"trades": trades}, current_min_score=55, min_samples=5)
+        self.assertEqual(feedback["recommended_min_score"], 70.0)
+        self.assertEqual(feedback["strategy_adjustments"]["CSP"]["signal"], "BOOST")
+
+    def test_operator_summary_is_send_ready(self):
+        text = build_summary(
+            {"summary": {"approve": 1, "reduce": 0, "reject": 0}, "actions": []},
+            {"summary": {"high": 0}},
+            {"tickets": []},
+            {"overall": {"count": 3, "win_rate": 66.7, "expectancy": 25, "total_pnl": 75}, "drawdown": {"max_drawdown": 20}},
+            {"recommended_min_score": 60},
+        )
+        self.assertIn("Quant Tools Morning Review", text)
+        self.assertIn("Recommended minimum score: 60.0", text)
+        self.assertIn("Do not place orders without explicit confirmation", text)
 
     def test_dashboard_renders_core_sections(self):
         plan = {
@@ -301,6 +361,8 @@ class CoreWorkflowTests(unittest.TestCase):
         html = build_dashboard(plan=plan, alerts=alerts, tickets=tickets, manifest=manifest, base=Path("."))
         self.assertIn("Quant Tools Dashboard", html)
         self.assertIn("Action Plan", html)
+        self.assertIn("Score-Band Performance", html)
+        self.assertIn("Strategy Calibration", html)
         self.assertIn("Execution Tickets", html)
         self.assertIn("SPY", html)
 

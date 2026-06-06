@@ -62,6 +62,7 @@ def add_trade(state: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
     trades = state.setdefault("trades", [])
     trade = {
         "id": args.id or next_trade_id(trades),
+        "ticket_id": getattr(args, "ticket_id", None),
         "status": "OPEN",
         "ticker": args.ticker.upper(),
         "strategy": args.strategy.upper(),
@@ -69,6 +70,7 @@ def add_trade(state: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
         "closed_at": None,
         "quantity": args.quantity,
         "entry_credit": args.entry_credit,
+        "planned_limit_credit": getattr(args, "planned_limit_credit", None),
         "entry_debit": args.entry_debit,
         "exit_credit": None,
         "exit_debit": None,
@@ -197,10 +199,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_add = sub.add_parser("add", help="Record a newly opened trade")
     p_add.add_argument("--id")
+    p_add.add_argument("--ticket-id")
     p_add.add_argument("--ticker", required=True)
     p_add.add_argument("--strategy", required=True)
     p_add.add_argument("--quantity", type=float, default=1)
     p_add.add_argument("--entry-credit", type=float, default=0.0)
+    p_add.add_argument("--planned-limit-credit", type=float)
     p_add.add_argument("--entry-debit", type=float, default=0.0)
     p_add.add_argument("--capital-at-risk", type=float, default=0.0)
     p_add.add_argument("--max-loss", type=float, default=0.0)

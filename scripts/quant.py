@@ -146,7 +146,32 @@ def main():
     p_dashboard.add_argument("--alerts")
     p_dashboard.add_argument("--tickets")
     p_dashboard.add_argument("--manifest")
+    p_dashboard.add_argument("--analytics")
+    p_dashboard.add_argument("--feedback")
     p_dashboard.add_argument("--output")
+
+    p_analytics = sub.add_parser("analytics", help="Analyze realized journal performance")
+    p_analytics.add_argument("--journal")
+    p_analytics.add_argument("--recent-window", type=int, default=10)
+    p_analytics.add_argument("--output")
+    p_analytics.add_argument("--json", action="store_true")
+
+    p_feedback = sub.add_parser("feedback", help="Recommend score and sizing calibration")
+    p_feedback.add_argument("--journal")
+    p_feedback.add_argument("--current-min-score", type=float)
+    p_feedback.add_argument("--min-samples", type=int)
+    p_feedback.add_argument("--output")
+    p_feedback.add_argument("--json", action="store_true")
+
+    p_operator = sub.add_parser("operator", help="Run the complete morning decision workflow")
+    p_operator.add_argument("--report-dir")
+    p_operator.add_argument("--journal")
+    p_operator.add_argument("--dry-run", action="store_true")
+    p_operator.add_argument("--send", action="store_true")
+    p_operator.add_argument("--skip-brief", action="store_true")
+    p_operator.add_argument("--skip-alerts", action="store_true")
+    p_operator.add_argument("--skip-discovery", action="store_true")
+    p_operator.add_argument("--no-cache", action="store_true")
 
     p_earn = sub.add_parser("earnings", help="Earnings IV scanner")
     p_earn.add_argument("--watchlist", nargs="+", required=True)
@@ -170,7 +195,7 @@ def main():
     p_btest2.add_argument("--oos", action="store_true")
     p_btest2.add_argument("--portfolio", action="store_true")
 
-    p_mc = sub.add_parser("monte-carlo", help="Monte Carlo stress test for 16Δ strangle")
+    p_mc = sub.add_parser("monte-carlo", help="Monte Carlo stress test for 16-delta strangle")
     p_mc.add_argument("--ticker", required=True)
     p_mc.add_argument("--num-simulations", type=int, default=10000)
     p_mc.add_argument("--hold-days", type=int, default=5)
@@ -381,11 +406,59 @@ def main():
             ("alerts", "--alerts"),
             ("tickets", "--tickets"),
             ("manifest", "--manifest"),
+            ("analytics", "--analytics"),
+            ("feedback", "--feedback"),
             ("output", "--output"),
         ]:
             value = getattr(args, attr)
             if value:
                 cmd += [flag, value]
+        return run(*cmd)
+    elif args.cmd == "analytics":
+        cmd = ["historical_analytics.py"]
+        journal = args.journal or cfg.get("journal", {}).get("path")
+        if journal:
+            cmd += ["--journal", resolve_project_path(journal)]
+        cmd += ["--recent-window", str(args.recent_window)]
+        if args.output:
+            cmd += ["--output", args.output]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "feedback":
+        cmd = ["feedback_calibration.py"]
+        journal = args.journal or cfg.get("journal", {}).get("path")
+        if journal:
+            cmd += ["--journal", resolve_project_path(journal)]
+        cmd += [
+            "--current-min-score",
+            str(args.current_min_score if args.current_min_score is not None else risk_cfg["min_score"]),
+            "--min-samples",
+            str(args.min_samples if args.min_samples is not None else cfg.get("feedback", {}).get("min_samples", 5)),
+        ]
+        if args.output:
+            cmd += ["--output", args.output]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "operator":
+        cmd = ["daily_workflow.py"]
+        if args.config:
+            cmd += ["--config", args.config]
+        if args.report_dir:
+            cmd += ["--report-dir", args.report_dir]
+        if args.journal:
+            cmd += ["--journal", args.journal]
+        for flag_name, flag in [
+            ("dry_run", "--dry-run"),
+            ("send", "--send"),
+            ("skip_brief", "--skip-brief"),
+            ("skip_alerts", "--skip-alerts"),
+            ("skip_discovery", "--skip-discovery"),
+            ("no_cache", "--no-cache"),
+        ]:
+            if getattr(args, flag_name):
+                cmd += [flag]
         return run(*cmd)
     elif args.cmd == "earnings":
         return run("earnings_iv_scanner.py",

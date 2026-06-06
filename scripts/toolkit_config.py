@@ -65,6 +65,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "energy": ["XOM", "CVX"],
         "banks": ["JPM", "GS", "BAC"],
     },
+    "adaptive_sizing": {
+        "min_trades": 5,
+        "min_multiplier": 0.25,
+        "max_multiplier": 1.15,
+        "drawdown_limit_pct": 8.0,
+    },
+    "feedback": {
+        "min_samples": 5,
+    },
 }
 
 

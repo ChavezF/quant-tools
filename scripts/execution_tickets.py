@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,18 @@ def build_ticket(action: dict[str, Any]) -> dict[str, Any]:
     candidate = action.get("candidate", {})
     execution = candidate.get("execution", {})
     strategy = str(action.get("strategy") or candidate.get("strategy") or "").upper()
+    ticket_key = "|".join(
+        str(value or "")
+        for value in (
+            action.get("ticker"),
+            strategy,
+            candidate.get("expiration"),
+            strikes_text(candidate),
+            action.get("score"),
+        )
+    )
     return {
+        "ticket_id": f"QTK-{hashlib.sha1(ticket_key.encode()).hexdigest()[:10].upper()}",
         "ticker": action.get("ticker"),
         "strategy": strategy,
         "decision": action.get("action_decision"),
@@ -48,6 +60,8 @@ def build_ticket(action: dict[str, Any]) -> dict[str, Any]:
         "rationale": {
             "profile": action.get("profile_note"),
             "correlation": action.get("correlation", {}).get("note"),
+            "adaptive_sizing": action.get("adaptive_sizing", {}).get("note"),
+            "calibrated_min_score": action.get("feedback_calibration", {}).get("recommended_min_score"),
             "risk_checks_failed": [c["name"] for c in action.get("checks", []) if not c.get("ok")],
         },
         "safety": "Review manually. Do not place orders without explicit confirmation.",

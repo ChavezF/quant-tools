@@ -1,8 +1,8 @@
 # quant-tools — Public.com options & risk toolkit
 
 Production trading toolkit for the Public.com brokerage account (`5OG66124`).
-10 Python scripts that hit the live Public.com API + yfinance, plus state and
-reports directories. **No mocks, ever.**
+Python tools for live Public.com and yfinance data, decision analytics, risk
+gating, execution preparation, and operator reporting. **No mocks, ever.**
 
 ## Layout
 
@@ -37,6 +37,9 @@ cd /home/chavez_f/code/quant-tools/scripts
 /usr/bin/python3.12 quant.py alerts --plan reports/plan.json --journal state/trades.json
 /usr/bin/python3.12 quant.py tickets --plan reports/plan.json
 /usr/bin/python3.12 quant.py dashboard --report-dir reports/latest
+/usr/bin/python3.12 quant.py analytics --journal state/trades.json
+/usr/bin/python3.12 quant.py feedback --journal state/trades.json
+/usr/bin/python3.12 quant.py operator --report-dir reports
 /usr/bin/python3.12 quant.py iv-rank --tickers SPY QQQ NVDA AAPL MSFT TSLA AMD
 /usr/bin/python3.12 quant.py brief --watchlist SPY QQQ NVDA AAPL MSFT TSLA
 ```
@@ -64,7 +67,12 @@ loads `config.json` automatically when present, or you can pass a specific file:
 /usr/bin/python3.12 quant.py --config config.example.json plan --candidates reports/scan.json --portfolio reports/risk.json
 /usr/bin/python3.12 quant.py --config config.example.json daily --dry-run
 /usr/bin/python3.12 quant.py --config config.example.json dashboard --report-dir reports/latest
+/usr/bin/python3.12 quant.py --config config.example.json operator --dry-run
 ```
+
+The `operator` command produces a timestamped decision package containing
+analytics, calibration feedback, discovery, scan, risk, plan, alerts, execution
+tickets, a send-ready Markdown summary, and the sortable HTML dashboard.
 
 ## Project vs skill — what's where
 

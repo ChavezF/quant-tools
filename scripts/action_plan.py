@@ -12,8 +12,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from adaptive_sizing import adaptive_size
 from candidate_scoring import score_results
 from correlation_risk import correlation_penalty
+from feedback_calibration import build_feedback_report
+from historical_analytics import build_analytics
 from performance_profiles import build_profiles, lookup_profile, profile_note
 from pretrade_check import RiskLimits, evaluate_report
 from trade_journal import DEFAULT_STATE_FILE, journal_stats, load_state
@@ -47,6 +50,8 @@ def apply_performance_overlay(
     stats_by_strategy: dict[str, dict[str, Any]],
     profiles: dict[str, Any] | None = None,
     correlation: dict[str, Any] | None = None,
+    adaptive: dict[str, Any] | None = None,
+    feedback: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     out = dict(decision)
     strategy = str(out.get("strategy") or "").upper()
@@ -85,13 +90,28 @@ def apply_performance_overlay(
             adjusted = "REDUCE"
         multiplier = max(0.0, multiplier * (1 - float(correlation["penalty"])))
 
+    if adaptive:
+        multiplier = max(0.0, multiplier * float(adaptive.get("multiplier", 1.0)))
+        if adjusted == "APPROVE" and float(adaptive.get("multiplier", 1.0)) < 0.75:
+            adjusted = "REDUCE"
+
+    calibrated_floor = float((feedback or {}).get("recommended_min_score", 0) or 0)
+    if adjusted != "REJECT" and calibrated_floor > 0 and float(out.get("score") or 0) < calibrated_floor:
+        adjusted = "REDUCE"
+        multiplier = min(multiplier, 0.5)
+
     out["action_decision"] = adjusted
-    out["action_size_multiplier"] = multiplier
+    out["action_size_multiplier"] = round(multiplier, 3)
     out["performance_note"] = note
     out["profile_scope"] = profile_scope
     out["profile_signal"] = profile_signal
     out["profile_note"] = profile_note(profile_scope, profile)
     out["correlation"] = correlation or {}
+    out["adaptive_sizing"] = adaptive or {}
+    out["feedback_calibration"] = {
+        "recommended_min_score": calibrated_floor,
+        "threshold_reason": (feedback or {}).get("threshold_reason"),
+    }
     return out
 
 
@@ -101,11 +121,20 @@ def build_action_plan(
     journal_state: dict[str, Any] | None,
     limits: RiskLimits,
     correlation_groups: dict[str, list[str]] | None = None,
+    adaptive_config: dict[str, Any] | None = None,
+    feedback_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     score_results(screener_report)
     risk_report = evaluate_report(screener_report, portfolio_report, limits)
     stats_by_strategy = strategy_stats_map(journal_state)
-    profiles = build_profiles(journal_state.get("trades", [])) if journal_state else {}
+    trades = journal_state.get("trades", []) if journal_state else []
+    profiles = build_profiles(trades)
+    analytics = build_analytics(journal_state or {"trades": []})
+    feedback = build_feedback_report(
+        journal_state or {"trades": []},
+        current_min_score=limits.min_score,
+        min_samples=int((feedback_config or {}).get("min_samples", 5)),
+    )
     actions = []
     for decision in risk_report.get("decisions", []):
         corr = correlation_penalty(
@@ -114,7 +143,13 @@ def build_action_plan(
             correlation_groups or {},
             limits.account_nav,
         )
-        actions.append(apply_performance_overlay(decision, stats_by_strategy, profiles, corr))
+        sizing = adaptive_size(
+            str(decision.get("ticker") or ""),
+            str(decision.get("strategy") or ""),
+            analytics,
+            adaptive_config,
+        )
+        actions.append(apply_performance_overlay(decision, stats_by_strategy, profiles, corr, sizing, feedback))
 
     approved = [a for a in actions if a["action_decision"] == "APPROVE"]
     reduced = [a for a in actions if a["action_decision"] == "REDUCE"]
@@ -123,6 +158,8 @@ def build_action_plan(
     return {
         "limits": risk_report["limits"],
         "journal_stats": journal_stats(journal_state.get("trades", [])) if journal_state else None,
+        "historical_analytics": analytics,
+        "feedback_calibration": feedback,
         "performance_profiles": profiles,
         "summary": {
             "approve": len(approved),
@@ -210,7 +247,15 @@ def main() -> None:
     if args.correlation_groups:
         correlation_groups = json.loads(Path(args.correlation_groups).read_text())
 
-    plan = build_action_plan(screener_report, portfolio_report, journal_state, limits, correlation_groups)
+    plan = build_action_plan(
+        screener_report,
+        portfolio_report,
+        journal_state,
+        limits,
+        correlation_groups,
+        cfg.get("adaptive_sizing", {}),
+        cfg.get("feedback", {}),
+    )
     if args.json:
         print(json.dumps(plan, indent=2, default=str))
         return

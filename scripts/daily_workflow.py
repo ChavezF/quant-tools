@@ -3,7 +3,8 @@
 daily_workflow.py - run the saved daily quant workflow.
 
 Pipeline:
-  discovery -> scan -> risk -> plan -> alerts -> tickets -> dashboard -> brief
+  analytics -> feedback -> discovery -> scan -> risk -> plan -> alerts ->
+  tickets -> brief -> operator summary -> dashboard
 
 Each run writes into reports/YYYYMMDD-HHMMSS/ so the morning process is
 repeatable and auditable.
@@ -99,6 +100,35 @@ def build_discovery_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[s
     ]
 
 
+def journal_path(cfg: dict[str, Any], args: argparse.Namespace) -> str:
+    return resolve_project_path(args.journal or cfg.get("journal", {}).get("path")) or ""
+
+
+def build_analytics_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    return [
+        PY,
+        str(SCRIPTS_DIR / "historical_analytics.py"),
+        "--journal",
+        journal_path(cfg, args),
+        "--json",
+    ]
+
+
+def build_feedback_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    feedback_cfg = cfg.get("feedback", {})
+    return [
+        PY,
+        str(SCRIPTS_DIR / "feedback_calibration.py"),
+        "--journal",
+        journal_path(cfg, args),
+        "--current-min-score",
+        str(args.min_score if args.min_score is not None else cfg["risk_limits"]["min_score"]),
+        "--min-samples",
+        str(feedback_cfg.get("min_samples", 5)),
+        "--json",
+    ]
+
+
 def build_risk_cmd(args: argparse.Namespace, watchlist: list[str] | None) -> list[str]:
     cmd = [PY, str(SCRIPTS_DIR / "portfolio_risk.py"), "--json"]
     if args.target_watchlist:
@@ -168,6 +198,10 @@ def build_dashboard_cmd(run_dir: Path) -> list[str]:
     return [PY, str(SCRIPTS_DIR / "dashboard.py"), "--report-dir", str(run_dir)]
 
 
+def build_operator_summary_cmd(run_dir: Path) -> list[str]:
+    return [PY, str(SCRIPTS_DIR / "operator_summary.py"), "--report-dir", str(run_dir)]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     add_config_argument(ap)
@@ -206,6 +240,8 @@ def main() -> None:
 
     cfg = load_config(args.config)
     run_dir = ensure_report_dir(args.report_dir)
+    analytics_report = run_dir / "analytics.json"
+    feedback_report = run_dir / "feedback.json"
     discovery_report = run_dir / "discovery.json"
     scan_report = run_dir / "scan.json"
     risk_report = run_dir / "risk.json"
@@ -217,6 +253,8 @@ def main() -> None:
         "created_at": datetime.now().isoformat(),
         "run_dir": str(run_dir),
         "reports": {
+            "analytics": str(analytics_report),
+            "feedback": str(feedback_report),
             "discovery": str(discovery_report) if not args.skip_discovery else None,
             "scan": str(scan_report),
             "risk": str(risk_report) if not args.skip_risk else None,
@@ -224,10 +262,21 @@ def main() -> None:
             "brief": str(run_dir / "brief.out") if not args.skip_brief else None,
             "alerts": str(run_dir / "alerts.json") if not args.skip_alerts else None,
             "tickets": str(run_dir / "tickets.json"),
+            "operator_summary": str(run_dir / "operator_summary.md"),
             "dashboard": str(run_dir / "dashboard.html"),
         },
         "steps": [],
     }
+
+    analytics_meta = run_command("analytics", build_analytics_cmd(cfg, args), run_dir, dry_run=args.dry_run)
+    manifest["steps"].append(analytics_meta)
+    if not args.dry_run and analytics_meta["returncode"] == 0:
+        analytics_report.write_text(Path(analytics_meta["stdout"]).read_text())
+
+    feedback_meta = run_command("feedback", build_feedback_cmd(cfg, args), run_dir, dry_run=args.dry_run)
+    manifest["steps"].append(feedback_meta)
+    if not args.dry_run and feedback_meta["returncode"] == 0:
+        feedback_report.write_text(Path(feedback_meta["stdout"]).read_text())
 
     if not args.skip_discovery:
         discovery_meta = run_command("discovery", build_discovery_cmd(cfg, args), run_dir, dry_run=args.dry_run)
@@ -283,10 +332,13 @@ def main() -> None:
         manifest["steps"].append(run_command("brief", brief_cmd, run_dir, dry_run=args.dry_run))
 
     if args.dry_run:
+        manifest["steps"].append(run_command("operator_summary", build_operator_summary_cmd(run_dir), run_dir, dry_run=True))
         manifest["steps"].append(run_command("dashboard", build_dashboard_cmd(run_dir), run_dir, dry_run=True))
         write_json(manifest_path, manifest)
     else:
         write_json(manifest_path, manifest)
+        summary_meta = run_command("operator_summary", build_operator_summary_cmd(run_dir), run_dir, dry_run=False)
+        manifest["steps"].append(summary_meta)
         dashboard_meta = run_command("dashboard", build_dashboard_cmd(run_dir), run_dir, dry_run=False)
         manifest["steps"].append(dashboard_meta)
         write_json(manifest_path, manifest)
