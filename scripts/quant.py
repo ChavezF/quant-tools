@@ -117,6 +117,8 @@ def main():
     p_daily.add_argument("--dry-run", action="store_true")
 
     p_journal = sub.add_parser("journal", help="Trade journal add/list/close/stats")
+    p_journal.add_argument("--state-file")
+    p_journal.add_argument("--db")
     p_journal.add_argument("journal_args", nargs=argparse.REMAINDER)
 
     p_alerts = sub.add_parser("alerts", help="Generate alerts from plan and journal state")
@@ -148,6 +150,8 @@ def main():
     p_dashboard.add_argument("--manifest")
     p_dashboard.add_argument("--analytics")
     p_dashboard.add_argument("--feedback")
+    p_dashboard.add_argument("--reconciliation")
+    p_dashboard.add_argument("--execution-analytics")
     p_dashboard.add_argument("--output")
 
     p_analytics = sub.add_parser("analytics", help="Analyze realized journal performance")
@@ -166,12 +170,40 @@ def main():
     p_operator = sub.add_parser("operator", help="Run the complete morning decision workflow")
     p_operator.add_argument("--report-dir")
     p_operator.add_argument("--journal")
+    p_operator.add_argument("--broker-snapshot")
     p_operator.add_argument("--dry-run", action="store_true")
     p_operator.add_argument("--send", action="store_true")
     p_operator.add_argument("--skip-brief", action="store_true")
     p_operator.add_argument("--skip-alerts", action="store_true")
     p_operator.add_argument("--skip-discovery", action="store_true")
+    p_operator.add_argument("--skip-storage", action="store_true")
     p_operator.add_argument("--no-cache", action="store_true")
+
+    p_storage = sub.add_parser("storage", help="Sync workflow artifacts into SQLite")
+    p_storage.add_argument("--db")
+    p_storage.add_argument("--journal")
+    p_storage.add_argument("--tickets")
+    p_storage.add_argument("--portfolio")
+    p_storage.add_argument("--broker-snapshot")
+    p_storage.add_argument("--output")
+    p_storage.add_argument("--export-journal")
+    p_storage.add_argument("--json", action="store_true")
+
+    p_reconcile = sub.add_parser("reconcile", help="Reconcile tickets and journal against broker data")
+    p_reconcile.add_argument("--journal", required=True)
+    p_reconcile.add_argument("--tickets", required=True)
+    p_reconcile.add_argument("--broker-snapshot", required=True)
+    p_reconcile.add_argument("--output")
+    p_reconcile.add_argument("--apply-updates", action="store_true")
+    p_reconcile.add_argument("--journal-output")
+    p_reconcile.add_argument("--db")
+    p_reconcile.add_argument("--json", action="store_true")
+
+    p_execution = sub.add_parser("execution-analytics", help="Measure fill quality and ticket execution")
+    p_execution.add_argument("--tickets", required=True)
+    p_execution.add_argument("--reconciliation", required=True)
+    p_execution.add_argument("--output")
+    p_execution.add_argument("--json", action="store_true")
 
     p_earn = sub.add_parser("earnings", help="Earnings IV scanner")
     p_earn.add_argument("--watchlist", nargs="+", required=True)
@@ -356,7 +388,13 @@ def main():
                 cmd += [flag]
         return run(*cmd)
     elif args.cmd == "journal":
-        return run("trade_journal.py", *args.journal_args)
+        cmd = ["trade_journal.py"]
+        if args.state_file:
+            cmd += ["--state-file", args.state_file]
+        if args.db:
+            cmd += ["--db", args.db]
+        cmd += args.journal_args
+        return run(*cmd)
     elif args.cmd == "alerts":
         cmd = [
             "alerts.py",
@@ -408,6 +446,8 @@ def main():
             ("manifest", "--manifest"),
             ("analytics", "--analytics"),
             ("feedback", "--feedback"),
+            ("reconciliation", "--reconciliation"),
+            ("execution_analytics", "--execution-analytics"),
             ("output", "--output"),
         ]:
             value = getattr(args, attr)
@@ -449,16 +489,75 @@ def main():
             cmd += ["--report-dir", args.report_dir]
         if args.journal:
             cmd += ["--journal", args.journal]
+        if args.broker_snapshot:
+            cmd += ["--broker-snapshot", args.broker_snapshot]
         for flag_name, flag in [
             ("dry_run", "--dry-run"),
             ("send", "--send"),
             ("skip_brief", "--skip-brief"),
             ("skip_alerts", "--skip-alerts"),
             ("skip_discovery", "--skip-discovery"),
+            ("skip_storage", "--skip-storage"),
             ("no_cache", "--no-cache"),
         ]:
             if getattr(args, flag_name):
                 cmd += [flag]
+        return run(*cmd)
+    elif args.cmd == "storage":
+        cmd = ["storage_sync.py"]
+        storage_cfg = cfg.get("storage", {})
+        db_path = args.db or storage_cfg.get("path")
+        journal = args.journal or cfg.get("journal", {}).get("path")
+        if db_path:
+            cmd += ["--db", resolve_project_path(db_path)]
+        if journal:
+            cmd += ["--journal", resolve_project_path(journal)]
+        for attr, flag in [
+            ("tickets", "--tickets"),
+            ("portfolio", "--portfolio"),
+            ("broker_snapshot", "--broker-snapshot"),
+            ("output", "--output"),
+            ("export_journal", "--export-journal"),
+        ]:
+            value = getattr(args, attr)
+            if value:
+                cmd += [flag, value]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "reconcile":
+        cmd = [
+            "broker_reconciliation.py",
+            "--journal",
+            args.journal,
+            "--tickets",
+            args.tickets,
+            "--broker-snapshot",
+            args.broker_snapshot,
+        ]
+        if args.output:
+            cmd += ["--output", args.output]
+        if args.apply_updates:
+            cmd += ["--apply-updates"]
+        if args.journal_output:
+            cmd += ["--journal-output", args.journal_output]
+        if args.db:
+            cmd += ["--db", args.db]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "execution-analytics":
+        cmd = [
+            "execution_analytics.py",
+            "--tickets",
+            args.tickets,
+            "--reconciliation",
+            args.reconciliation,
+        ]
+        if args.output:
+            cmd += ["--output", args.output]
+        if args.json:
+            cmd += ["--json"]
         return run(*cmd)
     elif args.cmd == "earnings":
         return run("earnings_iv_scanner.py",

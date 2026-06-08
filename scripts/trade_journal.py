@@ -41,6 +41,28 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     path.write_text(json.dumps(state, indent=2, default=str))
 
 
+def load_backend(state_file: Path, db_path: str | None) -> tuple[dict[str, Any], Any]:
+    json_state = load_state(state_file)
+    if not db_path:
+        return json_state, None
+    from storage import connect, export_journal_state, upsert_trades
+
+    con = connect(db_path)
+    db_state = export_journal_state(con)
+    if db_state.get("trades"):
+        return db_state, con
+    upsert_trades(con, json_state.get("trades", []))
+    return json_state, con
+
+
+def save_backend(state_file: Path, state: dict[str, Any], con: Any = None) -> None:
+    save_state(state_file, state)
+    if con is not None:
+        from storage import upsert_trades
+
+        upsert_trades(con, state.get("trades", []))
+
+
 def next_trade_id(trades: list[dict[str, Any]]) -> str:
     today = date.today().strftime("%Y%m%d")
     prefix = f"T{today}-"
@@ -195,6 +217,7 @@ def print_stats(stats: dict[str, Any]) -> None:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--state-file", default=str(DEFAULT_STATE_FILE))
+    ap.add_argument("--db", help="Optional SQLite database; JSON remains dual-written for compatibility")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_add = sub.add_parser("add", help="Record a newly opened trade")
@@ -246,18 +269,18 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     state_file = Path(args.state_file)
-    state = load_state(state_file)
+    state, con = load_backend(state_file, args.db)
 
     if args.cmd == "add":
         trade = add_trade(state, args)
-        save_state(state_file, state)
+        save_backend(state_file, state, con)
         if args.json:
             print(json.dumps(trade, indent=2, default=str))
         else:
             print(f"Added trade {trade['id']} ({trade['ticker']} {trade['strategy']})")
     elif args.cmd == "close":
         trade = close_trade(state, args)
-        save_state(state_file, state)
+        save_backend(state_file, state, con)
         if args.json:
             print(json.dumps(trade, indent=2, default=str))
         else:
@@ -282,6 +305,8 @@ def main() -> None:
             print(json.dumps(profiles, indent=2, default=str))
         else:
             print_profiles(profiles, args.section)
+    if con is not None:
+        con.close()
 
 
 if __name__ == "__main__":

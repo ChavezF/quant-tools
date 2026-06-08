@@ -74,6 +74,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "feedback": {
         "min_samples": 5,
     },
+    "storage": {
+        "enabled": True,
+        "path": "state/quant_tools.db",
+        "broker_snapshot": None,
+    },
 }
 
 

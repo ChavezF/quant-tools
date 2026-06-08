@@ -60,5 +60,10 @@
   },
   "feedback": {
     "min_samples": 5
+  },
+  "storage": {
+    "enabled": true,
+    "path": "state/quant_tools.db",
+    "broker_snapshot": null
   }
 }

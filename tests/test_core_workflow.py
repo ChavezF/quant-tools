@@ -17,6 +17,7 @@ from common import parse_osi_expiration, parse_osi_parts, parse_osi_strike
 from data_reliability import quote_is_stale, retry_call, utc_now_iso
 from correlation_risk import correlation_penalty
 from execution_quality import execution_quality
+from execution_analytics import build_execution_analytics
 from performance_profiles import build_profiles, lookup_profile
 from pretrade_check import RiskLimits, evaluate_report
 from scan_optimizer import parse_wing_widths, select_expirations
@@ -25,12 +26,14 @@ from trade_journal import add_trade, close_trade, default_state, journal_stats
 from action_plan import build_action_plan
 from adaptive_sizing import adaptive_size
 from alerts import build_alerts
+from broker_reconciliation import apply_journal_updates, build_reconciliation
 from dashboard import build_dashboard
 from execution_tickets import build_tickets
 from feedback_calibration import build_feedback_report
 from historical_analytics import build_analytics
 from opportunity_discovery import score_discovery_metrics
 from operator_summary import build_summary
+from storage import connect, export_journal_state, table_counts, upsert_tickets, upsert_trades
 
 
 def sample_scan_report():
@@ -332,6 +335,113 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertIn("Quant Tools Morning Review", text)
         self.assertIn("Recommended minimum score: 60.0", text)
         self.assertIn("Do not place orders without explicit confirmation", text)
+
+    def test_sqlite_storage_migrates_and_upserts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "quant.db"
+            con = connect(db_path)
+            try:
+                trade = {"id": "T1", "ticket_id": "QTK-1", "status": "OPEN", "ticker": "SPY", "strategy": "BULL_PUT"}
+                ticket = {"ticket_id": "QTK-1", "ticker": "SPY", "strategy": "BULL_PUT", "decision": "APPROVE"}
+                upsert_trades(con, [trade])
+                upsert_trades(con, [{**trade, "status": "CLOSED"}])
+                upsert_tickets(con, [ticket])
+                counts = table_counts(con)
+                self.assertEqual(counts["trades"], 1)
+                self.assertEqual(counts["tickets"], 1)
+                self.assertEqual(export_journal_state(con)["trades"][0]["status"], "CLOSED")
+            finally:
+                con.close()
+
+    def test_broker_reconciliation_matches_ticket_and_position(self):
+        journal = {
+            "trades": [
+                {"id": "T1", "ticket_id": "QTK-1", "status": "OPEN", "ticker": "SPY", "strategy": "BULL_PUT"}
+            ]
+        }
+        tickets = {
+            "tickets": [
+                {"ticket_id": "QTK-1", "ticker": "SPY", "strategy": "BULL_PUT", "limit_credit": 1.1}
+            ]
+        }
+        broker = {
+            "fills": [{"fill_id": "F1", "ticket_id": "QTK-1", "ticker": "SPY", "strategy": "BULL_PUT", "price": 1.12}],
+            "positions": [{"symbol": "SPY260717P00475000", "type": "OPTION", "quantity": -1}],
+        }
+        report = build_reconciliation(journal, tickets, broker)
+        self.assertEqual(report["summary"]["matched_tickets"], 1)
+        self.assertEqual(report["summary"]["missing_positions"], 0)
+        self.assertEqual(report["proposed_journal_updates"][0]["set"]["broker_fill_id"], "F1")
+
+        partial = build_reconciliation(
+            {
+                "trades": [
+                    {
+                        "id": "T2",
+                        "status": "OPEN",
+                        "ticker": "SPY",
+                        "strategy": "BULL_PUT",
+                        "expiration": "2026-07-17",
+                        "strikes": "475/470",
+                    }
+                ]
+            },
+            {"tickets": []},
+            {"positions": [{"symbol": "SPY260717P00475000", "type": "OPTION", "quantity": -1}], "fills": []},
+        )
+        self.assertEqual(partial["summary"]["partial_positions"], 1)
+        self.assertEqual(partial["summary"]["position_exceptions"], 1)
+
+    def test_reconciliation_applies_journal_updates_explicitly(self):
+        journal = {
+            "trades": [
+                {"id": "T1", "ticket_id": "QTK-1", "status": "OPEN", "ticker": "SPY", "strategy": "BULL_PUT"}
+            ]
+        }
+        updates = [
+            {
+                "trade_id": "T1",
+                "ticket_id": "QTK-1",
+                "set": {"planned_limit_credit": 1.1, "entry_credit": 1.12, "broker_fill_id": "F1"},
+            }
+        ]
+        applied = apply_journal_updates(journal, updates)
+        trade = applied["journal"]["trades"][0]
+        self.assertEqual(trade["entry_credit"], 1.12)
+        self.assertEqual(trade["broker_fill_id"], "F1")
+        self.assertEqual(len(applied["applied_updates"]), 1)
+
+    def test_execution_analytics_measures_fill_quality(self):
+        tickets = {
+            "tickets": [
+                {
+                    "ticket_id": "QTK-1",
+                    "ticker": "SPY",
+                    "strategy": "BULL_PUT",
+                    "execution_grade": "B",
+                    "limit_credit": 1.10,
+                    "do_not_chase_below": 1.00,
+                },
+                {
+                    "ticket_id": "QTK-2",
+                    "ticker": "QQQ",
+                    "strategy": "CSP",
+                    "execution_grade": "A",
+                    "limit_credit": 2.00,
+                    "do_not_chase_below": 1.80,
+                },
+            ]
+        }
+        reconciliation = {
+            "ticket_matches": [
+                {"ticket_id": "QTK-1", "status": "MATCHED", "fill_price": 1.12},
+                {"ticket_id": "QTK-2", "status": "MATCHED", "fill_price": 1.75},
+            ]
+        }
+        report = build_execution_analytics(tickets, reconciliation)
+        self.assertEqual(report["summary"]["fill_rate"], 100.0)
+        self.assertEqual(report["summary"]["avg_credit_improvement"], -0.115)
+        self.assertEqual(report["summary"]["floor_violations"], 1)
 
     def test_dashboard_renders_core_sections(self):
         plan = {

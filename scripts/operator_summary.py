@@ -24,7 +24,13 @@ def build_summary(
     tickets: dict[str, Any],
     analytics: dict[str, Any],
     feedback: dict[str, Any],
+    reconciliation: dict[str, Any] | None = None,
+    execution_analytics: dict[str, Any] | None = None,
 ) -> str:
+    reconciliation = reconciliation or {}
+    reconciliation = reconciliation.get("reconciliation", reconciliation)
+    recon_summary = reconciliation.get("summary", {})
+    execution_summary = (execution_analytics or {}).get("summary", {})
     summary = plan.get("summary", {})
     overall = analytics.get("overall", {})
     drawdown = analytics.get("drawdown", {})
@@ -40,6 +46,11 @@ def build_summary(
         f"- Rejected: {summary.get('reject', 0)}",
         f"- High-priority alerts: {alerts.get('summary', {}).get('high', 0)}",
         f"- Execution tickets: {len(tickets.get('tickets', []))}",
+        f"- Unmatched tickets: {recon_summary.get('unmatched_tickets', 0)}",
+        f"- Broker position exceptions: {recon_summary.get('position_exceptions', recon_summary.get('missing_positions', 0))}",
+        f"- Fill rate: {float(execution_summary.get('fill_rate', 0) or 0):.1f}%",
+        f"- Average credit vs plan: {float(execution_summary.get('avg_credit_improvement', 0) or 0):+.3f}",
+        f"- Execution floor violations: {execution_summary.get('floor_violations', 0)}",
         "",
         "## Realized Edge",
         "",
@@ -101,6 +112,8 @@ def main() -> None:
         read_json(base / "tickets.json"),
         read_json(base / "analytics.json"),
         read_json(base / "feedback.json"),
+        read_json(base / "reconciliation.json"),
+        read_json(base / "execution_analytics.json"),
     )
     output.write_text(text)
     print(output)

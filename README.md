@@ -40,6 +40,11 @@ cd /home/chavez_f/code/quant-tools/scripts
 /usr/bin/python3.12 quant.py analytics --journal state/trades.json
 /usr/bin/python3.12 quant.py feedback --journal state/trades.json
 /usr/bin/python3.12 quant.py operator --report-dir reports
+/usr/bin/python3.12 quant.py storage --journal state/trades.json --tickets reports/latest/tickets.json --portfolio reports/latest/risk.json
+/usr/bin/python3.12 quant.py reconcile --journal state/trades.json --tickets reports/latest/tickets.json --broker-snapshot state/broker_snapshot.json
+/usr/bin/python3.12 quant.py reconcile --journal state/trades.json --tickets reports/latest/tickets.json --broker-snapshot state/broker_snapshot.json --apply-updates --db state/quant_tools.db
+/usr/bin/python3.12 quant.py execution-analytics --tickets reports/latest/tickets.json --reconciliation reports/latest/reconciliation.json
+/usr/bin/python3.12 quant.py journal --db state/quant_tools.db add --ticker SPY --strategy BULL_PUT --entry-credit 1.10
 /usr/bin/python3.12 quant.py iv-rank --tickers SPY QQQ NVDA AAPL MSFT TSLA AMD
 /usr/bin/python3.12 quant.py brief --watchlist SPY QQQ NVDA AAPL MSFT TSLA
 ```
@@ -72,7 +77,43 @@ loads `config.json` automatically when present, or you can pass a specific file:
 
 The `operator` command produces a timestamped decision package containing
 analytics, calibration feedback, discovery, scan, risk, plan, alerts, execution
-tickets, a send-ready Markdown summary, and the sortable HTML dashboard.
+tickets, broker reconciliation, a send-ready Markdown summary, and the sortable
+HTML dashboard. It also synchronizes journal, ticket, position, fill, and
+reconciliation records into `state/quant_tools.db` by default, then reports
+fill rate, credit improvement or slippage versus plan, and execution-floor
+violations by strategy.
+
+## SQLite and broker reconciliation
+
+SQLite is a durable mirror of the existing JSON workflow, so current scripts
+remain compatible while the migration proceeds. Schema creation and upgrades
+run automatically through `PRAGMA user_version`. Journal writes can dual-write
+SQLite with `journal --db state/quant_tools.db ...`.
+
+Broker fill imports use a provider-neutral JSON snapshot:
+
+```json
+{
+  "positions": [
+    {"symbol": "SPY260717P00475000", "type": "OPTION", "quantity": -1}
+  ],
+  "fills": [
+    {
+      "fill_id": "broker-fill-123",
+      "ticket_id": "QTK-ABC123",
+      "ticker": "SPY",
+      "strategy": "BULL_PUT",
+      "price": 1.12,
+      "filled_at": "2026-06-07T10:15:00-04:00"
+    }
+  ]
+}
+```
+
+Ticket IDs are matched first. Ticker, strategy, expiration, and strikes are
+used only as a fallback. Reconciliation proposes journal updates but never
+applies fill data unless `--apply-updates` is passed explicitly, and it never
+places orders automatically.
 
 ## Project vs skill — what's where
 

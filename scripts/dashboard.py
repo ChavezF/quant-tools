@@ -147,6 +147,23 @@ def render_strategy_feedback(feedback: dict[str, Any]) -> str:
     return "\n".join(rows)
 
 
+def render_execution_breakdown(execution_analytics: dict[str, Any]) -> str:
+    rows = []
+    for strategy, row in execution_analytics.get("by_strategy", {}).items():
+        rows.append(
+            "<tr>"
+            f"<td>{esc(strategy)}</td>"
+            f"<td>{esc(row.get('tickets'))}</td>"
+            f"<td>{float(row.get('fill_rate') or 0):.1f}%</td>"
+            f"<td>{float(row.get('avg_credit_improvement') or 0):+.3f}</td>"
+            f"<td>{esc(row.get('floor_violations'))}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='5'>No execution history.</td></tr>")
+    return "\n".join(rows)
+
+
 def render_links(manifest: dict[str, Any], base: Path) -> str:
     reports = manifest.get("reports", {})
     links = []
@@ -168,9 +185,16 @@ def build_dashboard(
     base: Path,
     analytics: dict[str, Any] | None = None,
     feedback: dict[str, Any] | None = None,
+    reconciliation: dict[str, Any] | None = None,
+    execution_analytics: dict[str, Any] | None = None,
 ) -> str:
     analytics = analytics or plan.get("historical_analytics", {})
     feedback = feedback or {}
+    reconciliation = reconciliation or {}
+    reconciliation = reconciliation.get("reconciliation", reconciliation)
+    recon_summary = reconciliation.get("summary", {})
+    execution_analytics = execution_analytics or {}
+    execution_summary = execution_analytics.get("summary", {})
     plan_summary = plan.get("summary", {})
     alert_summary = alerts.get("summary", {})
     overall = analytics.get("overall", {})
@@ -227,6 +251,10 @@ def build_dashboard(
       <div class="card">Expectancy<b>{money(overall.get('expectancy'))}</b></div>
       <div class="card">Max Drawdown<b>{money(drawdown.get('max_drawdown'))}</b></div>
       <div class="card">Min Score<b>{float(feedback.get('recommended_min_score') or 0):.0f}</b></div>
+      <div class="card">Unmatched Tickets<b>{esc(recon_summary.get('unmatched_tickets', 0))}</b></div>
+      <div class="card">Position Exceptions<b>{esc(recon_summary.get('position_exceptions', recon_summary.get('missing_positions', 0)))}</b></div>
+      <div class="card">Fill Rate<b>{float(execution_summary.get('fill_rate') or 0):.0f}%</b></div>
+      <div class="card">Credit vs Plan<b>{float(execution_summary.get('avg_credit_improvement') or 0):+.3f}</b></div>
     </section>
     <h2>Action Plan</h2>
     <div class="table-wrap"><table class="sortable">
@@ -249,6 +277,11 @@ def build_dashboard(
         </table></div>
       </section>
     </div>
+    <h2>Execution Quality</h2>
+    <div class="table-wrap"><table class="sortable">
+      <thead><tr><th data-sort>Strategy</th><th data-sort>Tickets</th><th data-sort>Fill Rate</th><th data-sort>Credit vs Plan</th><th data-sort>Floor Violations</th></tr></thead>
+      <tbody>{render_execution_breakdown(execution_analytics)}</tbody>
+    </table></div>
     <h2>Alerts</h2>
     <div class="table-wrap"><table class="sortable">
       <thead><tr><th>Priority</th><th>Kind</th><th>Title</th><th>Detail</th></tr></thead>
@@ -297,6 +330,8 @@ def main() -> None:
     ap.add_argument("--manifest")
     ap.add_argument("--analytics")
     ap.add_argument("--feedback")
+    ap.add_argument("--reconciliation")
+    ap.add_argument("--execution-analytics")
     ap.add_argument("--output")
     args = ap.parse_args()
 
@@ -307,6 +342,8 @@ def main() -> None:
     manifest_path = Path(args.manifest) if args.manifest else base / "manifest.json"
     analytics_path = Path(args.analytics) if args.analytics else base / "analytics.json"
     feedback_path = Path(args.feedback) if args.feedback else base / "feedback.json"
+    reconciliation_path = Path(args.reconciliation) if args.reconciliation else base / "reconciliation.json"
+    execution_path = Path(args.execution_analytics) if args.execution_analytics else base / "execution_analytics.json"
     output_path = Path(args.output) if args.output else base / "dashboard.html"
 
     html_out = build_dashboard(
@@ -317,6 +354,8 @@ def main() -> None:
         base=base,
         analytics=read_json(analytics_path),
         feedback=read_json(feedback_path),
+        reconciliation=read_json(reconciliation_path),
+        execution_analytics=read_json(execution_path),
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html_out)

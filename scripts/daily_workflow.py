@@ -4,7 +4,8 @@ daily_workflow.py - run the saved daily quant workflow.
 
 Pipeline:
   analytics -> feedback -> discovery -> scan -> risk -> plan -> alerts ->
-  tickets -> brief -> operator summary -> dashboard
+  tickets -> storage/reconciliation -> execution analytics -> brief ->
+  operator summary -> dashboard
 
 Each run writes into reports/YYYYMMDD-HHMMSS/ so the morning process is
 repeatable and auditable.
@@ -202,6 +203,45 @@ def build_operator_summary_cmd(run_dir: Path) -> list[str]:
     return [PY, str(SCRIPTS_DIR / "operator_summary.py"), "--report-dir", str(run_dir)]
 
 
+def build_storage_cmd(
+    cfg: dict[str, Any],
+    args: argparse.Namespace,
+    run_dir: Path,
+    risk_report: Path,
+    tickets_report: Path,
+) -> list[str]:
+    storage_cfg = cfg.get("storage", {})
+    cmd = [
+        PY,
+        str(SCRIPTS_DIR / "storage_sync.py"),
+        "--db",
+        resolve_project_path(storage_cfg.get("path")) or str(PROJECT_ROOT / "state" / "quant_tools.db"),
+        "--journal",
+        journal_path(cfg, args),
+        "--tickets",
+        str(tickets_report),
+        "--portfolio",
+        str(risk_report),
+        "--json",
+    ]
+    broker_snapshot = args.broker_snapshot or storage_cfg.get("broker_snapshot")
+    if broker_snapshot:
+        cmd += ["--broker-snapshot", resolve_project_path(broker_snapshot)]
+    return cmd
+
+
+def build_execution_analytics_cmd(tickets_report: Path, reconciliation_report: Path) -> list[str]:
+    return [
+        PY,
+        str(SCRIPTS_DIR / "execution_analytics.py"),
+        "--tickets",
+        str(tickets_report),
+        "--reconciliation",
+        str(reconciliation_report),
+        "--json",
+    ]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     add_config_argument(ap)
@@ -216,6 +256,7 @@ def main() -> None:
     ap.add_argument("--wing-widths", nargs="+", type=float)
     ap.add_argument("--target-watchlist", nargs="+")
     ap.add_argument("--journal")
+    ap.add_argument("--broker-snapshot")
     ap.add_argument("--report-dir")
     ap.add_argument("--account-nav", type=float)
     ap.add_argument("--max-trade-risk-pct", type=float)
@@ -233,12 +274,14 @@ def main() -> None:
     ap.add_argument("--skip-risk", action="store_true")
     ap.add_argument("--skip-brief", action="store_true")
     ap.add_argument("--skip-alerts", action="store_true")
+    ap.add_argument("--skip-storage", action="store_true")
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--send", action="store_true", help="Send the daily brief instead of dry-run printing it")
     ap.add_argument("--dry-run", action="store_true", help="Print planned commands without running live API steps")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    storage_enabled = bool(cfg.get("storage", {}).get("enabled", True)) and not args.skip_storage
     run_dir = ensure_report_dir(args.report_dir)
     analytics_report = run_dir / "analytics.json"
     feedback_report = run_dir / "feedback.json"
@@ -262,6 +305,8 @@ def main() -> None:
             "brief": str(run_dir / "brief.out") if not args.skip_brief else None,
             "alerts": str(run_dir / "alerts.json") if not args.skip_alerts else None,
             "tickets": str(run_dir / "tickets.json"),
+            "reconciliation": str(run_dir / "reconciliation.json") if storage_enabled else None,
+            "execution_analytics": str(run_dir / "execution_analytics.json") if storage_enabled else None,
             "operator_summary": str(run_dir / "operator_summary.md"),
             "dashboard": str(run_dir / "dashboard.html"),
         },
@@ -326,6 +371,26 @@ def main() -> None:
         manifest["steps"].append(tickets_meta)
         if tickets_meta["returncode"] == 0:
             tickets_report.write_text(Path(tickets_meta["stdout"]).read_text())
+
+    reconciliation_report = run_dir / "reconciliation.json"
+    if storage_enabled:
+        storage_cmd = build_storage_cmd(cfg, args, run_dir, risk_report, tickets_report)
+        storage_meta = run_command("storage", storage_cmd, run_dir, dry_run=args.dry_run)
+        manifest["steps"].append(storage_meta)
+        if not args.dry_run and storage_meta["returncode"] == 0:
+            reconciliation_report.write_text(Path(storage_meta["stdout"]).read_text())
+
+        if args.dry_run or storage_meta["returncode"] == 0:
+            execution_report = run_dir / "execution_analytics.json"
+            execution_meta = run_command(
+                "execution_analytics",
+                build_execution_analytics_cmd(tickets_report, reconciliation_report),
+                run_dir,
+                dry_run=args.dry_run,
+            )
+            manifest["steps"].append(execution_meta)
+            if not args.dry_run and execution_meta["returncode"] == 0:
+                execution_report.write_text(Path(execution_meta["stdout"]).read_text())
 
     if not args.skip_brief:
         brief_cmd = build_brief_cmd(args, watchlist)
