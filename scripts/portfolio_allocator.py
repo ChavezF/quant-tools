@@ -172,9 +172,14 @@ def allocate_portfolio(plan: dict[str, Any], config: dict[str, Any] | None = Non
         selected_actions.append(selected_action)
 
     projected_delta = base_delta + delta_change
+    # Pass through sizing_mode metadata when the caller provided it (via
+    # apply_sizing_mode) so the operator can see at a glance whether the
+    # basket was sized at cautious/normal/aggressive.
+    extras = {k: configured[k] for k in ("sizing_mode", "sizing_multiplier") if k in configured}
     return {
         "limits": {
             **limits,
+            **extras,
             "account_nav": account_nav,
             "capital_budget": round(capital_budget, 2),
             "tail_loss_budget": round(tail_budget, 2),
@@ -218,18 +223,51 @@ def print_allocation(report: dict[str, Any]) -> None:
             print(f"    {row['ticker']} {row['strategy']}: {'; '.join(row['reasons'])}")
 
 
+# Multiplier applied to the per-NAV capital / tail / ticker caps based on the
+# operator's regime read. cautious = half-size (Fernando's standing rule when
+# macro < FAVORABLE or portfolio IVRank < 50). normal = use config as-is.
+# aggressive = 1.5x, capped at 100% NAV by the underlying bounds.
+SIZING_MODE_MULTIPLIERS = {
+    "cautious": 0.5,
+    "normal": 1.0,
+    "aggressive": 1.5,
+}
+
+
+def apply_sizing_mode(config: dict[str, Any], sizing_mode: str) -> dict[str, Any]:
+    """Scale the per-NAV capital / tail / ticker caps by the sizing-mode multiplier.
+
+    Cautious halves the budget so the operator doesn't deploy full size into a
+    CAUTIOUS macro regime. Aggressive raises it 1.5x but is hard-capped at 100%
+    NAV so it can never request more capital than the account actually holds."""
+    multiplier = SIZING_MODE_MULTIPLIERS.get(sizing_mode, 1.0)
+    if multiplier == 1.0:
+        return config
+    scaled = dict(config)
+    for key in ("max_total_capital_pct", "max_tail_loss_pct", "max_ticker_capital_pct"):
+        if key in scaled:
+            scaled[key] = min(1.0, float(scaled[key]) * multiplier)
+    scaled["sizing_mode"] = sizing_mode
+    scaled["sizing_multiplier"] = multiplier
+    return scaled
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     add_config_argument(ap)
     ap.add_argument("--plan", required=True, help="Path to action_plan --json output")
+    ap.add_argument("--sizing-mode", choices=sorted(SIZING_MODE_MULTIPLIERS),
+                    default="normal",
+                    help="Scale per-NAV caps: cautious=0.5x, normal=1.0x, aggressive=1.5x")
     ap.add_argument("--output")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    alloc_cfg = apply_sizing_mode(cfg.get("portfolio_allocation", {}), args.sizing_mode)
     report = allocate_portfolio(
         json.loads(Path(args.plan).read_text()),
-        cfg.get("portfolio_allocation", {}),
+        alloc_cfg,
     )
     if args.output:
         Path(args.output).write_text(json.dumps(report, indent=2, default=str))

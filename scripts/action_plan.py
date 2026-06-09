@@ -19,6 +19,7 @@ from feedback_calibration import build_feedback_report
 from historical_analytics import build_analytics
 from performance_profiles import build_profiles, lookup_profile, profile_note
 from pretrade_check import RiskLimits, evaluate_report
+from common import derive_live_account_nav
 from trade_journal import DEFAULT_STATE_FILE, journal_stats, load_state
 from toolkit_config import add_config_argument, load_config
 
@@ -228,16 +229,6 @@ def main() -> None:
     ap.add_argument("--correlation-groups", help="Optional JSON file containing correlation_groups")
     args = ap.parse_args()
 
-    limits = RiskLimits(
-        account_nav=args.account_nav,
-        max_trade_risk_pct=args.max_trade_risk_pct,
-        max_trade_bp_pct=args.max_trade_bp_pct,
-        max_single_ticker_pct=args.max_single_ticker_pct,
-        max_portfolio_delta_abs=args.max_portfolio_delta_abs,
-        min_score=args.min_score,
-        min_liquidity_score=args.min_liquidity_score,
-        min_pop_pct=args.min_pop_pct,
-    )
     screener_report = json.loads(Path(args.candidates).read_text())
     portfolio_report = json.loads(Path(args.portfolio).read_text()) if args.portfolio else None
     journal_path = Path(args.journal)
@@ -246,6 +237,22 @@ def main() -> None:
     correlation_groups = cfg.get("correlation_groups", {})
     if args.correlation_groups:
         correlation_groups = json.loads(Path(args.correlation_groups).read_text())
+
+    # Prefer the live NAV from the risk report so account-size changes
+    # (deposits, withdrawals, P&L) flow through automatically without code
+    # changes. Falls back to the CLI value (which defaults to 30000) when no
+    # report is supplied.
+    live_nav = derive_live_account_nav(portfolio_report, args.account_nav)
+    limits = RiskLimits(
+        account_nav=live_nav,
+        max_trade_risk_pct=args.max_trade_risk_pct,
+        max_trade_bp_pct=args.max_trade_bp_pct,
+        max_single_ticker_pct=args.max_single_ticker_pct,
+        max_portfolio_delta_abs=args.max_portfolio_delta_abs,
+        min_score=args.min_score,
+        min_liquidity_score=args.min_liquidity_score,
+        min_pop_pct=args.min_pop_pct,
+    )
 
     plan = build_action_plan(
         screener_report,

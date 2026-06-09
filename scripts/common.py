@@ -102,3 +102,29 @@ def greeks_to_dict(greeks: Any) -> dict[str, float]:
             else 0.0
         ),
     }
+
+
+def derive_live_account_nav(portfolio_report: dict[str, Any] | None, default: float) -> float:
+    """Pick the live account NAV from a `portfolio_risk --json` report.
+
+    Prefers `portfolio.options_bp` (the buying-power figure the broker actually
+    quotes for new option orders), then `portfolio.cash_only` (settled cash
+    without margin), then `portfolio.buying_power` (which on Reg-T margin
+    accounts is 2× cash and would over-state the cash budget). Falls back to
+    the config default when the report is missing or in demo mode (the demo
+    report has `positions` with synthetic 100-share lots, but the BP fields
+    are absent in that case so the fallback is correct automatically).
+
+    This replaces the legacy `--account-nav` CLI flag plumbing: callers that
+    consume a `portfolio_report` should derive NAV from here so deposits /
+    withdrawals / gains / losses flow through automatically without code
+    changes.
+    """
+    if not portfolio_report:
+        return default
+    portfolio = portfolio_report.get("portfolio", {}) or {}
+    for key in ("options_bp", "cash_only", "buying_power"):
+        value = portfolio.get(key)
+        if value is not None and float(value) > 0:
+            return float(value)
+    return default

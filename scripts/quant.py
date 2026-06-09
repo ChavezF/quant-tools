@@ -108,6 +108,9 @@ def main():
     p_daily.add_argument("--journal")
     p_daily.add_argument("--report-dir")
     p_daily.add_argument("--account-nav", type=float)
+    p_daily.add_argument("--sizing-mode", choices=["cautious", "normal", "aggressive"],
+                         default="normal",
+                         help="Scale per-NAV allocation caps: cautious=0.5x, normal=1.0x, aggressive=1.5x")
     p_daily.add_argument("--max-trade-risk-pct", type=float)
     p_daily.add_argument("--max-trade-bp-pct", type=float)
     p_daily.add_argument("--max-single-ticker-pct", type=float)
@@ -210,6 +213,9 @@ def main():
     p_operator.add_argument("--report-dir")
     p_operator.add_argument("--journal")
     p_operator.add_argument("--broker-snapshot")
+    p_operator.add_argument("--sizing-mode", choices=["cautious", "normal", "aggressive"],
+                            default="normal",
+                            help="Scale per-NAV allocation caps: cautious=0.5x, normal=1.0x, aggressive=1.5x")
     p_operator.add_argument("--dry-run", action="store_true")
     p_operator.add_argument("--send", action="store_true")
     p_operator.add_argument("--skip-brief", action="store_true")
@@ -428,6 +434,7 @@ def main():
             ("min_oi", "--min-oi"),
             ("max_expirations", "--max-expirations"),
             ("account_nav", "--account-nav"),
+            ("sizing_mode", "--sizing-mode"),
             ("max_trade_risk_pct", "--max-trade-risk-pct"),
             ("max_trade_bp_pct", "--max-trade-bp-pct"),
             ("max_single_ticker_pct", "--max-single-ticker-pct"),
@@ -614,6 +621,8 @@ def main():
             cmd += ["--journal", args.journal]
         if args.broker_snapshot:
             cmd += ["--broker-snapshot", args.broker_snapshot]
+        if getattr(args, "sizing_mode", None):
+            cmd += ["--sizing-mode", args.sizing_mode]
         for flag_name, flag in [
             ("dry_run", "--dry-run"),
             ("send", "--send"),

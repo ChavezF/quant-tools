@@ -169,11 +169,14 @@ def build_drift_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[str]:
 
 
 def build_risk_cmd(args: argparse.Namespace, watchlist: list[str] | None) -> list[str]:
+    """Build the portfolio_risk command. Demo mode (`--target-watchlist`) is
+    only triggered by the explicit CLI flag — we do NOT auto-fall-back to the
+    resolved scan watchlist, because that turns the live morning pipeline into
+    a synthetic-100-share simulation and causes pretrade exposure checks to
+    reject every real candidate. See pitfall #28 in the skill."""
     cmd = [PY, str(SCRIPTS_DIR / "portfolio_risk.py"), "--json"]
     if args.target_watchlist:
         cmd += ["--target-watchlist", *args.target_watchlist]
-    elif watchlist:
-        cmd += ["--target-watchlist", *watchlist]
     return cmd
 
 
@@ -218,14 +221,16 @@ def build_scenario_stress_cmd(cfg: dict[str, Any], risk_report: Path) -> list[st
 
 
 def build_allocation_cmd(cfg: dict[str, Any], args: argparse.Namespace, plan_report: Path) -> list[str]:
-    return [
+    cmd = [
         PY,
         str(SCRIPTS_DIR / "portfolio_allocator.py"),
         *(["--config", args.config] if args.config else []),
         "--plan",
         str(plan_report),
+        "--sizing-mode", str(getattr(args, "sizing_mode", "normal") or "normal"),
         "--json",
     ]
+    return cmd
 
 
 def build_brief_cmd(args: argparse.Namespace, watchlist: list[str] | None) -> list[str]:
@@ -357,6 +362,9 @@ def main() -> None:
     ap.add_argument("--broker-snapshot")
     ap.add_argument("--report-dir")
     ap.add_argument("--account-nav", type=float)
+    ap.add_argument("--sizing-mode", choices=["cautious", "normal", "aggressive"],
+                    default="normal",
+                    help="Scale per-NAV allocation caps: cautious=0.5x, normal=1.0x, aggressive=1.5x")
     ap.add_argument("--max-trade-risk-pct", type=float)
     ap.add_argument("--max-trade-bp-pct", type=float)
     ap.add_argument("--max-single-ticker-pct", type=float)

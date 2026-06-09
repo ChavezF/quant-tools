@@ -773,6 +773,107 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertEqual(merged["a"]["c"], 2)
         self.assertEqual(merged["x"], 3)
 
+    def test_derive_live_account_nav_prefers_options_bp(self):
+        """Live NAV derivation: options_bp (the right number for sizing option
+        orders) wins over cash_only and buying_power (which is 2× cash on Reg-T
+        margin accounts and would over-state the budget)."""
+        from common import derive_live_account_nav
+
+        # All three present: options_bp wins
+        report = {"portfolio": {"options_bp": 30000.0, "cash_only": 28000.0, "buying_power": 60000.0}}
+        self.assertEqual(derive_live_account_nav(report, default=50000.0), 30000.0)
+
+        # cash_only only (no margin) — wins over the 2× Reg-T buying_power
+        report = {"portfolio": {"cash_only": 30000.0, "buying_power": 60000.0}}
+        self.assertEqual(derive_live_account_nav(report, default=50000.0), 30000.0)
+
+        # buying_power only (no options_bp, no cash_only) — falls through
+        report = {"portfolio": {"buying_power": 60000.0}}
+        self.assertEqual(derive_live_account_nav(report, default=50000.0), 60000.0)
+
+        # No report at all — config default wins
+        self.assertEqual(derive_live_account_nav(None, default=50000.0), 50000.0)
+        self.assertEqual(derive_live_account_nav({}, default=50000.0), 50000.0)
+        self.assertEqual(derive_live_account_nav({"portfolio": {}}, default=50000.0), 50000.0)
+
+        # Zero / None values are skipped (the broker can briefly report 0 BP)
+        report = {"portfolio": {"options_bp": 0, "cash_only": 30000.0}}
+        self.assertEqual(derive_live_account_nav(report, default=50000.0), 30000.0)
+
+    def test_apply_sizing_mode_scales_caps(self):
+        """Sizing mode scales the per-NAV capital / tail / ticker caps so the
+        operator can apply a half-size rule (cautious) or 1.5x (aggressive)
+        without editing config. Hard-caps at 100% NAV to prevent overflow."""
+        from portfolio_allocator import apply_sizing_mode
+
+        config = {
+            "max_positions": 6,
+            "max_total_capital_pct": 0.35,
+            "max_tail_loss_pct": 0.08,
+            "max_ticker_capital_pct": 0.15,
+            "max_group_exposure_pct": 0.35,
+        }
+
+        cautious = apply_sizing_mode(config, "cautious")
+        self.assertAlmostEqual(cautious["max_total_capital_pct"], 0.175)  # 0.35 * 0.5
+        self.assertAlmostEqual(cautious["max_tail_loss_pct"], 0.04)
+        self.assertAlmostEqual(cautious["max_ticker_capital_pct"], 0.075)
+        self.assertEqual(cautious["sizing_mode"], "cautious")
+        self.assertEqual(cautious["sizing_multiplier"], 0.5)
+        # Untouched keys pass through
+        self.assertEqual(cautious["max_positions"], 6)
+        self.assertEqual(cautious["max_group_exposure_pct"], 0.35)
+
+        normal = apply_sizing_mode(config, "normal")
+        # normal returns the original dict (unchanged values + no metadata)
+        self.assertIs(normal, config)
+
+        aggressive = apply_sizing_mode(config, "aggressive")
+        self.assertAlmostEqual(aggressive["max_total_capital_pct"], 0.525)  # 0.35 * 1.5
+        self.assertEqual(aggressive["sizing_mode"], "aggressive")
+        self.assertEqual(aggressive["sizing_multiplier"], 1.5)
+
+        # Cap at 1.0: even with aggressive=1.5, can't request >100% NAV
+        huge = {"max_total_capital_pct": 0.9}
+        capped = apply_sizing_mode(huge, "aggressive")
+        self.assertAlmostEqual(capped["max_total_capital_pct"], 1.0)
+
+    def test_pretrade_uses_live_account_nav_from_risk_report(self):
+        """pretrade_check picks up NAV from the risk report when present,
+        ignoring the (stale or default) CLI --account-nav. The actual NAV
+        override happens in main() (via derive_live_account_nav) before
+        evaluate_candidate is called — this test documents the split of
+        responsibility and confirms evaluate_candidate is limits-driven."""
+        from pretrade_check import evaluate_candidate, RiskLimits
+
+        candidate = {
+            "ticker": "AAPL",
+            "strategy": "BULL_PUT",  # needed for candidate_max_loss to use max_loss
+            "score": 60,
+            "pop_pct": 70,
+            "score_components": {"liquidity": 80},
+            "max_loss": 1500,
+            "capital_required": 1500,
+        }
+        portfolio_report = {
+            "portfolio": {"options_bp": 60000.0, "cash_only": 60000.0, "buying_power": 120000.0},
+            "risk": {},
+            "demo": False,
+        }
+        # With account_nav=60000: limit = 60000 * 0.05 = 3000; max_loss 1500 passes
+        limits_60k = RiskLimits(account_nav=60000.0)
+        result = evaluate_candidate(candidate, portfolio_report, limits_60k)
+        max_loss_check = next(c for c in result["checks"] if c["name"] == "max_trade_risk")
+        self.assertTrue(max_loss_check["ok"])
+
+        # With account_nav=20000: limit = 20000 * 0.05 = 1000; max_loss 1500 fails
+        # This is the case the live-NAV derivation prevents: if the caller
+        # forgot to update the NAV, the same trade would wrongly be approved.
+        limits_tiny = RiskLimits(account_nav=20000.0)
+        result2 = evaluate_candidate(candidate, portfolio_report, limits_tiny)
+        max_loss_check2 = next(c for c in result2["checks"] if c["name"] == "max_trade_risk")
+        self.assertFalse(max_loss_check2["ok"])
+
     def test_cache_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             import cache_utils

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from candidate_scoring import score_results
+from common import derive_live_account_nav
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ def evaluate_candidate(
 ) -> dict[str, Any]:
     portfolio = (portfolio_report or {}).get("portfolio", {})
     risk = (portfolio_report or {}).get("risk", {})
+    is_demo = bool((portfolio_report or {}).get("demo", False))
     ticker = str(candidate.get("ticker", ""))
     components = candidate.get("score_components", {})
 
@@ -123,8 +125,12 @@ def evaluate_candidate(
     )
     add_check(
         "single_ticker_exposure",
-        ticker_exposure <= ticker_limit,
-        f"{ticker} exposure ${ticker_exposure:,.0f} <= ${ticker_limit:,.0f}",
+        # Skip when portfolio_risk is in demo mode (synthetic 100-share lots) —
+        # the exposure numbers are fake and would wrongly reject every real
+        # candidate. See pitfall #28 in the skill.
+        is_demo or ticker_exposure <= ticker_limit,
+        f"{ticker} exposure ${ticker_exposure:,.0f} <= ${ticker_limit:,.0f}" if not is_demo
+        else f"skipped (demo portfolio): {ticker} synthetic exposure ${ticker_exposure:,.0f}",
     )
     add_check(
         "delta_limit",
@@ -220,8 +226,15 @@ def main() -> None:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
+    screener_report = json.loads(Path(args.candidates).read_text())
+    portfolio_report = json.loads(Path(args.portfolio).read_text()) if args.portfolio else None
+    # Prefer the live NAV from the risk report when present (options_bp, then
+    # cash_only, then buying_power) so the limits reflect the actual funded
+    # account without requiring a hardcoded --account-nav. Falls back to the
+    # CLI value (which itself defaults to 30000) when no report is supplied.
+    live_nav = derive_live_account_nav(portfolio_report, args.account_nav)
     limits = RiskLimits(
-        account_nav=args.account_nav,
+        account_nav=live_nav,
         max_trade_risk_pct=args.max_trade_risk_pct,
         max_trade_bp_pct=args.max_trade_bp_pct,
         max_single_ticker_pct=args.max_single_ticker_pct,
@@ -230,8 +243,6 @@ def main() -> None:
         min_liquidity_score=args.min_liquidity_score,
         min_pop_pct=args.min_pop_pct,
     )
-    screener_report = json.loads(Path(args.candidates).read_text())
-    portfolio_report = json.loads(Path(args.portfolio).read_text()) if args.portfolio else None
     report = evaluate_report(screener_report, portfolio_report, limits)
 
     if args.json:
