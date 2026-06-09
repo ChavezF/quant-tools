@@ -26,11 +26,27 @@ def build_summary(
     feedback: dict[str, Any],
     reconciliation: dict[str, Any] | None = None,
     execution_analytics: dict[str, Any] | None = None,
+    database_maintenance: dict[str, Any] | None = None,
+    health: dict[str, Any] | None = None,
+    scenario_stress: dict[str, Any] | None = None,
+    allocation: dict[str, Any] | None = None,
+    validation: dict[str, Any] | None = None,
+    drift: dict[str, Any] | None = None,
 ) -> str:
     reconciliation = reconciliation or {}
     reconciliation = reconciliation.get("reconciliation", reconciliation)
     recon_summary = reconciliation.get("summary", {})
     execution_summary = (execution_analytics or {}).get("summary", {})
+    database_maintenance = database_maintenance or {}
+    health = health or {}
+    stress_summary = (scenario_stress or {}).get("summary", {})
+    allocation_summary = (allocation or {}).get("summary", {})
+    validation_summary = (validation or {}).get("summary", {})
+    drift = drift or {}
+    drift_summary = drift.get("summary", {})
+    drift_comparison = drift.get("comparison", {})
+    database_status = "NOT RUN" if not database_maintenance else ("OK" if database_maintenance.get("ok") else "FAILED")
+    health_status = "NOT RUN" if not health else ("OK" if health.get("ok") else "FAILED")
     summary = plan.get("summary", {})
     overall = analytics.get("overall", {})
     drawdown = analytics.get("drawdown", {})
@@ -51,6 +67,24 @@ def build_summary(
         f"- Fill rate: {float(execution_summary.get('fill_rate', 0) or 0):.1f}%",
         f"- Average credit vs plan: {float(execution_summary.get('avg_credit_improvement', 0) or 0):+.3f}",
         f"- Execution floor violations: {execution_summary.get('floor_violations', 0)}",
+        f"- Database integrity: {database_status}",
+        f"- Database backup: {database_maintenance.get('backup') or 'not created'}",
+        f"- Health checks: {health_status}",
+        f"- Worst stress scenario: {stress_summary.get('worst_scenario') or 'NOT RUN'}",
+        f"- Worst stress P&L: ${float(stress_summary.get('worst_pnl', 0) or 0):,.2f} "
+        f"({float(stress_summary.get('worst_pnl_pct_nav', 0) or 0):.2f}% NAV)",
+        f"- Basket selected: {allocation_summary.get('selected', 0)} "
+        f"of {allocation_summary.get('eligible', 0)} eligible",
+        f"- Capital allocated: ${float(allocation_summary.get('capital_allocated', 0) or 0):,.2f} "
+        f"({float(allocation_summary.get('capital_utilization_pct', 0) or 0):.1f}% of budget)",
+        f"- Tail-loss budget used: {float(allocation_summary.get('tail_budget_utilization_pct', 0) or 0):.1f}%",
+        f"- Walk-forward validation: {validation_summary.get('status') or 'NOT RUN'} "
+        f"({float(validation_summary.get('profitable_fold_pct', 0) or 0):.1f}% profitable folds)",
+        f"- OOS expectancy: ${float(validation_summary.get('avg_oos_expectancy', 0) or 0):,.2f}",
+        f"- Performance drift: {drift_summary.get('status') or 'NOT RUN'} "
+        f"({drift_summary.get('severity') or 'N/A'})",
+        f"- Recent expectancy change: ${float(drift_comparison.get('expectancy_change', 0) or 0):+,.2f}",
+        f"- Score threshold shift: {float(drift_summary.get('score_threshold_shift', 0) or 0):+.1f}",
         "",
         "## Realized Edge",
         "",
@@ -80,9 +114,12 @@ def build_summary(
     if not ticket_rows:
         lines.append("- No tickets.")
     for ticket in ticket_rows[:10]:
+        allocation_rank = ticket.get("portfolio_allocation", {}).get("rank")
+        rank_text = f"rank {allocation_rank}, " if allocation_rank else ""
         lines.append(
             f"- `{ticket.get('ticket_id')}` {ticket.get('ticker')} {ticket.get('strategy')} "
-            f"{ticket.get('expiration')} {ticket.get('strikes')} at {ticket.get('limit_credit')}"
+            f"{ticket.get('expiration')} {ticket.get('strikes')} at {ticket.get('limit_credit')} "
+            f"({rank_text}size x{float(ticket.get('size_multiplier', 0) or 0):.2f})"
         )
 
     lines.extend(
@@ -114,6 +151,12 @@ def main() -> None:
         read_json(base / "feedback.json"),
         read_json(base / "reconciliation.json"),
         read_json(base / "execution_analytics.json"),
+        read_json(base / "database_maintenance.json"),
+        read_json(base / "health.json"),
+        read_json(base / "scenario_stress.json"),
+        read_json(base / "allocation.json"),
+        read_json(base / "validation.json"),
+        read_json(base / "drift.json"),
     )
     output.write_text(text)
     print(output)

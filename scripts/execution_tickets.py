@@ -31,6 +31,7 @@ def build_ticket(action: dict[str, Any]) -> dict[str, Any]:
     candidate = action.get("candidate", {})
     execution = candidate.get("execution", {})
     strategy = str(action.get("strategy") or candidate.get("strategy") or "").upper()
+    allocation = action.get("portfolio_allocation", {})
     ticket_key = "|".join(
         str(value or "")
         for value in (
@@ -57,12 +58,16 @@ def build_ticket(action: dict[str, Any]) -> dict[str, Any]:
         "score": action.get("score"),
         "max_loss": action.get("max_loss"),
         "capital_required": action.get("capital_required"),
+        "portfolio_allocation": allocation,
         "rationale": {
             "profile": action.get("profile_note"),
             "correlation": action.get("correlation", {}).get("note"),
             "adaptive_sizing": action.get("adaptive_sizing", {}).get("note"),
             "calibrated_min_score": action.get("feedback_calibration", {}).get("recommended_min_score"),
             "risk_checks_failed": [c["name"] for c in action.get("checks", []) if not c.get("ok")],
+            "allocation_rank": allocation.get("rank"),
+            "allocation_objective_score": allocation.get("objective_score"),
+            "allocation_tail_loss": allocation.get("tail_loss"),
         },
         "safety": "Review manually. Do not place orders without explicit confirmation.",
     }

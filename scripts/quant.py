@@ -55,6 +55,12 @@ def main():
     p_risk = sub.add_parser("risk", help="Portfolio risk")
     p_risk.add_argument("--target-watchlist", nargs="+")
 
+    p_scenario = sub.add_parser("scenario-stress", help="Run deterministic portfolio shock scenarios")
+    p_scenario.add_argument("--portfolio", required=True, help="Path to portfolio_risk --json output")
+    p_scenario.add_argument("--scenarios", help="Optional JSON scenario definition file")
+    p_scenario.add_argument("--output")
+    p_scenario.add_argument("--json", action="store_true")
+
     p_pre = sub.add_parser("pretrade", help="Risk-check scored candidates before execution")
     p_pre.add_argument("--candidates", required=True, help="Path to options_screener JSON report")
     p_pre.add_argument("--portfolio", help="Optional path to portfolio_risk --json output")
@@ -83,6 +89,11 @@ def main():
     p_plan.add_argument("--top", type=int, default=10)
     p_plan.add_argument("--json", action="store_true")
 
+    p_allocate = sub.add_parser("allocate", help="Select a portfolio-level basket from an action plan")
+    p_allocate.add_argument("--plan", required=True)
+    p_allocate.add_argument("--output")
+    p_allocate.add_argument("--json", action="store_true")
+
     p_daily = sub.add_parser("daily", help="Run saved daily workflow into timestamped reports")
     p_daily.add_argument("--watchlist", nargs="+")
     p_daily.add_argument("--watchlist-name", default="core")
@@ -110,6 +121,8 @@ def main():
     p_daily.add_argument("--top", type=int, default=10)
     p_daily.add_argument("--skip-discovery", action="store_true")
     p_daily.add_argument("--skip-risk", action="store_true")
+    p_daily.add_argument("--skip-scenario-stress", action="store_true")
+    p_daily.add_argument("--skip-allocation", action="store_true")
     p_daily.add_argument("--skip-brief", action="store_true")
     p_daily.add_argument("--skip-alerts", action="store_true")
     p_daily.add_argument("--no-cache", action="store_true")
@@ -127,6 +140,8 @@ def main():
     p_alerts.add_argument("--min-score", type=float, default=68.0)
     p_alerts.add_argument("--profit-target-pct", type=float, default=50.0)
     p_alerts.add_argument("--dte-warning", type=int, default=21)
+    p_alerts.add_argument("--validation")
+    p_alerts.add_argument("--drift")
     p_alerts.add_argument("--json", action="store_true")
 
     p_discover = sub.add_parser("discover", help="Discover symbols worth scanning")
@@ -152,6 +167,12 @@ def main():
     p_dashboard.add_argument("--feedback")
     p_dashboard.add_argument("--reconciliation")
     p_dashboard.add_argument("--execution-analytics")
+    p_dashboard.add_argument("--database-maintenance")
+    p_dashboard.add_argument("--health")
+    p_dashboard.add_argument("--scenario-stress")
+    p_dashboard.add_argument("--allocation")
+    p_dashboard.add_argument("--validation")
+    p_dashboard.add_argument("--drift")
     p_dashboard.add_argument("--output")
 
     p_analytics = sub.add_parser("analytics", help="Analyze realized journal performance")
@@ -167,6 +188,24 @@ def main():
     p_feedback.add_argument("--output")
     p_feedback.add_argument("--json", action="store_true")
 
+    p_validate = sub.add_parser("validate", help="Walk-forward validate live score thresholds")
+    p_validate.add_argument("--journal")
+    p_validate.add_argument("--min-train", type=int)
+    p_validate.add_argument("--test-window", type=int)
+    p_validate.add_argument("--thresholds", nargs="+", type=float)
+    p_validate.add_argument("--min-selected", type=int)
+    p_validate.add_argument("--output")
+    p_validate.add_argument("--json", action="store_true")
+
+    p_drift = sub.add_parser("drift", help="Detect recent performance and calibration drift")
+    p_drift.add_argument("--journal")
+    p_drift.add_argument("--recent-window", type=int)
+    p_drift.add_argument("--min-baseline", type=int)
+    p_drift.add_argument("--current-min-score", type=float)
+    p_drift.add_argument("--min-samples", type=int)
+    p_drift.add_argument("--output")
+    p_drift.add_argument("--json", action="store_true")
+
     p_operator = sub.add_parser("operator", help="Run the complete morning decision workflow")
     p_operator.add_argument("--report-dir")
     p_operator.add_argument("--journal")
@@ -177,6 +216,8 @@ def main():
     p_operator.add_argument("--skip-alerts", action="store_true")
     p_operator.add_argument("--skip-discovery", action="store_true")
     p_operator.add_argument("--skip-storage", action="store_true")
+    p_operator.add_argument("--skip-scenario-stress", action="store_true")
+    p_operator.add_argument("--skip-allocation", action="store_true")
     p_operator.add_argument("--no-cache", action="store_true")
 
     p_storage = sub.add_parser("storage", help="Sync workflow artifacts into SQLite")
@@ -204,6 +245,23 @@ def main():
     p_execution.add_argument("--reconciliation", required=True)
     p_execution.add_argument("--output")
     p_execution.add_argument("--json", action="store_true")
+
+    p_verify = sub.add_parser("verify", help="Run repository and runtime health checks")
+    p_verify.add_argument("--db")
+    p_verify.add_argument("--skip-tests", action="store_true")
+    p_verify.add_argument("--skip-db", action="store_true")
+    p_verify.add_argument("--output")
+    p_verify.add_argument("--json", action="store_true")
+
+    p_db_maintenance = sub.add_parser("db-maintenance", help="Check, back up, and retain SQLite state")
+    p_db_maintenance.add_argument("--db")
+    p_db_maintenance.add_argument("--backup-dir")
+    p_db_maintenance.add_argument("--retention-days", type=int)
+    p_db_maintenance.add_argument("--keep-last", type=int)
+    p_db_maintenance.add_argument("--no-backup", action="store_true")
+    p_db_maintenance.add_argument("--vacuum", action="store_true")
+    p_db_maintenance.add_argument("--output")
+    p_db_maintenance.add_argument("--json", action="store_true")
 
     p_earn = sub.add_parser("earnings", help="Earnings IV scanner")
     p_earn.add_argument("--watchlist", nargs="+", required=True)
@@ -335,6 +393,24 @@ def main():
         if args.json:
             cmd += ["--json"]
         return run(*cmd)
+    elif args.cmd == "allocate":
+        cmd = ["portfolio_allocator.py", "--plan", args.plan]
+        if args.config:
+            cmd += ["--config", args.config]
+        if args.output:
+            cmd += ["--output", args.output]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "scenario-stress":
+        cmd = ["scenario_stress.py", "--portfolio", args.portfolio]
+        if args.scenarios:
+            cmd += ["--scenarios", args.scenarios]
+        if args.output:
+            cmd += ["--output", args.output]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
     elif args.cmd == "daily":
         cmd = ["daily_workflow.py"]
         if args.config:
@@ -378,6 +454,8 @@ def main():
         for flag_name, flag in [
             ("skip_discovery", "--skip-discovery"),
             ("skip_risk", "--skip-risk"),
+            ("skip_scenario_stress", "--skip-scenario-stress"),
+            ("skip_allocation", "--skip-allocation"),
             ("skip_brief", "--skip-brief"),
             ("skip_alerts", "--skip-alerts"),
             ("no_cache", "--no-cache"),
@@ -404,6 +482,10 @@ def main():
         ]
         if args.plan:
             cmd += ["--plan", args.plan]
+        if args.validation:
+            cmd += ["--validation", args.validation]
+        if args.drift:
+            cmd += ["--drift", args.drift]
         journal = args.journal or cfg.get("journal", {}).get("path")
         if journal:
             cmd += ["--journal", resolve_project_path(journal)]
@@ -448,6 +530,12 @@ def main():
             ("feedback", "--feedback"),
             ("reconciliation", "--reconciliation"),
             ("execution_analytics", "--execution-analytics"),
+            ("database_maintenance", "--database-maintenance"),
+            ("health", "--health"),
+            ("scenario_stress", "--scenario-stress"),
+            ("allocation", "--allocation"),
+            ("validation", "--validation"),
+            ("drift", "--drift"),
             ("output", "--output"),
         ]:
             value = getattr(args, attr)
@@ -481,6 +569,41 @@ def main():
         if args.json:
             cmd += ["--json"]
         return run(*cmd)
+    elif args.cmd == "validate":
+        validation_cfg = cfg.get("validation", {})
+        cmd = ["walk_forward_validation.py"]
+        journal = args.journal or cfg.get("journal", {}).get("path")
+        if journal:
+            cmd += ["--journal", resolve_project_path(journal)]
+        cmd += [
+            "--min-train", str(args.min_train if args.min_train is not None else validation_cfg.get("min_train", 10)),
+            "--test-window", str(args.test_window if args.test_window is not None else validation_cfg.get("test_window", 5)),
+            "--min-selected", str(args.min_selected if args.min_selected is not None else validation_cfg.get("min_selected", 3)),
+        ]
+        thresholds = args.thresholds or validation_cfg.get("thresholds", [50, 55, 60, 65, 70, 75])
+        cmd += ["--thresholds", *[str(value) for value in thresholds]]
+        if args.output:
+            cmd += ["--output", args.output]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "drift":
+        drift_cfg = cfg.get("drift_monitor", {})
+        cmd = ["drift_monitor.py"]
+        journal = args.journal or cfg.get("journal", {}).get("path")
+        if journal:
+            cmd += ["--journal", resolve_project_path(journal)]
+        cmd += [
+            "--recent-window", str(args.recent_window if args.recent_window is not None else drift_cfg.get("recent_window", 10)),
+            "--min-baseline", str(args.min_baseline if args.min_baseline is not None else drift_cfg.get("min_baseline", 10)),
+            "--current-min-score", str(args.current_min_score if args.current_min_score is not None else risk_cfg["min_score"]),
+            "--min-samples", str(args.min_samples if args.min_samples is not None else cfg.get("feedback", {}).get("min_samples", 5)),
+        ]
+        if args.output:
+            cmd += ["--output", args.output]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
     elif args.cmd == "operator":
         cmd = ["daily_workflow.py"]
         if args.config:
@@ -498,6 +621,8 @@ def main():
             ("skip_alerts", "--skip-alerts"),
             ("skip_discovery", "--skip-discovery"),
             ("skip_storage", "--skip-storage"),
+            ("skip_scenario_stress", "--skip-scenario-stress"),
+            ("skip_allocation", "--skip-allocation"),
             ("no_cache", "--no-cache"),
         ]:
             if getattr(args, flag_name):
@@ -554,6 +679,44 @@ def main():
             "--reconciliation",
             args.reconciliation,
         ]
+        if args.output:
+            cmd += ["--output", args.output]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "verify":
+        cmd = ["health_check.py"]
+        db_path = args.db or cfg.get("storage", {}).get("path")
+        if db_path:
+            cmd += ["--db", resolve_project_path(db_path)]
+        if args.skip_tests:
+            cmd += ["--skip-tests"]
+        if args.skip_db:
+            cmd += ["--skip-db"]
+        if args.output:
+            cmd += ["--output", args.output]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "db-maintenance":
+        operations = cfg.get("operations", {})
+        db_path = args.db or cfg.get("storage", {}).get("path")
+        backup_dir = args.backup_dir or operations.get("backup_dir")
+        cmd = ["database_maintenance.py"]
+        if db_path:
+            cmd += ["--db", resolve_project_path(db_path)]
+        if backup_dir:
+            cmd += ["--backup-dir", resolve_project_path(backup_dir)]
+        cmd += [
+            "--retention-days",
+            str(args.retention_days if args.retention_days is not None else operations.get("backup_retention_days", 30)),
+            "--keep-last",
+            str(args.keep_last if args.keep_last is not None else operations.get("backup_keep_last", 14)),
+        ]
+        if args.no_backup:
+            cmd += ["--no-backup"]
+        if args.vacuum:
+            cmd += ["--vacuum"]
         if args.output:
             cmd += ["--output", args.output]
         if args.json:

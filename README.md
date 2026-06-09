@@ -34,17 +34,23 @@ cd /home/chavez_f/code/quant-tools/scripts
 /usr/bin/python3.12 quant.py journal add --ticker SPY --strategy BULL_PUT --entry-credit 1.20 --capital-at-risk 380 --score 66 --thesis "defined risk, acceptable liquidity"
 /usr/bin/python3.12 quant.py journal profiles --section ticker_strategy
 /usr/bin/python3.12 quant.py plan --candidates reports/scan.json --portfolio reports/risk.json --journal state/trades.json --account-nav 30000
+/usr/bin/python3.12 quant.py allocate --plan reports/plan.json --json
 /usr/bin/python3.12 quant.py alerts --plan reports/plan.json --journal state/trades.json
 /usr/bin/python3.12 quant.py tickets --plan reports/plan.json
 /usr/bin/python3.12 quant.py dashboard --report-dir reports/latest
 /usr/bin/python3.12 quant.py analytics --journal state/trades.json
 /usr/bin/python3.12 quant.py feedback --journal state/trades.json
+/usr/bin/python3.12 quant.py validate --journal state/trades.json --json
+/usr/bin/python3.12 quant.py drift --journal state/trades.json --json
 /usr/bin/python3.12 quant.py operator --report-dir reports
 /usr/bin/python3.12 quant.py storage --journal state/trades.json --tickets reports/latest/tickets.json --portfolio reports/latest/risk.json
 /usr/bin/python3.12 quant.py reconcile --journal state/trades.json --tickets reports/latest/tickets.json --broker-snapshot state/broker_snapshot.json
 /usr/bin/python3.12 quant.py reconcile --journal state/trades.json --tickets reports/latest/tickets.json --broker-snapshot state/broker_snapshot.json --apply-updates --db state/quant_tools.db
 /usr/bin/python3.12 quant.py execution-analytics --tickets reports/latest/tickets.json --reconciliation reports/latest/reconciliation.json
 /usr/bin/python3.12 quant.py journal --db state/quant_tools.db add --ticker SPY --strategy BULL_PUT --entry-credit 1.10
+/usr/bin/python3.12 quant.py db-maintenance --db state/quant_tools.db --json
+/usr/bin/python3.12 quant.py verify --json
+/usr/bin/python3.12 quant.py scenario-stress --portfolio reports/latest/risk.json --json
 /usr/bin/python3.12 quant.py iv-rank --tickers SPY QQQ NVDA AAPL MSFT TSLA AMD
 /usr/bin/python3.12 quant.py brief --watchlist SPY QQQ NVDA AAPL MSFT TSLA
 ```
@@ -54,6 +60,7 @@ cd /home/chavez_f/code/quant-tools/scripts
 ```bash
 /usr/bin/python3.12 ~/.hermes/skills/mlops/quant-trading-toolkit/scripts/verify_toolkit.py
 python -m unittest discover -s tests
+python scripts/quant.py verify --json
 ```
 
 The skill verifier runs 11 smoke tests across all tools. The local unit tests
@@ -81,7 +88,30 @@ tickets, broker reconciliation, a send-ready Markdown summary, and the sortable
 HTML dashboard. It also synchronizes journal, ticket, position, fill, and
 reconciliation records into `state/quant_tools.db` by default, then reports
 fill rate, credit improvement or slippage versus plan, and execution-floor
-violations by strategy.
+violations by strategy. Deterministic market and volatility scenarios estimate
+portfolio and position-level losses before tickets are reviewed. The portfolio
+allocator ranks actionable trades by quality and capital efficiency, then
+selects a basket within aggregate capital, tail-loss, ticker, correlation-group,
+position-count, and delta limits. Execution tickets are created from that
+selected basket rather than every individually approved candidate.
+
+The `validate` command uses expanding training windows to select a score
+threshold, then measures that threshold on the next unseen block of closed
+trades. It reports profitable-fold percentage, out-of-sample expectancy, and
+threshold stability overall and by strategy. The `drift` command compares the
+recent trade window with the older baseline and flags deterioration in
+expectancy, win rate, return on risk, score thresholds, and strategy signals.
+
+The `verify` command runs dependency-light health checks: config JSON parsing,
+script compilation, unit tests, and optional SQLite integrity. The
+`db-maintenance` command performs SQLite `quick_check`, creates timestamped
+backups with the SQLite backup API, prunes old backups by retention policy, and
+can run `VACUUM` when requested.
+
+The `scenario-stress` command consumes a saved `risk --json` report and applies
+auditable market/volatility shocks. Equity positions use beta-adjusted notional
+exposure; options use delta, gamma, vega, quantity, and underlying spot when
+available, with an explicit value-based fallback for older reports.
 
 ## SQLite and broker reconciliation
 

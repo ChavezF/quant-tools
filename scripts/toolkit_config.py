@@ -79,6 +79,39 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "path": "state/quant_tools.db",
         "broker_snapshot": None,
     },
+    "operations": {
+        "backup_on_operator": True,
+        "backup_dir": "state/backups",
+        "backup_retention_days": 30,
+        "backup_keep_last": 14,
+        "health_check_on_operator": True,
+    },
+    "scenario_stress": {
+        "enabled": True,
+        "scenarios_path": None,
+    },
+    "portfolio_allocation": {
+        "enabled": True,
+        "max_positions": 6,
+        "max_total_capital_pct": 0.35,
+        "max_tail_loss_pct": 0.08,
+        "max_ticker_capital_pct": 0.15,
+        "max_group_exposure_pct": 0.35,
+        "stress_loss_fraction": 0.65,
+        "include_reduce": True,
+    },
+    "validation": {
+        "enabled": True,
+        "min_train": 10,
+        "test_window": 5,
+        "thresholds": [50, 55, 60, 65, 70, 75],
+        "min_selected": 3,
+    },
+    "drift_monitor": {
+        "enabled": True,
+        "recent_window": 10,
+        "min_baseline": 10,
+    },
 }
 
 

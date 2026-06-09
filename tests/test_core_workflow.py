@@ -28,11 +28,17 @@ from adaptive_sizing import adaptive_size
 from alerts import build_alerts
 from broker_reconciliation import apply_journal_updates, build_reconciliation
 from dashboard import build_dashboard
+from database_maintenance import backup_database, maintain_database, prune_backups
+from drift_monitor import build_drift_report
 from execution_tickets import build_tickets
 from feedback_calibration import build_feedback_report
 from historical_analytics import build_analytics
 from opportunity_discovery import score_discovery_metrics
 from operator_summary import build_summary
+from portfolio_allocator import allocate_portfolio
+from scenario_stress import build_scenario_report
+from health_check import build_health_report
+from walk_forward_validation import build_walk_forward_report
 from storage import connect, export_journal_state, table_counts, upsert_tickets, upsert_trades
 
 
@@ -241,6 +247,30 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertIn("profit_target", kinds)
         self.assertIn("dte_warning", kinds)
 
+    def test_alerts_include_validation_and_drift_health(self):
+        report = build_alerts(
+            None,
+            None,
+            min_score=68,
+            profit_target_pct=50,
+            dte_warning=21,
+            validation={
+                "summary": {
+                    "status": "WATCH",
+                    "profitable_fold_pct": 40,
+                    "avg_oos_expectancy": -10,
+                }
+            },
+            drift={
+                "summary": {"status": "DRIFT", "severity": "HIGH"},
+                "comparison": {"expectancy_change": -75, "win_rate_change": -25},
+            },
+        )
+        kinds = {row["kind"] for row in report["alerts"]}
+        self.assertEqual(report["summary"]["high"], 1)
+        self.assertIn("validation", kinds)
+        self.assertIn("drift", kinds)
+
     def test_correlation_penalty_for_group_overlap(self):
         portfolio = {"portfolio": {"positions": [{"symbol": "AAPL", "current_value": 12000}]}}
         groups = {"mega_cap_tech": ["AAPL", "MSFT", "NVDA"]}
@@ -272,6 +302,11 @@ class CoreWorkflowTests(unittest.TestCase):
                             "execution_grade": "B",
                         },
                     },
+                    "portfolio_allocation": {
+                        "rank": 1,
+                        "objective_score": 75,
+                        "tail_loss": 247,
+                    },
                 }
             ]
         }
@@ -279,6 +314,7 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertEqual(len(tickets), 1)
         self.assertEqual(tickets[0]["order_action"], "SELL_SPREAD_TO_OPEN")
         self.assertEqual(tickets[0]["strikes"], "475/470")
+        self.assertEqual(tickets[0]["portfolio_allocation"]["rank"], 1)
         self.assertTrue(tickets[0]["ticket_id"].startswith("QTK-"))
 
     def test_historical_analytics_tracks_expectancy_and_drawdown(self):
@@ -352,6 +388,205 @@ class CoreWorkflowTests(unittest.TestCase):
                 self.assertEqual(export_journal_state(con)["trades"][0]["status"], "CLOSED")
             finally:
                 con.close()
+
+    def test_database_maintenance_creates_backup_and_prunes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "quant.db"
+            backup_dir = Path(tmp) / "backups"
+            con = connect(db_path)
+            try:
+                upsert_trades(con, [{"id": "T1", "status": "OPEN", "ticker": "SPY", "strategy": "CSP"}])
+            finally:
+                con.close()
+            report = maintain_database(db_path, backup_dir, retention_days=0, keep_last=1)
+            self.assertTrue(report["ok"])
+            self.assertTrue(Path(report["backup"]).exists())
+            older = backup_database(db_path, backup_dir)
+            self.assertTrue(older.exists())
+            deleted = prune_backups(backup_dir, retention_days=0, keep_last=1)
+            self.assertEqual(len(deleted), 1)
+
+    def test_health_report_passes_without_live_database(self):
+        report = build_health_report(include_tests=False, include_db=True, db_path=Path("missing-health-test.db"))
+        self.assertTrue(report["ok"])
+        self.assertTrue(any(check["name"] == "database_integrity" for check in report["checks"]))
+
+    def test_scenario_stress_estimates_equity_loss(self):
+        report = build_scenario_report(
+            {
+                "portfolio": {
+                    "positions": [
+                        {"symbol": "SPY", "type": "EQUITY", "quantity": 100, "current_value": 50000}
+                    ]
+                },
+                "risk": {"total_value": 50000, "portfolio_beta": 1.0},
+            },
+            [{"name": "down_10", "market_shock_pct": -10, "vol_shock_pct": 0}],
+        )
+        self.assertEqual(report["summary"]["worst_scenario"], "down_10")
+        self.assertEqual(report["summary"]["worst_pnl"], -5000.0)
+        self.assertEqual(report["summary"]["worst_pnl_pct_nav"], -10.0)
+
+    def test_scenario_stress_uses_option_greeks_with_underlying_spot(self):
+        report = build_scenario_report(
+            {
+                "portfolio": {
+                    "positions": [
+                        {
+                            "symbol": "SPY260717P00475000",
+                            "type": "OPTION",
+                            "quantity": -1,
+                            "current_value": -200,
+                            "underlying_price": 500,
+                            "greeks": {"delta": -0.2, "gamma": 0.001, "vega": 0.1},
+                        }
+                    ]
+                },
+                "risk": {"total_value": 10000, "portfolio_beta": 1.0},
+            },
+            [{"name": "down_10_vol_up", "market_shock_pct": -10, "vol_shock_pct": 10}],
+        )
+        worst = report["scenarios"][0]["worst_positions"][0]
+        self.assertEqual(worst["model"], "greeks")
+        self.assertEqual(report["summary"]["worst_pnl"], -1225.0)
+
+    def test_portfolio_allocator_selects_best_risk_budgeted_basket(self):
+        def action(ticker, score, capital, max_loss, delta, ann_roc):
+            return {
+                "ticker": ticker,
+                "strategy": "BULL_PUT",
+                "score": score,
+                "action_decision": "APPROVE",
+                "action_size_multiplier": 1.0,
+                "capital_required": capital,
+                "max_loss": max_loss,
+                "delta_change": delta,
+                "projected_delta": delta,
+                "correlation": {"groups": [], "penalty": 0},
+                "candidate": {
+                    "strategy": "BULL_PUT",
+                    "expiration": "2026-07-17",
+                    "short_strike": 100,
+                    "long_strike": 95,
+                    "pop_pct": 75,
+                    "ann_roc_pct": ann_roc,
+                    "execution": {"execution_score": 80},
+                },
+            }
+
+        report = allocate_portfolio(
+            {
+                "limits": {"account_nav": 10000, "max_portfolio_delta_abs": 100},
+                "actions": [
+                    action("AAA", 80, 1000, 1000, -20, 30),
+                    action("BBB", 70, 1000, 1000, -20, 20),
+                    action("CCC", 60, 1000, 1000, -20, 10),
+                ],
+            },
+            {
+                "max_positions": 2,
+                "max_total_capital_pct": 0.25,
+                "max_tail_loss_pct": 0.20,
+                "max_ticker_capital_pct": 0.20,
+                "max_group_exposure_pct": 0.50,
+                "stress_loss_fraction": 0.50,
+            },
+        )
+        self.assertEqual([row["ticker"] for row in report["selected"]], ["AAA", "BBB"])
+        self.assertEqual(report["summary"]["selected"], 2)
+        self.assertEqual(report["summary"]["capital_allocated"], 2000.0)
+        self.assertIn("position limit 2", report["excluded"][0]["reasons"])
+
+    def test_portfolio_allocator_enforces_tail_loss_budget(self):
+        report = allocate_portfolio(
+            {
+                "limits": {"account_nav": 10000, "max_portfolio_delta_abs": 100},
+                "actions": [
+                    {
+                        "ticker": "SPY",
+                        "strategy": "BULL_PUT",
+                        "score": 80,
+                        "action_decision": "APPROVE",
+                        "action_size_multiplier": 1.0,
+                        "capital_required": 1200,
+                        "max_loss": 1200,
+                        "delta_change": -20,
+                        "projected_delta": -20,
+                        "correlation": {"groups": [], "penalty": 0},
+                        "candidate": {
+                            "strategy": "BULL_PUT",
+                            "expiration": "2026-07-17",
+                            "short_strike": 475,
+                            "long_strike": 470,
+                            "pop_pct": 75,
+                            "ann_roc_pct": 20,
+                            "execution": {"execution_score": 80},
+                        },
+                    }
+                ],
+            },
+            {
+                "max_tail_loss_pct": 0.05,
+                "stress_loss_fraction": 0.65,
+                "max_total_capital_pct": 0.50,
+                "max_ticker_capital_pct": 0.50,
+            },
+        )
+        self.assertEqual(report["summary"]["selected"], 0)
+        self.assertIn("tail-loss budget $500", report["excluded"][0]["reasons"])
+
+    def test_walk_forward_validation_finds_stable_profitable_threshold(self):
+        trades = []
+        for i in range(20):
+            high_score = i % 2 == 0
+            trades.append(
+                {
+                    "id": str(i),
+                    "status": "CLOSED",
+                    "closed_at": f"2026-05-{i + 1:02d}",
+                    "ticker": "SPY",
+                    "strategy": "BULL_PUT",
+                    "score": 72 if high_score else 52,
+                    "realized_pnl": 100 if high_score else -80,
+                    "capital_at_risk": 500,
+                }
+            )
+        report = build_walk_forward_report(
+            {"trades": trades},
+            min_train=10,
+            test_window=5,
+            thresholds=[50, 60, 70],
+            min_selected=3,
+        )
+        self.assertEqual(report["summary"]["status"], "PASS")
+        self.assertEqual(report["summary"]["avg_selected_threshold"], 60.0)
+        self.assertEqual(report["summary"]["profitable_fold_pct"], 100.0)
+
+    def test_drift_monitor_flags_recent_edge_deterioration(self):
+        trades = []
+        for i in range(20):
+            recent = i >= 15
+            trades.append(
+                {
+                    "id": str(i),
+                    "status": "CLOSED",
+                    "closed_at": f"2026-05-{i + 1:02d}",
+                    "ticker": "SPY",
+                    "strategy": "BULL_PUT",
+                    "score": 70,
+                    "realized_pnl": -100 if recent else 75,
+                    "capital_at_risk": 500,
+                }
+            )
+        report = build_drift_report(
+            {"trades": trades},
+            recent_window=5,
+            min_baseline=10,
+            min_samples=5,
+        )
+        self.assertEqual(report["summary"]["status"], "DRIFT")
+        self.assertEqual(report["summary"]["severity"], "HIGH")
+        self.assertLess(report["comparison"]["expectancy_change"], 0)
 
     def test_broker_reconciliation_matches_ticket_and_position(self):
         journal = {
@@ -468,12 +703,68 @@ class CoreWorkflowTests(unittest.TestCase):
         alerts = {"summary": {"high": 1}, "alerts": [{"priority": "HIGH", "kind": "candidate", "title": "SPY", "detail": "Approved"}]}
         tickets = {"tickets": [{"decision": "APPROVE", "ticker": "SPY", "strategy": "BULL_PUT", "expiration": "2026-07-17"}]}
         manifest = {"created_at": "2026-06-05T12:00:00", "reports": {"plan": "plan.json"}}
-        html = build_dashboard(plan=plan, alerts=alerts, tickets=tickets, manifest=manifest, base=Path("."))
+        html = build_dashboard(
+            plan=plan,
+            alerts=alerts,
+            tickets=tickets,
+            manifest=manifest,
+            base=Path("."),
+            scenario_stress={
+                "summary": {"worst_scenario": "crash", "worst_pnl": -7500, "worst_pnl_pct_nav": -15},
+                "scenarios": [
+                    {
+                        "name": "crash",
+                        "market_shock_pct": -15,
+                        "vol_shock_pct": 25,
+                        "estimated_pnl": -7500,
+                        "estimated_pnl_pct_nav": -15,
+                    }
+                ],
+            },
+            allocation={
+                "summary": {
+                    "selected": 1,
+                    "capital_allocated": 380,
+                    "tail_budget_utilization_pct": 10,
+                },
+                "selected": [
+                    {
+                        "rank": 1,
+                        "ticker": "SPY",
+                        "strategy": "BULL_PUT",
+                        "objective_score": 75,
+                        "capital": 380,
+                        "tail_loss": 247,
+                        "delta_change": -22,
+                    }
+                ],
+            },
+            validation={
+                "summary": {"status": "PASS", "avg_oos_expectancy": 25},
+                "overall": {
+                    "status": "PASS",
+                    "valid_fold_count": 3,
+                    "profitable_fold_pct": 66.7,
+                    "avg_oos_expectancy": 25,
+                    "avg_selected_threshold": 65,
+                    "threshold_std": 2.5,
+                },
+            },
+            drift={
+                "summary": {"status": "STABLE", "severity": "LOW"},
+                "comparison": {"expectancy_change": 5},
+            },
+        )
         self.assertIn("Quant Tools Dashboard", html)
         self.assertIn("Action Plan", html)
         self.assertIn("Score-Band Performance", html)
         self.assertIn("Strategy Calibration", html)
         self.assertIn("Execution Tickets", html)
+        self.assertIn("Scenario Stress", html)
+        self.assertIn("Portfolio Allocation", html)
+        self.assertIn("Walk-Forward Validation", html)
+        self.assertIn("Drift Status", html)
+        self.assertIn("crash", html)
         self.assertIn("SPY", html)
 
     def test_config_deep_merge(self):

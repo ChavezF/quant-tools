@@ -83,18 +83,58 @@ def journal_alerts(journal_state: dict[str, Any], profit_target_pct: float, dte_
     return out
 
 
+def model_health_alerts(
+    validation: dict[str, Any] | None,
+    drift: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    out = []
+    validation_summary = (validation or {}).get("summary", {})
+    validation_status = validation_summary.get("status")
+    if validation_status in {"FAIL", "WATCH"}:
+        priority = "HIGH" if validation_status == "FAIL" else "MEDIUM"
+        out.append(
+            alert(
+                priority,
+                "validation",
+                f"Walk-forward validation: {validation_status}",
+                f"profitable folds={float(validation_summary.get('profitable_fold_pct', 0) or 0):.1f}%, "
+                f"OOS expectancy=${float(validation_summary.get('avg_oos_expectancy', 0) or 0):,.2f}",
+                validation_summary,
+            )
+        )
+
+    drift_summary = (drift or {}).get("summary", {})
+    if drift_summary.get("status") == "DRIFT":
+        priority = "HIGH" if drift_summary.get("severity") == "HIGH" else "MEDIUM"
+        comparison = (drift or {}).get("comparison", {})
+        out.append(
+            alert(
+                priority,
+                "drift",
+                f"Performance drift: {drift_summary.get('severity')}",
+                f"expectancy change=${float(comparison.get('expectancy_change', 0) or 0):+,.2f}, "
+                f"win-rate change={float(comparison.get('win_rate_change', 0) or 0):+.1f} pts",
+                drift,
+            )
+        )
+    return out
+
+
 def build_alerts(
     plan: dict[str, Any] | None,
     journal_state: dict[str, Any] | None,
     min_score: float,
     profit_target_pct: float,
     dte_warning: int,
+    validation: dict[str, Any] | None = None,
+    drift: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     alerts = []
     if plan:
         alerts.extend(candidate_alerts(plan, min_score))
     if journal_state:
         alerts.extend(journal_alerts(journal_state, profit_target_pct, dte_warning))
+    alerts.extend(model_health_alerts(validation, drift))
 
     priority_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     alerts.sort(key=lambda row: (priority_order.get(row["priority"], 9), row["kind"], row["title"]))
@@ -132,13 +172,25 @@ def main() -> None:
     ap.add_argument("--min-score", type=float, default=68.0)
     ap.add_argument("--profit-target-pct", type=float, default=50.0)
     ap.add_argument("--dte-warning", type=int, default=21)
+    ap.add_argument("--validation")
+    ap.add_argument("--drift")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     plan = json.loads(Path(args.plan).read_text()) if args.plan else None
     journal_path = Path(args.journal)
     journal_state = load_state(journal_path) if journal_path.exists() else None
-    report = build_alerts(plan, journal_state, args.min_score, args.profit_target_pct, args.dte_warning)
+    validation = json.loads(Path(args.validation).read_text()) if args.validation and Path(args.validation).exists() else None
+    drift = json.loads(Path(args.drift).read_text()) if args.drift and Path(args.drift).exists() else None
+    report = build_alerts(
+        plan,
+        journal_state,
+        args.min_score,
+        args.profit_target_pct,
+        args.dte_warning,
+        validation,
+        drift,
+    )
     if args.json:
         print(json.dumps(report, indent=2, default=str))
         return

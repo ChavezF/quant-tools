@@ -314,6 +314,8 @@ def main():
         und = fetch_underlying_for_position(pos)
         if und not in metrics_map:
             metrics_map[und] = get_underlying_metrics(und)
+        pos["underlying_symbol"] = und
+        pos["underlying_price"] = metrics_map[und].get("last")
         if pos["type"] == "OPTION":
             osis_to_fetch.append(pos["symbol"])
             pos_lookup[pos["symbol"]] = pos
