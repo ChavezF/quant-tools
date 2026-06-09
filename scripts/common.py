@@ -128,3 +128,51 @@ def derive_live_account_nav(portfolio_report: dict[str, Any] | None, default: fl
         if value is not None and float(value) > 0:
             return float(value)
     return default
+
+
+# Map the macro regime verdict emitted by daily_brief.py to the --sizing-mode
+# flag. The macro scoring thresholds (macro_overlay.build_overlay) are:
+#   score >= 65 → AGGRESSIVE  (scale up short premium)
+#   score >= 50 → FAVORABLE   (normal sizing)
+#   score >= 35 → CAUTIOUS    (half size, skip earnings names)
+#   else        → DEFENSIVE   (cash > premium, wait for setup)
+# AGGRESSIVE/FAVORABLE pass the "macro > FAVORABLE" guard from the standing
+# rule ("half size until macro regime > FAVORABLE or portfolio IVRank > 50"),
+# so we go full-size. CAUTIOUS/DEFENSIVE are below the bar → half size. Any
+# parse failure or unknown verdict falls back to cautious (the safer default).
+REGIME_TO_SIZING = {
+    "AGGRESSIVE": "aggressive",
+    "FAVORABLE": "normal",
+    "CAUTIOUS": "cautious",
+    "DEFENSIVE": "cautious",
+}
+
+
+def parse_regime_from_brief(brief_text: str) -> str | None:
+    """Pull the macro regime verdict from daily_brief.py output.
+
+    Looks for the line `  Verdict: <VERDICT>: <reasoning>` and returns the
+    verdict token (AGGRESSIVE/FAVORABLE/CAUTIOUS/DEFENSIVE). Returns None
+    when the line is missing or malformed — caller falls back to cautious.
+    """
+    for line in brief_text.splitlines():
+        if "Verdict:" not in line:
+            continue
+        after = line.split("Verdict:", 1)[1].strip()
+        if not after:
+            return None
+        return after.split(":", 1)[0].strip().upper() or None
+    return None
+
+
+def derive_sizing_mode(brief_text: str) -> tuple[str, str | None]:
+    """Map the brief's regime to --sizing-mode. Returns (mode, verdict) tuple.
+
+    verdict is None if the parse failed (caller logs a warning). Mode always
+    resolves to one of cautious/normal/aggressive — unknown verdicts fall
+    through to cautious rather than raising, so a brief-format drift can't
+    crash the morning cron."""
+    verdict = parse_regime_from_brief(brief_text)
+    if verdict is None:
+        return "cautious", None
+    return REGIME_TO_SIZING.get(verdict, "cautious"), verdict

@@ -838,6 +838,57 @@ class CoreWorkflowTests(unittest.TestCase):
         capped = apply_sizing_mode(huge, "aggressive")
         self.assertAlmostEqual(capped["max_total_capital_pct"], 1.0)
 
+    def test_parse_regime_from_brief_extracts_verdict(self):
+        """The cron reads the macro regime from daily_brief.py's `Verdict:`
+        line. Parser must handle all 4 macro verdicts and fall back to None
+        on a malformed line — never raise, since cron failures page the user."""
+        from common import parse_regime_from_brief, derive_sizing_mode, REGIME_TO_SIZING
+
+        # Live-style brief excerpt (the 2 leading spaces matter — the parser
+        # looks for "Verdict:" anywhere in the line, not at col 0)
+        brief_live = """☀️ MORNING BRIEF — Tue Jun 09, 13:45 ET
+
+🎯 MACRO REGIME
+  Score: 70/100  ██████████████░░░░░░
+  Verdict: AGGRESSIVE: scale up short premium
+   • VIX 20.93 in sweet spot (20-25)
+
+📈 MARKETS
+"""
+        self.assertEqual(parse_regime_from_brief(brief_live), "AGGRESSIVE")
+        self.assertEqual(derive_sizing_mode(brief_live), ("aggressive", "AGGRESSIVE"))
+
+        # Other 3 verdicts
+        for verdict, expected_mode in [
+            ("FAVORABLE: normal sizing", ("normal", "FAVORABLE")),
+            ("CAUTIOUS: half size, skip earnings names", ("cautious", "CAUTIOUS")),
+            ("DEFENSIVE: cash > premium, wait for setup", ("cautious", "DEFENSIVE")),
+        ]:
+            brief = f"\n🎯 MACRO REGIME\n  Verdict: {verdict}\n"
+            self.assertEqual(parse_regime_from_brief(brief), verdict.split(":", 1)[0])
+            self.assertEqual(derive_sizing_mode(brief), expected_mode)
+
+        # Case insensitivity (brief output is uppercase but be defensive)
+        brief_lower = "  Verdict: aggressive: scale up short premium"
+        self.assertEqual(parse_regime_from_brief(brief_lower), "AGGRESSIVE")
+
+        # Missing / malformed — must NOT raise, must return (cautious, None)
+        self.assertIsNone(parse_regime_from_brief(""))
+        self.assertIsNone(parse_regime_from_brief("no verdict line here\nnothing\n"))
+        self.assertIsNone(parse_regime_from_brief("  Verdict: \n"))  # empty after colon
+        self.assertEqual(derive_sizing_mode(""), ("cautious", None))
+        self.assertEqual(derive_sizing_mode("no verdict line"), ("cautious", None))
+
+        # Unknown verdict — falls through to cautious but returns the unknown
+        # token so the caller can log a drift warning
+        brief_unknown = "  Verdict: BAZINGA: something weird"
+        self.assertEqual(parse_regime_from_brief(brief_unknown), "BAZINGA")
+        self.assertEqual(derive_sizing_mode(brief_unknown), ("cautious", "BAZINGA"))
+
+        # REGIME_TO_SIZING must cover all 4 macro verdicts
+        self.assertEqual(set(REGIME_TO_SIZING.keys()),
+                         {"AGGRESSIVE", "FAVORABLE", "CAUTIOUS", "DEFENSIVE"})
+
     def test_pretrade_uses_live_account_nav_from_risk_report(self):
         """pretrade_check picks up NAV from the risk report when present,
         ignoring the (stale or default) CLI --account-nav. The actual NAV
