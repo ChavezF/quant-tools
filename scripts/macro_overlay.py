@@ -35,9 +35,9 @@ def get_vix_regime() -> dict:
         if hist.empty:
             return {}
         closes = hist["Close"]
-        spot = float(closes.iloc[-1])
-        pct_1w = (spot / float(closes.iloc[-5]) - 1) * 100 if len(closes) >= 5 else 0
-        pct_1m = (spot / float(closes.iloc[-21]) - 1) * 100 if len(closes) >= 21 else 0
+        spot = float(closes.dropna().iloc[-1])
+        pct_1w = (spot / float(closes.dropna().iloc[-5]) - 1) * 100 if len(closes.dropna()) >= 5 else 0
+        pct_1m = (spot / float(closes.dropna().iloc[-21]) - 1) * 100 if len(closes.dropna()) >= 21 else 0
         pct_rank = float((closes < spot).sum() / len(closes) * 100)
         return {
             "spot": round(spot, 2),
@@ -87,8 +87,8 @@ def get_dxy_trend() -> dict:
         if hist.empty:
             return {}
         closes = hist["Close"]
-        spot = float(closes.iloc[-1])
-        pct_1m = (spot / float(closes.iloc[-21]) - 1) * 100 if len(closes) >= 21 else 0
+        spot = float(closes.dropna().iloc[-1])
+        pct_1m = (spot / float(closes.dropna().iloc[-21]) - 1) * 100 if len(closes.dropna()) >= 21 else 0
         return {
             "spot": round(spot, 2),
             "pct_1m": round(pct_1m, 2),
@@ -131,7 +131,7 @@ def get_upcoming_earnings(watchlist: list, days: int = 7) -> list[dict]:
             closes = hist["Close"]
             log_returns = np.log(closes / closes.shift(1)).dropna()
             rv_21 = float(log_returns.tail(21).std() * np.sqrt(252) * 100)
-            spot = float(closes.iloc[-1])
+            spot = float(closes.dropna().iloc[-1])
             emove_pct = rv_21 / np.sqrt(252)
             emove_dollar = spot * emove_pct / 100
             out.append({

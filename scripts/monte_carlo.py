@@ -246,7 +246,7 @@ def get_current_iv(symbol: str) -> tuple[float, float]:
     log_rets = np.log(closes / closes.shift(1)).dropna()
     iv_30d = float(log_rets[-30:].std() * np.sqrt(252) * 100)
     if spot == 0:
-        spot = float(closes.iloc[-1])
+        spot = float(closes.dropna().iloc[-1])
     return iv_30d, spot
 
 

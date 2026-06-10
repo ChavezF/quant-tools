@@ -248,7 +248,7 @@ def fetch_underlying_metrics_uncached(symbol: str) -> dict:
         rv_60 = float(log_returns.tail(60).std() * np.sqrt(252))
         info = t.info or {}
         return {
-            "last_close": float(closes.iloc[-1]),
+            "last_close": float(closes.dropna().iloc[-1]),
             "rv_21d_pct": rv_21 * 100,
             "rv_60d_pct": rv_60 * 100,
             "iv_rank_proxy_pct": min(100, max(0, (rv_21 / max(0.05, 0.30)) * 100)),  # crude

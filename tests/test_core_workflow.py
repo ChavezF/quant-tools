@@ -1682,6 +1682,15 @@ class CoreWorkflowTests(unittest.TestCase):
             db_path = Path(tmp) / "quant.db"
             con = connect(db_path)
             try:
+                # Seed the ticket as live PENDING so the EXPIRED/CANCELLED
+                # filter in load_execution_records keeps it.
+                con.execute(
+                    "INSERT INTO tickets(ticket_id, ticker, strategy, decision, "
+                    "expiration, lifecycle_status, payload_json, updated_at) "
+                    "VALUES ('QTK-1', 'SPY', 'BULL_PUT', 'APPROVE', "
+                    "'2026-07-17', 'PENDING', '{}', '2026-06-01T10:00:00Z')"
+                )
+                con.commit()
                 record_reconciliation(
                     con,
                     {
@@ -1729,6 +1738,79 @@ class CoreWorkflowTests(unittest.TestCase):
             self.assertEqual(records[0]["status"], "MATCHED")
             self.assertEqual(report["summary"]["quantity_fill_rate"], 100.0)
             self.assertEqual(report["summary"]["fees_per_contract"], 1.0)
+
+    def test_execution_attribution_excludes_expired_and_cancelled_tickets(self):
+        """Regression: a bulk-EXPIRE clears the live queue but the historical
+        reconciliation_runs payloads still reference those tickets. Without
+        filtering by current lifecycle_status, the attribution would count
+        unmatched records from EXPIRED tickets as 0%-fill-rate, trip a
+        THROTTLE signal, and downgrade every trade in the next plan.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "quant.db"
+            con = connect(db_path)
+            try:
+                # Three tickets in the recon: one active PENDING, one EXPIRED
+                # (was PENDING but the operator gave up), one CANCELLED.
+                record_reconciliation(
+                    con,
+                    {
+                        "created_at": "2026-06-01T10:00:00Z",
+                        "ticket_matches": [
+                            {
+                                "ticket_id": "QTK-ACTIVE",
+                                "ticker": "SPY",
+                                "strategy": "BULL_PUT",
+                                "status": "UNMATCHED",
+                                "target_quantity": 1,
+                                "filled_quantity": 0,
+                            },
+                            {
+                                "ticket_id": "QTK-EXPIRED",
+                                "ticker": "QQQ",
+                                "strategy": "BULL_PUT",
+                                "status": "UNMATCHED",
+                                "target_quantity": 1,
+                                "filled_quantity": 0,
+                            },
+                            {
+                                "ticket_id": "QTK-CANCELLED",
+                                "ticker": "NVDA",
+                                "strategy": "BULL_PUT",
+                                "status": "UNMATCHED",
+                                "target_quantity": 1,
+                                "filled_quantity": 0,
+                            },
+                        ],
+                    },
+                )
+                # Seed the tickets table directly with the right lifecycle
+                # statuses. upsert_tickets does not propagate lifecycle_status
+                # on conflict (intentional: that field is governed by the
+                # durable queue, not by the action plan), so we use raw SQL.
+                for tid, status in [
+                    ("QTK-ACTIVE", "PENDING"),
+                    ("QTK-EXPIRED", "EXPIRED"),
+                    ("QTK-CANCELLED", "CANCELLED"),
+                ]:
+                    con.execute(
+                        "INSERT INTO tickets(ticket_id, ticker, strategy, decision, "
+                        "expiration, lifecycle_status, payload_json, updated_at) "
+                        "VALUES (?, 'X', 'BULL_PUT', 'APPROVE', '2026-07-17', ?, '{}', '2026-06-01T10:00:00Z')",
+                        (tid, status),
+                    )
+                con.commit()
+            finally:
+                con.close()
+
+            records = load_execution_records(db_path)
+            self.assertEqual(len(records), 1, "only the active PENDING ticket should survive")
+            self.assertEqual(records[0]["ticket_id"], "QTK-ACTIVE")
+            # The summary must show n=1, not n=3 — otherwise THROTTLE fires
+            # from stale unmatched records.
+            report = build_execution_attribution(records, min_samples=1)
+            self.assertEqual(report["summary"]["count"], 1)
+            self.assertEqual(report["summary"]["fill_rate"], 0.0)  # 0/1 unmatched, not 0/3
 
     def test_action_plan_applies_execution_attribution(self):
         limits = RiskLimits(account_nav=30000)

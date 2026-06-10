@@ -92,7 +92,7 @@ def get_underlying_metrics(symbol: str) -> dict:
         rv_21 = float(log_returns.tail(21).std() * np.sqrt(252))
         info = t.info or {}
         return {
-            "last": float(closes.iloc[-1]),
+            "last": float(closes.dropna().iloc[-1]),
             "rv_21d": rv_21,
             "beta": info.get("beta", 1.0) or 1.0,
             "sector": info.get("sector", "Unknown"),

@@ -21,20 +21,40 @@ def as_float(value: Any) -> float | None:
 
 
 def load_execution_records(db_path: str | Path) -> list[dict[str, Any]]:
+    """Aggregate the latest reconciliation snapshot per ticket, excluding
+    tickets the operator has since closed out (EXPIRED / CANCELLED).
+
+    Why: every reconciliation_run's payload lists every ticket it tried to
+    match. A bulk EXPIRE earlier in the day clears the live queue but does
+    not rewrite the historical payloads, so a stale "unmatched" record from
+    a ticket the user never intended to execute can drag the fill_rate to
+    0% and trip a THROTTLE signal on every trade in the next plan. Joining
+    against the current lifecycle_status is the cheapest correct fix: a
+    ticket that's been EXPIRED is not part of the live execution record
+    anymore, and the attribution should not pretend otherwise.
+    """
     con = connect(db_path)
     try:
         runs = con.execute(
             "SELECT id, created_at, payload_json FROM reconciliation_runs ORDER BY id"
         ).fetchall()
+        # Only tickets still considered part of the live execution record.
+        # PENDING / PARTIAL / MATCHED / FILLED all mean "we expect to act on
+        # this"; EXPIRED / CANCELLED mean "we deliberately gave up on it".
+        active_rows = con.execute(
+            "SELECT ticket_id FROM tickets "
+            "WHERE lifecycle_status IN ('PENDING','PARTIAL','MATCHED','FILLED')"
+        ).fetchall()
     finally:
         con.close()
 
+    active_ids = {row["ticket_id"] for row in active_rows}
     latest: dict[str, dict[str, Any]] = {}
     for run in runs:
         report = json.loads(run["payload_json"])
         for match in report.get("ticket_matches", []):
             ticket_id = str(match.get("ticket_id") or "")
-            if not ticket_id:
+            if not ticket_id or ticket_id not in active_ids:
                 continue
             latest[ticket_id] = {
                 **match,

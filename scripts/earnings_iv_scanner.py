@@ -62,7 +62,7 @@ def get_earnings_and_rv(symbol: str) -> dict:
             pass
 
         return {
-            "last": float(closes.iloc[-1]),
+            "last": float(closes.dropna().iloc[-1]),
             "rv_21d_pct": rv_21 * 100,
             "rv_60d_pct": rv_60 * 100,
             "earnings_date": earnings_date,
