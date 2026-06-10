@@ -69,17 +69,6 @@ def fetch_underlying_for_position(pos: dict) -> str:
     return underlying_from_position(pos)
 
 
-def fetch_osi_strike(osi: str) -> float:
-    try:
-        return int(osi[-8:]) / 1000.0
-    except (ValueError, IndexError):
-        return 0.0
-
-
-def is_call(osi: str) -> bool:
-    return osi[-9] == "C"
-
-
 def get_greeks_for_option(client, osi: str) -> dict:
     try:
         res = client.get_option_greeks(osi_symbols=[osi])
@@ -94,7 +83,8 @@ def get_greeks_for_option(client, osi: str) -> dict:
 def get_underlying_metrics(symbol: str) -> dict:
     try:
         t = yf.Ticker(symbol)
-        hist = t.history(period="6mo", auto_adjust=True)
+        # 1y so the bootstrap VaR has ~250 joint return observations
+        hist = t.history(period="1y", auto_adjust=True)
         if hist.empty:
             return {}
         closes = hist["Close"]
@@ -107,9 +97,55 @@ def get_underlying_metrics(symbol: str) -> dict:
             "beta": info.get("beta", 1.0) or 1.0,
             "sector": info.get("sector", "Unknown"),
             "market_cap": info.get("marketCap", 0) or 0,
+            "daily_returns": [float(r) for r in log_returns.values],
         }
     except Exception:
         return {}
+
+
+def bootstrap_var(
+    exposures: dict[str, dict],
+    returns_map: dict[str, list[float]],
+    num_samples: int = 10000,
+    seed: int = 42,
+    min_observations: int = 60,
+) -> dict:
+    """Empirical 1-day VaR from jointly resampled historical returns.
+
+    `exposures` maps underlying -> {"delta_dollars": signed $ P&L per 100%
+    move, "gamma_dollars": signed $ gamma term}. Whole historical days are
+    sampled across all underlyings at once, so correlation and fat tails come
+    from the data instead of the delta-normal beta*1.2% assumption (which the
+    README itself warns "breaks in fat-tail events" — precisely the events a
+    short-premium book is exposed to). P&L per sampled day:
+        sum_u delta_dollars_u * r_u + 0.5 * gamma_dollars_u * r_u^2
+    """
+    symbols = [
+        symbol
+        for symbol in exposures
+        if len(returns_map.get(symbol) or []) >= min_observations
+    ]
+    if not symbols:
+        return {}
+    depth = min(len(returns_map[symbol]) for symbol in symbols)
+    # Tail-align on the most recent `depth` trading days across all symbols
+    matrix = np.column_stack([np.asarray(returns_map[symbol][-depth:], dtype=float) for symbol in symbols])
+    delta_vec = np.array([float(exposures[symbol].get("delta_dollars", 0.0)) for symbol in symbols])
+    gamma_vec = np.array([float(exposures[symbol].get("gamma_dollars", 0.0)) for symbol in symbols])
+
+    rng = np.random.default_rng(seed)
+    sampled = matrix[rng.integers(0, depth, size=num_samples)]
+    pnl = sampled @ delta_vec + 0.5 * (sampled**2) @ gamma_vec
+    p5 = float(np.percentile(pnl, 5))
+    tail = pnl[pnl <= p5]
+    return {
+        "var_1d_95": round(max(0.0, -p5), 2),
+        "var_1d_99": round(max(0.0, -float(np.percentile(pnl, 1))), 2),
+        "expected_shortfall_95": round(max(0.0, -float(tail.mean())) if len(tail) else 0.0, 2),
+        "observations": depth,
+        "num_samples": num_samples,
+        "underlyings": symbols,
+    }
 
 
 def compute_risk(positions: list, metrics_map: dict) -> dict:
@@ -130,6 +166,11 @@ def compute_risk(positions: list, metrics_map: dict) -> dict:
     # By underlying exposure — sum absolute notional exposure
     underlying_exposure = {}  # symbol -> {long, short, beta, value, sector}
     concentration = []  # (symbol, pct)
+    # Signed dollar exposures per underlying for the bootstrap VaR
+    bootstrap_exposures: dict[str, dict] = {}
+
+    def exposure_bucket(und: str) -> dict:
+        return bootstrap_exposures.setdefault(und, {"delta_dollars": 0.0, "gamma_dollars": 0.0})
 
     for pos in positions:
         und = fetch_underlying_for_position(pos)
@@ -137,6 +178,7 @@ def compute_risk(positions: list, metrics_map: dict) -> dict:
         beta = m.get("beta", 1.0) or 1.0
         sector = m.get("sector", "Unknown")
         weight = pos["current_value"] / total_value
+        spot = m.get("last", 0) or 0
 
         if pos["type"] == "OPTION":
             greeks = pos.get("greeks", {})
@@ -150,7 +192,11 @@ def compute_risk(positions: list, metrics_map: dict) -> dict:
 
             # Underlying equivalent: delta * qty * 100 (in shares) * spot
             delta_shares = greeks.get("delta", 0) * abs(qty) * 100 * sign
-            delta_value = delta_shares * (m.get("last", 0) or 0)
+            delta_value = delta_shares * spot
+            bucket = exposure_bucket(und)
+            bucket["delta_dollars"] += delta_value
+            # P&L gamma term for return r: 0.5 * gamma * (spot*r)^2 * 100 * qty
+            bucket["gamma_dollars"] += greeks.get("gamma", 0) * abs(qty) * 100 * sign * spot * spot
             if und not in underlying_exposure:
                 underlying_exposure[und] = {"long": 0, "short": 0, "beta": beta, "sector": sector, "value": 0}
             if delta_value > 0:
@@ -163,7 +209,8 @@ def compute_risk(positions: list, metrics_map: dict) -> dict:
             qty = pos["quantity"]
             if und not in underlying_exposure:
                 underlying_exposure[und] = {"long": 0, "short": 0, "beta": beta, "sector": sector, "value": 0}
-            value = qty * (m.get("last", 0) or 0)
+            value = qty * spot
+            exposure_bucket(und)["delta_dollars"] += value
             if value > 0:
                 underlying_exposure[und]["long"] += value
             else:
@@ -187,10 +234,19 @@ def compute_risk(positions: list, metrics_map: dict) -> dict:
     top_concentration = concentration[:5]
 
     # 1-day 95% VaR (delta-normal): VaR = 1.645 * portfolio_sigma * portfolio_value
-    # portfolio_sigma ≈ sum_i (weight_i * beta_i * market_sigma)
+    # Kept for continuity, but the bootstrap VaR below is the honest number —
+    # delta-normal understates exactly the fat-tail events a short-premium
+    # book is exposed to.
     market_sigma_1d = 0.012  # SPY daily vol ~1.2%
     port_sigma_1d = abs(port_beta) * market_sigma_1d
     var_1d_95 = 1.645 * port_sigma_1d * total_value
+
+    # Empirical VaR: jointly resample the underlyings' actual return history
+    returns_map = {
+        und: metrics_map.get(und, {}).get("daily_returns") or []
+        for und in bootstrap_exposures
+    }
+    empirical = bootstrap_var(bootstrap_exposures, returns_map)
 
     # Stress test
     stress_results = {}
@@ -209,6 +265,7 @@ def compute_risk(positions: list, metrics_map: dict) -> dict:
         "sector_concentration": sector_pcts,
         "top_holdings": top_concentration,
         "var_1d_95": var_1d_95,
+        "var_bootstrap": empirical,
         "stress_test": stress_results,
     }
 
@@ -248,6 +305,13 @@ def print_dashboard(portfolio: dict, risk: dict, demo: bool = False):
     print(f"  Portfolio Beta:                {risk['portfolio_beta']:>10.3f}")
     print(f"  1-day 95% VaR (delta-normal):  ${risk['var_1d_95']:>11,.2f}  "
           f"({risk['var_1d_95']/risk['total_value']*100:.2f}% of NAV)")
+    empirical = risk.get("var_bootstrap") or {}
+    if empirical:
+        print(f"  1-day 95% VaR (bootstrap):     ${empirical['var_1d_95']:>11,.2f}  "
+              f"({empirical['var_1d_95']/risk['total_value']*100:.2f}% of NAV)")
+        print(f"  1-day 99% VaR (bootstrap):     ${empirical['var_1d_99']:>11,.2f}")
+        print(f"  95% expected shortfall:        ${empirical['expected_shortfall_95']:>11,.2f}  "
+              f"({empirical['observations']} joint return days)")
 
     print(f"\n{'─'*78}\n  STRESS TESTS\n{'─'*78}")
     print(f"  {'Scenario':<10}  {'Est. P&L':>12}  {'% of NAV':>10}")

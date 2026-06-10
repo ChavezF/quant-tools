@@ -9,14 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
-def read_json(path: Path | None) -> dict[str, Any]:
-    if not path or not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text())
-    except json.JSONDecodeError:
-        return {}
+from common import read_json
 
 
 def esc(value: Any) -> str:

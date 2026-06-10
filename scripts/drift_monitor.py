@@ -9,7 +9,7 @@ from typing import Any
 
 from feedback_calibration import build_feedback_report
 from historical_analytics import closed_trades, summarize_trades
-from trade_journal import DEFAULT_STATE_FILE, load_state
+from trade_journal import DEFAULT_STATE_FILE, load_journal
 
 
 def severity_for(expectancy_change: float, win_rate_change: float, ror_change: float) -> str:
@@ -135,6 +135,7 @@ def print_report(report: dict[str, Any]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--journal", default=str(DEFAULT_STATE_FILE))
+    ap.add_argument("--db", help="Optional SQLite database; authoritative over the JSON journal when set")
     ap.add_argument("--recent-window", type=int, default=10)
     ap.add_argument("--min-baseline", type=int, default=10)
     ap.add_argument("--current-min-score", type=float, default=55.0)
@@ -144,7 +145,7 @@ def main() -> None:
     args = ap.parse_args()
 
     report = build_drift_report(
-        load_state(Path(args.journal)),
+        load_journal(Path(args.journal), args.db),
         recent_window=args.recent_window,
         min_baseline=args.min_baseline,
         current_min_score=args.current_min_score,

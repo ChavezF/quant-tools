@@ -75,6 +75,38 @@ def get_historical_iv_series(symbol: str, lookback_years: int = 5) -> np.ndarray
     return series.dropna().values
 
 
+def strangle_pnls(moves_pct: np.ndarray, premium_pct: float,
+                  strike_distance_pct: float) -> tuple[np.ndarray, int]:
+    """P&L of a 16Δ short strangle for each simulated move (linear approx).
+
+    Inside the strikes the full premium is kept; outside, the breach excess
+    eats the premium, floored at -strike_distance (deep-tail cap). Returns
+    (pnls, breach count).
+    """
+    abs_moves = np.abs(moves_pct)
+    breached = abs_moves > strike_distance_pct
+    losses = np.maximum(
+        premium_pct - (abs_moves - strike_distance_pct - premium_pct),
+        -strike_distance_pct,
+    )
+    pnls = np.where(breached, losses, premium_pct)
+    return pnls, int(breached.sum())
+
+
+def pnl_distribution_stats(pnls: np.ndarray, num_sims: int, breached: int) -> dict:
+    return {
+        "p5_pnl_pct": round(float(np.percentile(pnls, 5)), 3),
+        "p50_pnl_pct": round(float(np.percentile(pnls, 50)), 3),
+        "p95_pnl_pct": round(float(np.percentile(pnls, 95)), 3),
+        "p99_pnl_pct": round(float(np.percentile(pnls, 99)), 3),
+        "mean_pnl_pct": round(float(pnls.mean()), 3),
+        "std_pnl_pct": round(float(pnls.std()), 3),
+        "breach_rate": round(breached / num_sims * 100, 1),
+        "ruin_prob_pnl_lt_-2pct": round(float((pnls < -2).mean()) * 100, 2),
+        "ruin_prob_pnl_lt_-5pct": round(float((pnls < -5).mean()) * 100, 2),
+    }
+
+
 def parametric_simulation(current_iv_pct: float, hold_days: int,
                           num_sims: int, spot: float) -> dict:
     """
@@ -92,21 +124,8 @@ def parametric_simulation(current_iv_pct: float, hold_days: int,
     # Simulate returns
     rng = np.random.default_rng(42)
     moves = rng.normal(0, hold_vol, num_sims) * 100  # in %
+    pnls, breached = strangle_pnls(moves, premium_pct, strike_distance_pct)
 
-    pnls = []
-    breached = 0
-    for m in moves:
-        if abs(m) <= strike_distance_pct:
-            pnls.append(premium_pct)
-        else:
-            excess = abs(m) - strike_distance_pct - premium_pct
-            pnl = premium_pct - excess
-            pnl = max(pnl, -strike_distance_pct)
-            pnls.append(pnl)
-            if abs(m) > strike_distance_pct:
-                breached += 1
-
-    pnls = np.array(pnls)
     return {
         "method": "parametric (log-normal)",
         "n_sims": num_sims,
@@ -114,15 +133,7 @@ def parametric_simulation(current_iv_pct: float, hold_days: int,
         "iv_used_pct": current_iv_pct,
         "premium_pct_per_trade": round(premium_pct, 3),
         "strike_distance_pct": round(strike_distance_pct, 3),
-        "p5_pnl_pct": round(float(np.percentile(pnls, 5)), 3),
-        "p50_pnl_pct": round(float(np.percentile(pnls, 50)), 3),
-        "p95_pnl_pct": round(float(np.percentile(pnls, 95)), 3),
-        "p99_pnl_pct": round(float(np.percentile(pnls, 99)), 3),
-        "mean_pnl_pct": round(float(pnls.mean()), 3),
-        "std_pnl_pct": round(float(pnls.std()), 3),
-        "breach_rate": round(breached / num_sims * 100, 1),
-        "ruin_prob_pnl_lt_-2pct": round(float((pnls < -2).mean()) * 100, 2),
-        "ruin_prob_pnl_lt_-5pct": round(float((pnls < -5).mean()) * 100, 2),
+        **pnl_distribution_stats(pnls, num_sims, breached),
     }
 
 
@@ -146,23 +157,11 @@ def bootstrap_simulation(historical_returns: np.ndarray, current_iv_pct: float,
     premium_pct = (current_iv_pct / 100) * math.sqrt(hold_days / 252) * 0.6 * 100
 
     rng = np.random.default_rng(42)
-    pnls = []
-    breached = 0
-    for _ in range(num_sims):
-        # Resample `hold_days` returns, compound them
-        idx = rng.integers(0, len(scaled_returns), size=hold_days)
-        sampled = scaled_returns[idx]
-        compounded = float(np.prod(1 + sampled) - 1) * 100
-        if abs(compounded) <= strike_distance_pct:
-            pnls.append(premium_pct)
-        else:
-            excess = abs(compounded) - strike_distance_pct - premium_pct
-            pnl = premium_pct - excess
-            pnl = max(pnl, -strike_distance_pct)
-            pnls.append(pnl)
-            breached += 1
+    # Resample `hold_days` returns per simulation, compound each row
+    idx = rng.integers(0, len(scaled_returns), size=(num_sims, hold_days))
+    compounded = (np.prod(1 + scaled_returns[idx], axis=1) - 1) * 100
+    pnls, breached = strangle_pnls(compounded, premium_pct, strike_distance_pct)
 
-    pnls = np.array(pnls)
     return {
         "method": f"bootstrap (scaled to current IV {current_iv_pct:.1f}%, {len(historical_returns)} historical returns)",
         "n_sims": num_sims,
@@ -170,16 +169,8 @@ def bootstrap_simulation(historical_returns: np.ndarray, current_iv_pct: float,
         "iv_used_pct": current_iv_pct,
         "premium_pct_per_trade": round(premium_pct, 3),
         "strike_distance_pct": round(strike_distance_pct, 3),
-        "p5_pnl_pct": round(float(np.percentile(pnls, 5)), 3),
-        "p50_pnl_pct": round(float(np.percentile(pnls, 50)), 3),
-        "p95_pnl_pct": round(float(np.percentile(pnls, 95)), 3),
-        "p99_pnl_pct": round(float(np.percentile(pnls, 99)), 3),
+        **pnl_distribution_stats(pnls, num_sims, breached),
         "p1_pnl_pct": round(float(np.percentile(pnls, 1)), 3),  # 1st percentile — the tail
-        "mean_pnl_pct": round(float(pnls.mean()), 3),
-        "std_pnl_pct": round(float(pnls.std()), 3),
-        "breach_rate": round(breached / num_sims * 100, 1),
-        "ruin_prob_pnl_lt_-2pct": round(float((pnls < -2).mean()) * 100, 2),
-        "ruin_prob_pnl_lt_-5pct": round(float((pnls < -5).mean()) * 100, 2),
         "ruin_prob_pnl_lt_-10pct": round(float((pnls < -10).mean()) * 100, 2),
     }
 

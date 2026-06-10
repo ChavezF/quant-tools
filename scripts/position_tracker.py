@@ -29,10 +29,12 @@ from datetime import datetime, date
 
 from common import (
     STATE_DIR,
+    atomic_write_json,
     configure_public_imports,
     get_public_client,
     greeks_to_dict,
     parse_osi_expiration,
+    state_lock,
 )
 
 configure_public_imports()
@@ -50,13 +52,18 @@ def load_state() -> dict:
         return {"positions": {}, "last_updated": None, "history": []}
     try:
         return json.loads(STATE_FILE.read_text())
-    except Exception:
-        return {"positions": {}, "last_updated": None, "history": []}
+    except json.JSONDecodeError as exc:
+        # Cost-basis history is unrecoverable if we overwrite it with a fresh
+        # default state, so refuse instead of silently starting over.
+        raise SystemExit(
+            f"Position state {STATE_FILE} is corrupt ({exc}). Refusing to "
+            "continue. Repair or remove the file (use --init to deliberately "
+            "re-baseline cost basis) and rerun."
+        ) from exc
 
 
 def save_state(state: dict):
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
+    atomic_write_json(STATE_FILE, state)
 
 
 def fetch_portfolio(client) -> list[dict]:
@@ -253,13 +260,14 @@ def main():
     args = ap.parse_args()
 
     client = get_client()
-    state = load_state()
-    if args.init:
-        state = {"positions": {}, "last_updated": None, "history": []}
-        print("  State reset — current positions will be marked as 'entry' today.")
+    with state_lock("positions"):
+        state = load_state()
+        if args.init:
+            state = {"positions": {}, "last_updated": None, "history": []}
+            print("  State reset — current positions will be marked as 'entry' today.")
 
-    report = track_positions(client, state, init=args.init)
-    save_state(state)
+        report = track_positions(client, state, init=args.init)
+        save_state(state)
 
     if args.json:
         print(json.dumps(report, indent=2, default=str))

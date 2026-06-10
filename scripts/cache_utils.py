@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
-from common import PROJECT_ROOT
+from common import PROJECT_ROOT, atomic_write_json
 
 
 T = TypeVar("T")
@@ -40,9 +40,8 @@ def read_cache(namespace: str, *parts: object, ttl_seconds: int) -> Any | None:
 
 
 def write_cache(namespace: str, value: Any, *parts: object) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"created_at": time.time(), "value": value}
-    cache_path(namespace, *parts).write_text(json.dumps(payload, indent=2, default=str))
+    # Atomic so concurrent runs sharing the cache never read a partial file.
+    atomic_write_json(cache_path(namespace, *parts), {"created_at": time.time(), "value": value})
 
 
 def cached(namespace: str, ttl_seconds: int, fn: Callable[[], T], *parts: object) -> T:

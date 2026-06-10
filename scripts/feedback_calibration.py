@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from historical_analytics import build_analytics
-from trade_journal import DEFAULT_STATE_FILE, load_state
+from trade_journal import DEFAULT_STATE_FILE, load_journal
 
 
 SCORE_BAND_FLOORS = {"<50": 0, "50-59": 50, "60-69": 60, "70+": 70}
@@ -145,7 +145,7 @@ def main() -> None:
             min_samples=args.min_samples,
         )
     report = build_feedback_report(
-        load_state(Path(args.journal)),
+        load_journal(Path(args.journal), args.db),
         current_min_score=args.current_min_score,
         min_samples=args.min_samples,
         execution_attribution=execution_attribution,

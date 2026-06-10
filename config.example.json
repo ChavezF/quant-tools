@@ -24,7 +24,8 @@
     "min_pop_pct": 55
   },
   "journal": {
-    "path": "state/trades.json"
+    "path": "state/trades.json",
+    "mark_to_market": true
   },
   "cache": {
     "enabled": true,
@@ -111,5 +112,12 @@
     "enabled": true,
     "recent_window": 10,
     "min_baseline": 10
+  },
+  "position_management": {
+    "enabled": true,
+    "profit_target_pct": 50.0,
+    "stop_loss_pct": 200.0,
+    "manage_dte": 21,
+    "urgent_dte": 7
   }
 }

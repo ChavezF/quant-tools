@@ -31,6 +31,7 @@ cd /home/chavez_f/code/quant-tools/scripts
 /usr/bin/python3.12 quant.py scan --watchlist SPY QQQ NVDA --strategies csp bull_put --min-dte 21 --max-dte 45
 /usr/bin/python3.12 quant.py scan --watchlist SPY QQQ NVDA --strategies csp bull_put --ranked --max-expirations 2 --wing-widths 2.5 5 10
 /usr/bin/python3.12 quant.py pretrade --candidates reports/scan.json --account-nav 30000
+/usr/bin/python3.12 quant.py mark --json
 /usr/bin/python3.12 quant.py journal add --ticker SPY --strategy BULL_PUT --entry-credit 1.20 --capital-at-risk 380 --score 66 --thesis "defined risk, acceptable liquidity"
 /usr/bin/python3.12 quant.py journal profiles --section ticker_strategy
 /usr/bin/python3.12 quant.py plan --candidates reports/scan.json --portfolio reports/risk.json --journal state/trades.json --account-nav 30000
@@ -97,6 +98,32 @@ selects a basket within aggregate capital, tail-loss, ticker, correlation-group,
 position-count, and delta limits. Execution tickets are created from that
 selected basket rather than every individually approved candidate.
 
+The `mark` command (`mark_to_market.py`) prices every OPEN journal trade
+against the live option chain and stamps `unrealized_pnl`,
+`unrealized_pnl_pct`, `mark_cost_to_close`, and `marked_at` onto the trade.
+`unrealized_pnl_pct` is the percent of **max profit** captured (100 = the
+position could be closed for zero debit), matching the standard "close at 50%"
+short-premium rule and the `alerts --profit-target-pct` threshold — without a
+fresh mark the profit-target alert cannot fire. The operator workflow runs the
+mark step first (before analytics and alerts); disable it with
+`journal.mark_to_market: false` in config or `--skip-mark`. Supported
+structures: CSP, CC, bull put / bear call spreads, short strangle, iron
+condor. Debit structures and unrecognized strategies are reported as SKIPPED,
+never guessed.
+
+## State safety
+
+Journal, position, cursor, and cache writes go through an atomic
+temp-file-plus-rename (`common.atomic_write_json`), so a crash mid-write can
+never truncate a state file. A **corrupt** `trades.json` or `positions.json`
+now refuses to load with a restore hint instead of silently starting from an
+empty state (which previously let the next save overwrite the only copy of
+the history). Journal mutations (`journal add/close`, `mark`,
+`reconcile --apply-updates`, position-tracker updates) take an advisory lock
+in `state/` so the morning cron and a manual command cannot interleave
+writes; a holder that crashed is detected by lock age and broken
+automatically after 30 minutes.
+
 The `validate` command uses expanding training windows to select a score
 threshold, then measures that threshold on the next unseen block of closed
 trades. It reports profitable-fold percentage, out-of-sample expectancy, and
@@ -117,10 +144,17 @@ available, with an explicit value-based fallback for older reports.
 
 ## SQLite and broker reconciliation
 
-SQLite is a durable mirror of the existing JSON workflow, so current scripts
-remain compatible while the migration proceeds. Schema creation and upgrades
-run automatically through `PRAGMA user_version`. Journal writes can dual-write
-SQLite with `journal --db state/quant_tools.db ...`.
+SQLite is the **authoritative journal store when configured**: every journal
+reader (`analytics`, `feedback`, `validate`, `drift`, `alerts`, `journal
+profiles`, `mark`) accepts `--db` and reads through
+`trade_journal.load_journal`, which prefers the database (seeding it once
+from the JSON file if empty). The operator workflow passes the configured
+`storage.path` to all of them automatically. JSON remains the continuously
+maintained export/backup format — every write still dual-writes it — so a
+write that reached only one backend can no longer give different answers to
+different tools. Schema creation and upgrades run automatically through
+`PRAGMA user_version`. Journal writes dual-write SQLite with
+`journal --db state/quant_tools.db ...`.
 
 Broker fill imports use a provider-neutral JSON snapshot:
 
@@ -277,8 +311,11 @@ Do not bump in November.
 - Account `5OG66124` is BROKERAGE (not paper). All tools handle an empty
   account — risk dashboard uses `--target-watchlist` for demo mode, screener
   still scans from live option chains.
-- The risk dashboard's VaR is delta-normal — fine for small shocks, breaks in
-  fat-tail events.
+- The risk dashboard reports two VaR numbers: the legacy delta-normal figure
+  (fine for small shocks, breaks in fat tails) and a bootstrap VaR/expected
+  shortfall that jointly resamples a year of the underlyings' actual daily
+  returns — correlation and fat tails come from data. **Size off the
+  bootstrap number**; the delta-normal one is kept for continuity.
 - Backtester uses estimated premium and approximate strikes — real-money
   results will typically be 0.5–2% worse per trade due to bid/ask spread,
   slippage, commissions.

@@ -105,12 +105,49 @@ def journal_path(cfg: dict[str, Any], args: argparse.Namespace) -> str:
     return resolve_project_path(args.journal or cfg.get("journal", {}).get("path")) or ""
 
 
+def build_mark_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    """Mark open journal trades to market so profit-target alerts can fire."""
+    return [
+        PY,
+        str(SCRIPTS_DIR / "mark_to_market.py"),
+        "--journal",
+        journal_path(cfg, args),
+        "--db",
+        storage_db_path(cfg),
+        "--json",
+    ]
+
+
+def build_management_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    """Exit/roll review of open trades; runs after mark_to_market."""
+    management_cfg = cfg.get("position_management", {})
+    return [
+        PY,
+        str(SCRIPTS_DIR / "position_management.py"),
+        "--journal",
+        journal_path(cfg, args),
+        "--db",
+        storage_db_path(cfg),
+        "--profit-target-pct",
+        str(args.profit_target_pct if args.profit_target_pct is not None else management_cfg.get("profit_target_pct", 50.0)),
+        "--stop-loss-pct",
+        str(management_cfg.get("stop_loss_pct", 200.0)),
+        "--manage-dte",
+        str(management_cfg.get("manage_dte", 21)),
+        "--urgent-dte",
+        str(management_cfg.get("urgent_dte", 7)),
+        "--json",
+    ]
+
+
 def build_analytics_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[str]:
     return [
         PY,
         str(SCRIPTS_DIR / "historical_analytics.py"),
         "--journal",
         journal_path(cfg, args),
+        "--db",
+        storage_db_path(cfg),
         "--json",
     ]
 
@@ -139,6 +176,8 @@ def build_validation_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[
         str(SCRIPTS_DIR / "walk_forward_validation.py"),
         "--journal",
         journal_path(cfg, args),
+        "--db",
+        storage_db_path(cfg),
         "--min-train",
         str(validation_cfg.get("min_train", 10)),
         "--test-window",
@@ -158,6 +197,8 @@ def build_drift_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[str]:
         str(SCRIPTS_DIR / "drift_monitor.py"),
         "--journal",
         journal_path(cfg, args),
+        "--db",
+        storage_db_path(cfg),
         "--recent-window",
         str(drift_cfg.get("recent_window", 10)),
         "--min-baseline",
@@ -267,6 +308,7 @@ def build_alerts_cmd(
     ]
     if journal:
         cmd += ["--journal", resolve_project_path(journal)]
+    cmd += ["--db", storage_db_path(cfg)]
     if reconciliation_report:
         cmd += ["--reconciliation", str(reconciliation_report)]
     return cmd
@@ -441,6 +483,8 @@ def main() -> None:
     ap.add_argument("--profit-target-pct", type=float)
     ap.add_argument("--dte-warning", type=int)
     ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("--skip-mark", action="store_true")
+    ap.add_argument("--skip-management", action="store_true")
     ap.add_argument("--skip-discovery", action="store_true")
     ap.add_argument("--skip-risk", action="store_true")
     ap.add_argument("--skip-scenario-stress", action="store_true")
@@ -470,9 +514,13 @@ def main() -> None:
         and not args.skip_risk
     )
     allocation_enabled = bool(cfg.get("portfolio_allocation", {}).get("enabled", True)) and not args.skip_allocation
+    mark_enabled = bool(cfg.get("journal", {}).get("mark_to_market", True)) and not args.skip_mark
+    management_enabled = bool(cfg.get("position_management", {}).get("enabled", True)) and not args.skip_management
     validation_enabled = bool(cfg.get("validation", {}).get("enabled", True))
     drift_enabled = bool(cfg.get("drift_monitor", {}).get("enabled", True))
     run_dir = ensure_report_dir(args.report_dir)
+    mark_report = run_dir / "mark_to_market.json"
+    management_report = run_dir / "management.json"
     analytics_report = run_dir / "analytics.json"
     feedback_report = run_dir / "feedback.json"
     validation_report = run_dir / "validation.json"
@@ -491,6 +539,8 @@ def main() -> None:
         "created_at": datetime.now().isoformat(),
         "run_dir": str(run_dir),
         "reports": {
+            "mark_to_market": str(mark_report) if mark_enabled else None,
+            "management": str(management_report) if management_enabled else None,
             "analytics": str(analytics_report),
             "feedback": str(feedback_report),
             "validation": str(validation_report) if validation_enabled else None,
@@ -519,6 +569,20 @@ def main() -> None:
         },
         "steps": [],
     }
+
+    # Refresh unrealized P&L on open trades first so the alerts step (and the
+    # operator) see live profit-target status instead of last run's marks.
+    if mark_enabled:
+        mark_meta = run_command("mark_to_market", build_mark_cmd(cfg, args), run_dir, dry_run=args.dry_run)
+        manifest["steps"].append(mark_meta)
+        if not args.dry_run and mark_meta["returncode"] == 0:
+            mark_report.write_text(Path(mark_meta["stdout"]).read_text())
+
+    if management_enabled:
+        management_meta = run_command("management", build_management_cmd(cfg, args), run_dir, dry_run=args.dry_run)
+        manifest["steps"].append(management_meta)
+        if not args.dry_run and management_meta["returncode"] == 0:
+            management_report.write_text(Path(management_meta["stdout"]).read_text())
 
     analytics_meta = run_command("analytics", build_analytics_cmd(cfg, args), run_dir, dry_run=args.dry_run)
     manifest["steps"].append(analytics_meta)

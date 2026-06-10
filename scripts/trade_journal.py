@@ -13,7 +13,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from common import STATE_DIR
+from common import STATE_DIR, atomic_write_json, state_lock
+from trade_stats import pnl_breakdown, profit_factor, trade_pnl
 
 
 DEFAULT_STATE_FILE = STATE_DIR / "trades.json"
@@ -28,17 +29,24 @@ def load_state(path: Path) -> dict[str, Any]:
         return default_state()
     try:
         state = json.loads(path.read_text())
-        state.setdefault("version", 1)
-        state.setdefault("trades", [])
-        return state
-    except json.JSONDecodeError:
-        return default_state()
+    except json.JSONDecodeError as exc:
+        # Never fall back to an empty journal here: every downstream report
+        # (analytics, calibration, drift) would silently compute from nothing
+        # and the next save would overwrite the only copy of the history.
+        raise SystemExit(
+            f"Trade journal {path} is corrupt ({exc}). Refusing to continue. "
+            "Restore it from state/backups (db-maintenance keeps SQLite "
+            "backups; `storage --export-journal` can rebuild the JSON) "
+            "before rerunning."
+        ) from exc
+    state.setdefault("version", 1)
+    state.setdefault("trades", [])
+    return state
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     state["last_updated"] = datetime.now().isoformat()
-    path.write_text(json.dumps(state, indent=2, default=str))
+    atomic_write_json(path, state)
 
 
 def load_backend(state_file: Path, db_path: str | None) -> tuple[dict[str, Any], Any]:
@@ -53,6 +61,21 @@ def load_backend(state_file: Path, db_path: str | None) -> tuple[dict[str, Any],
         return db_state, con
     upsert_trades(con, json_state.get("trades", []))
     return json_state, con
+
+
+def load_journal(state_file: Path, db_path: str | None = None) -> dict[str, Any]:
+    """Read-only journal access with SQLite authoritative when configured.
+
+    With a `db_path`, the database is the source of truth (seeded once from
+    the JSON file if empty); the JSON file is the export/backup format that
+    save_backend keeps in sync on every write. Without a db this is a plain
+    JSON read. Use this in every report/consumer script so a write that only
+    reached one backend cannot give different answers to different tools.
+    """
+    state, con = load_backend(state_file, db_path)
+    if con is not None:
+        con.close()
+    return state
 
 
 def save_backend(state_file: Path, state: dict[str, Any], con: Any = None) -> None:
@@ -154,17 +177,13 @@ def filter_trades(trades: list[dict[str, Any]], status: str | None = None) -> li
 
 def journal_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
     closed = [trade for trade in trades if trade.get("status") == "CLOSED"]
-    wins = [trade for trade in closed if float(trade.get("realized_pnl") or 0) > 0]
-    losses = [trade for trade in closed if float(trade.get("realized_pnl") or 0) <= 0]
-    total_pnl = sum(float(trade.get("realized_pnl") or 0) for trade in closed)
-    gross_wins = sum(float(trade.get("realized_pnl") or 0) for trade in wins)
-    gross_losses = abs(sum(float(trade.get("realized_pnl") or 0) for trade in losses))
+    breakdown = pnl_breakdown(closed)
 
     by_strategy: dict[str, dict[str, Any]] = {}
     for trade in closed:
         strategy = str(trade.get("strategy") or "UNKNOWN")
         bucket = by_strategy.setdefault(strategy, {"count": 0, "pnl": 0.0, "wins": 0})
-        pnl = float(trade.get("realized_pnl") or 0)
+        pnl = trade_pnl(trade)
         bucket["count"] += 1
         bucket["pnl"] += pnl
         bucket["wins"] += 1 if pnl > 0 else 0
@@ -175,11 +194,11 @@ def journal_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "open_trades": sum(1 for trade in trades if trade.get("status") == "OPEN"),
-        "closed_trades": len(closed),
-        "total_realized_pnl": round(total_pnl, 2),
-        "win_rate": round(len(wins) / len(closed) * 100, 1) if closed else 0,
-        "avg_pnl": round(total_pnl / len(closed), 2) if closed else 0,
-        "profit_factor": round(gross_wins / gross_losses, 2) if gross_losses else None,
+        "closed_trades": breakdown["count"],
+        "total_realized_pnl": round(breakdown["total_pnl"], 2),
+        "win_rate": round(breakdown["wins"] / breakdown["count"] * 100, 1) if closed else 0,
+        "avg_pnl": round(breakdown["total_pnl"] / breakdown["count"], 2) if closed else 0,
+        "profit_factor": profit_factor(breakdown["gross_wins"], breakdown["gross_losses"]),
         "by_strategy": by_strategy,
     }
 
@@ -269,23 +288,26 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     state_file = Path(args.state_file)
-    state, con = load_backend(state_file, args.db)
 
-    if args.cmd == "add":
-        trade = add_trade(state, args)
-        save_backend(state_file, state, con)
+    if args.cmd in {"add", "close"}:
+        # Hold the journal lock across load-mutate-save so a concurrent
+        # operator run or second manual command cannot interleave writes.
+        with state_lock("journal"):
+            state, con = load_backend(state_file, args.db)
+            trade = add_trade(state, args) if args.cmd == "add" else close_trade(state, args)
+            save_backend(state_file, state, con)
         if args.json:
             print(json.dumps(trade, indent=2, default=str))
-        else:
+        elif args.cmd == "add":
             print(f"Added trade {trade['id']} ({trade['ticker']} {trade['strategy']})")
-    elif args.cmd == "close":
-        trade = close_trade(state, args)
-        save_backend(state_file, state, con)
-        if args.json:
-            print(json.dumps(trade, indent=2, default=str))
         else:
             print(f"Closed trade {trade['id']}: realized P&L ${trade['realized_pnl']:,.2f}")
-    elif args.cmd == "list":
+        if con is not None:
+            con.close()
+        return
+
+    state, con = load_backend(state_file, args.db)
+    if args.cmd == "list":
         trades = filter_trades(state.get("trades", []), args.status)
         if args.json:
             print(json.dumps(trades, indent=2, default=str))

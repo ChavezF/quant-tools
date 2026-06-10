@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from common import PROJECT_ROOT, get_public_client, parse_osi_parts
+from common import PROJECT_ROOT, atomic_write_json, get_public_client, parse_osi_parts
 
 
 DEFAULT_CURSOR = PROJECT_ROOT / "state" / "public_fill_cursor.json"
@@ -460,10 +460,8 @@ def main() -> None:
         overlap_minutes=args.overlap_minutes,
         full_refresh=args.full_refresh,
     )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    cursor_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(snapshot, indent=2, default=str))
-    cursor_path.write_text(json.dumps(cursor, indent=2, default=str))
+    atomic_write_json(output_path, snapshot)
+    atomic_write_json(cursor_path, cursor)
     if args.json:
         print(json.dumps(snapshot, indent=2, default=str))
     else:
