@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from common import STATE_DIR
+from trade_stats import pnl_breakdown, profit_factor, trade_pnl
 
 
 DEFAULT_STATE_FILE = STATE_DIR / "trades.json"
@@ -154,17 +155,13 @@ def filter_trades(trades: list[dict[str, Any]], status: str | None = None) -> li
 
 def journal_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
     closed = [trade for trade in trades if trade.get("status") == "CLOSED"]
-    wins = [trade for trade in closed if float(trade.get("realized_pnl") or 0) > 0]
-    losses = [trade for trade in closed if float(trade.get("realized_pnl") or 0) <= 0]
-    total_pnl = sum(float(trade.get("realized_pnl") or 0) for trade in closed)
-    gross_wins = sum(float(trade.get("realized_pnl") or 0) for trade in wins)
-    gross_losses = abs(sum(float(trade.get("realized_pnl") or 0) for trade in losses))
+    breakdown = pnl_breakdown(closed)
 
     by_strategy: dict[str, dict[str, Any]] = {}
     for trade in closed:
         strategy = str(trade.get("strategy") or "UNKNOWN")
         bucket = by_strategy.setdefault(strategy, {"count": 0, "pnl": 0.0, "wins": 0})
-        pnl = float(trade.get("realized_pnl") or 0)
+        pnl = trade_pnl(trade)
         bucket["count"] += 1
         bucket["pnl"] += pnl
         bucket["wins"] += 1 if pnl > 0 else 0
@@ -175,11 +172,11 @@ def journal_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "open_trades": sum(1 for trade in trades if trade.get("status") == "OPEN"),
-        "closed_trades": len(closed),
-        "total_realized_pnl": round(total_pnl, 2),
-        "win_rate": round(len(wins) / len(closed) * 100, 1) if closed else 0,
-        "avg_pnl": round(total_pnl / len(closed), 2) if closed else 0,
-        "profit_factor": round(gross_wins / gross_losses, 2) if gross_losses else None,
+        "closed_trades": breakdown["count"],
+        "total_realized_pnl": round(breakdown["total_pnl"], 2),
+        "win_rate": round(breakdown["wins"] / breakdown["count"] * 100, 1) if closed else 0,
+        "avg_pnl": round(breakdown["total_pnl"] / breakdown["count"], 2) if closed else 0,
+        "profit_factor": profit_factor(breakdown["gross_wins"], breakdown["gross_losses"]),
         "by_strategy": by_strategy,
     }
 

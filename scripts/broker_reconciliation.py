@@ -77,6 +77,7 @@ def match_closing_fills(
         if normalize(fill.get("execution_effect")) == "CLOSE"
     }
     matches = []
+    matched_indices: set[int] = set()
     for trade in trades:
         if normalize(trade.get("status")) != "OPEN":
             continue
@@ -92,6 +93,7 @@ def match_closing_fills(
             continue
         fill = fills[index]
         available.remove(index)
+        matched_indices.add(index)
         target_quantity = as_quantity(trade.get("quantity"), 1.0) or 1.0
         quantity = fill_quantity(fill)
         matches.append(
@@ -111,14 +113,6 @@ def match_closing_fills(
                 "classification_confidence": fill.get("classification_confidence"),
             }
         )
-    matched_indices = {
-        index
-        for index, fill in enumerate(fills)
-        if any(
-            match.get("fill_id") == (fill.get("fill_id") or fill.get("id"))
-            for match in matches
-        )
-    }
     return matches, matched_indices
 
 
@@ -215,11 +209,12 @@ def match_tickets(
     matches = []
     for ticket in tickets:
         target = as_quantity(ticket.get("target_quantity"), 1.0) or 1.0
+        scored = ((ticket_fill_score(ticket, fills[idx]), idx) for idx in available)
         ranked = sorted(
             (
-                (ticket_fill_score(ticket, fills[idx]), idx)
-                for idx in available
-                if ticket_fill_score(ticket, fills[idx]) >= minimum_score
+                (score, idx)
+                for score, idx in scored
+                if score >= minimum_score
             ),
             key=lambda item: (
                 -item[0],

@@ -2,7 +2,9 @@
 """Shared utilities for the quant toolkit command-line scripts."""
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,22 @@ from typing import Any
 SCRIPTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPTS_DIR.parent
 STATE_DIR = PROJECT_ROOT / "state"
+
+
+def read_json(path: Path | str | None, default: Any = None) -> Any:
+    """Read a JSON file, returning `default` ({} unless overridden) when the
+    path is unset, missing, or unparseable. Use for optional report inputs."""
+    if default is None:
+        default = {}
+    if not path:
+        return default
+    path = Path(path)
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return default
 
 
 def configure_public_imports() -> None:
@@ -56,23 +74,22 @@ def get_public_client():
     )
 
 
+# Earliest occurrence of YYMMDD + C/P + 8-digit strike (thousandths of a dollar).
+_OSI_PATTERN = re.compile(r"(?a)(\d{6})([CP])(\d{8})")
+
+
 def parse_osi_parts(osi: str) -> dict[str, Any]:
     """Parse an OCC/OSI-style option symbol such as AAPL260116C00270000."""
-    for i in range(len(osi)):
-        suffix = osi[i:]
-        if len(suffix) < 15:
-            continue
-        yy_mm_dd = suffix[:6]
-        option_type = suffix[6]
-        strike_raw = suffix[7:15]
-        if yy_mm_dd.isdigit() and option_type in ("C", "P") and strike_raw.isdigit():
-            return {
-                "underlying": osi[:i],
-                "expiration": f"20{yy_mm_dd[:2]}-{yy_mm_dd[2:4]}-{yy_mm_dd[4:6]}",
-                "option_type": option_type,
-                "strike": int(strike_raw) / 1000.0,
-            }
-    return {"underlying": osi, "expiration": "", "option_type": "", "strike": None}
+    match = _OSI_PATTERN.search(osi)
+    if not match:
+        return {"underlying": osi, "expiration": "", "option_type": "", "strike": None}
+    yy_mm_dd = match.group(1)
+    return {
+        "underlying": osi[: match.start()],
+        "expiration": f"20{yy_mm_dd[:2]}-{yy_mm_dd[2:4]}-{yy_mm_dd[4:6]}",
+        "option_type": match.group(2),
+        "strike": int(match.group(3)) / 1000.0,
+    }
 
 
 def parse_osi_strike(osi: str) -> float | None:

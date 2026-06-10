@@ -9,60 +9,33 @@ from pathlib import Path
 from typing import Any
 
 from trade_journal import DEFAULT_STATE_FILE, load_state
+from trade_stats import closed_trades, pnl_breakdown, profit_factor, win_rate_pct
 
 
-def closed_trades(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [trade for trade in trades if trade.get("status") == "CLOSED"]
-
-
-def empty_bucket() -> dict[str, Any]:
-    return {
-        "count": 0,
-        "wins": 0,
-        "losses": 0,
-        "pnl": 0.0,
-        "gross_wins": 0.0,
-        "gross_losses": 0.0,
-        "avg_pnl": 0.0,
-        "win_rate": 0.0,
-        "profit_factor": None,
-        "confidence": "NONE",
-    }
-
-
-def add_to_bucket(bucket: dict[str, Any], trade: dict[str, Any]) -> None:
-    pnl = float(trade.get("realized_pnl") or 0)
-    bucket["count"] += 1
-    bucket["pnl"] += pnl
-    if pnl > 0:
-        bucket["wins"] += 1
-        bucket["gross_wins"] += pnl
-    else:
-        bucket["losses"] += 1
-        bucket["gross_losses"] += abs(pnl)
-
-
-def finalize_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
-    count = int(bucket["count"])
-    bucket["pnl"] = round(float(bucket["pnl"]), 2)
-    bucket["gross_wins"] = round(float(bucket["gross_wins"]), 2)
-    bucket["gross_losses"] = round(float(bucket["gross_losses"]), 2)
-    bucket["avg_pnl"] = round(bucket["pnl"] / count, 2) if count else 0.0
-    bucket["win_rate"] = round(bucket["wins"] / count * 100, 1) if count else 0.0
-    bucket["profit_factor"] = (
-        round(bucket["gross_wins"] / bucket["gross_losses"], 2)
-        if bucket["gross_losses"] > 0
-        else None
-    )
+def build_bucket(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    breakdown = pnl_breakdown(trades)
+    count = breakdown["count"]
+    pnl = round(breakdown["total_pnl"], 2)
     if count >= 20:
-        bucket["confidence"] = "HIGH"
+        confidence = "HIGH"
     elif count >= 8:
-        bucket["confidence"] = "MEDIUM"
+        confidence = "MEDIUM"
     elif count >= 3:
-        bucket["confidence"] = "LOW"
+        confidence = "LOW"
     else:
-        bucket["confidence"] = "TINY"
-    return bucket
+        confidence = "TINY"
+    return {
+        "count": count,
+        "wins": breakdown["wins"],
+        "losses": breakdown["losses"],
+        "pnl": pnl,
+        "gross_wins": round(breakdown["gross_wins"], 2),
+        "gross_losses": round(breakdown["gross_losses"], 2),
+        "avg_pnl": round(pnl / count, 2) if count else 0.0,
+        "win_rate": win_rate_pct(breakdown["wins"], count),
+        "profit_factor": profit_factor(breakdown["gross_wins"], breakdown["gross_losses"]),
+        "confidence": confidence,
+    }
 
 
 def profile_signal(profile: dict[str, Any] | None) -> str:
@@ -82,22 +55,21 @@ def profile_signal(profile: dict[str, Any] | None) -> str:
 
 
 def build_profiles(trades: list[dict[str, Any]]) -> dict[str, Any]:
-    strategy = defaultdict(empty_bucket)
-    ticker = defaultdict(empty_bucket)
-    ticker_strategy = defaultdict(empty_bucket)
+    strategy: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    ticker: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    ticker_strategy: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
     for trade in closed_trades(trades):
         ticker_key = str(trade.get("ticker") or "UNKNOWN").upper()
         strategy_key = str(trade.get("strategy") or "UNKNOWN").upper()
-        combo_key = f"{ticker_key}|{strategy_key}"
-        add_to_bucket(strategy[strategy_key], trade)
-        add_to_bucket(ticker[ticker_key], trade)
-        add_to_bucket(ticker_strategy[combo_key], trade)
+        strategy[strategy_key].append(trade)
+        ticker[ticker_key].append(trade)
+        ticker_strategy[f"{ticker_key}|{strategy_key}"].append(trade)
 
     profiles = {
-        "strategy": {key: finalize_bucket(value) for key, value in sorted(strategy.items())},
-        "ticker": {key: finalize_bucket(value) for key, value in sorted(ticker.items())},
-        "ticker_strategy": {key: finalize_bucket(value) for key, value in sorted(ticker_strategy.items())},
+        "strategy": {key: build_bucket(rows) for key, rows in sorted(strategy.items())},
+        "ticker": {key: build_bucket(rows) for key, rows in sorted(ticker.items())},
+        "ticker_strategy": {key: build_bucket(rows) for key, rows in sorted(ticker_strategy.items())},
     }
     for section in profiles.values():
         for profile in section.values():

@@ -365,16 +365,29 @@ def main():
     def risk_value(name: str):
         return getattr(args, name) if getattr(args, name) is not None else risk_cfg[name]
 
+    def pick(value, default):
+        return value if value is not None else default
+
+    def journal_path(override: str | None) -> str | None:
+        return resolve_project_path(override or cfg.get("journal", {}).get("path"))
+
+    def db_path_arg(override: str | None) -> str | None:
+        return resolve_project_path(override or cfg.get("storage", {}).get("path"))
+
+    def extend_opt(cmd: list[str], flag: str, value: str | None) -> None:
+        if value:
+            cmd += [flag, value]
+
     if args.cmd == "scan":
         watchlist = args.watchlist or cfg["watchlists"].get(args.watchlist_name)
         if not watchlist:
             raise SystemExit(f"Unknown watchlist: {args.watchlist_name}")
         strategies = args.strategies or scan_cfg["strategies"]
-        min_dte = args.min_dte if args.min_dte is not None else scan_cfg["min_dte"]
-        max_dte = args.max_dte if args.max_dte is not None else scan_cfg["max_dte"]
-        target_delta = args.target_delta if args.target_delta is not None else scan_cfg["target_delta"]
-        min_oi = args.min_oi if args.min_oi is not None else scan_cfg["min_oi"]
-        max_expirations = args.max_expirations if args.max_expirations is not None else scan_cfg.get("max_expirations", 1)
+        min_dte = pick(args.min_dte, scan_cfg["min_dte"])
+        max_dte = pick(args.max_dte, scan_cfg["max_dte"])
+        target_delta = pick(args.target_delta, scan_cfg["target_delta"])
+        min_oi = pick(args.min_oi, scan_cfg["min_oi"])
+        max_expirations = pick(args.max_expirations, scan_cfg.get("max_expirations", 1))
         wing_widths = args.wing_widths or scan_cfg.get("wing_widths", [5.0])
         return run("options_screener.py",
                    *(["--config", args.config] if args.config else []),
@@ -430,12 +443,8 @@ def main():
         ]
         if args.portfolio:
             cmd += ["--portfolio", args.portfolio]
-        journal = args.journal or cfg.get("journal", {}).get("path")
-        if journal:
-            cmd += ["--journal", resolve_project_path(journal)]
-        db_path = args.db or cfg.get("storage", {}).get("path")
-        if db_path:
-            cmd += ["--db", resolve_project_path(db_path)]
+        extend_opt(cmd, "--journal", journal_path(args.journal))
+        extend_opt(cmd, "--db", db_path_arg(args.db))
         if args.json:
             cmd += ["--json"]
         return run(*cmd)
@@ -535,9 +544,7 @@ def main():
             cmd += ["--drift", args.drift]
         if args.reconciliation:
             cmd += ["--reconciliation", args.reconciliation]
-        journal = args.journal or cfg.get("journal", {}).get("path")
-        if journal:
-            cmd += ["--journal", resolve_project_path(journal)]
+        extend_opt(cmd, "--journal", journal_path(args.journal))
         if args.json:
             cmd += ["--json"]
         return run(*cmd)
@@ -564,23 +571,13 @@ def main():
         cmd = ["execution_tickets.py", "--plan", args.plan]
         if args.approve_only:
             cmd += ["--approve-only"]
-        db_path = args.db or cfg.get("storage", {}).get("path")
-        if db_path:
-            cmd += ["--db", resolve_project_path(db_path)]
+        extend_opt(cmd, "--db", db_path_arg(args.db))
         lifecycle_cfg = cfg.get("execution_lifecycle", {})
         cmd += [
             "--pending-expiry-hours",
-            str(
-                args.pending_expiry_hours
-                if args.pending_expiry_hours is not None
-                else lifecycle_cfg.get("pending_expiry_hours", 24)
-            ),
+            str(pick(args.pending_expiry_hours, lifecycle_cfg.get("pending_expiry_hours", 24))),
             "--partial-review-hours",
-            str(
-                args.partial_review_hours
-                if args.partial_review_hours is not None
-                else lifecycle_cfg.get("partial_review_hours", 4)
-            ),
+            str(pick(args.partial_review_hours, lifecycle_cfg.get("partial_review_hours", 4))),
         ]
         if args.allow_duplicates:
             cmd += ["--allow-duplicates"]
@@ -613,9 +610,7 @@ def main():
         return run(*cmd)
     elif args.cmd == "analytics":
         cmd = ["historical_analytics.py"]
-        journal = args.journal or cfg.get("journal", {}).get("path")
-        if journal:
-            cmd += ["--journal", resolve_project_path(journal)]
+        extend_opt(cmd, "--journal", journal_path(args.journal))
         cmd += ["--recent-window", str(args.recent_window)]
         if args.output:
             cmd += ["--output", args.output]
@@ -624,17 +619,11 @@ def main():
         return run(*cmd)
     elif args.cmd == "feedback":
         cmd = ["feedback_calibration.py"]
-        journal = args.journal or cfg.get("journal", {}).get("path")
-        if journal:
-            cmd += ["--journal", resolve_project_path(journal)]
-        db_path = args.db or cfg.get("storage", {}).get("path")
-        if db_path:
-            cmd += ["--db", resolve_project_path(db_path)]
+        extend_opt(cmd, "--journal", journal_path(args.journal))
+        extend_opt(cmd, "--db", db_path_arg(args.db))
         cmd += [
-            "--current-min-score",
-            str(args.current_min_score if args.current_min_score is not None else risk_cfg["min_score"]),
-            "--min-samples",
-            str(args.min_samples if args.min_samples is not None else cfg.get("feedback", {}).get("min_samples", 5)),
+            "--current-min-score", str(pick(args.current_min_score, risk_cfg["min_score"])),
+            "--min-samples", str(pick(args.min_samples, cfg.get("feedback", {}).get("min_samples", 5))),
         ]
         if args.output:
             cmd += ["--output", args.output]
@@ -644,13 +633,11 @@ def main():
     elif args.cmd == "validate":
         validation_cfg = cfg.get("validation", {})
         cmd = ["walk_forward_validation.py"]
-        journal = args.journal or cfg.get("journal", {}).get("path")
-        if journal:
-            cmd += ["--journal", resolve_project_path(journal)]
+        extend_opt(cmd, "--journal", journal_path(args.journal))
         cmd += [
-            "--min-train", str(args.min_train if args.min_train is not None else validation_cfg.get("min_train", 10)),
-            "--test-window", str(args.test_window if args.test_window is not None else validation_cfg.get("test_window", 5)),
-            "--min-selected", str(args.min_selected if args.min_selected is not None else validation_cfg.get("min_selected", 3)),
+            "--min-train", str(pick(args.min_train, validation_cfg.get("min_train", 10))),
+            "--test-window", str(pick(args.test_window, validation_cfg.get("test_window", 5))),
+            "--min-selected", str(pick(args.min_selected, validation_cfg.get("min_selected", 3))),
         ]
         thresholds = args.thresholds or validation_cfg.get("thresholds", [50, 55, 60, 65, 70, 75])
         cmd += ["--thresholds", *[str(value) for value in thresholds]]
@@ -662,14 +649,12 @@ def main():
     elif args.cmd == "drift":
         drift_cfg = cfg.get("drift_monitor", {})
         cmd = ["drift_monitor.py"]
-        journal = args.journal or cfg.get("journal", {}).get("path")
-        if journal:
-            cmd += ["--journal", resolve_project_path(journal)]
+        extend_opt(cmd, "--journal", journal_path(args.journal))
         cmd += [
-            "--recent-window", str(args.recent_window if args.recent_window is not None else drift_cfg.get("recent_window", 10)),
-            "--min-baseline", str(args.min_baseline if args.min_baseline is not None else drift_cfg.get("min_baseline", 10)),
-            "--current-min-score", str(args.current_min_score if args.current_min_score is not None else risk_cfg["min_score"]),
-            "--min-samples", str(args.min_samples if args.min_samples is not None else cfg.get("feedback", {}).get("min_samples", 5)),
+            "--recent-window", str(pick(args.recent_window, drift_cfg.get("recent_window", 10))),
+            "--min-baseline", str(pick(args.min_baseline, drift_cfg.get("min_baseline", 10))),
+            "--current-min-score", str(pick(args.current_min_score, risk_cfg["min_score"])),
+            "--min-samples", str(pick(args.min_samples, cfg.get("feedback", {}).get("min_samples", 5))),
         ]
         if args.output:
             cmd += ["--output", args.output]
@@ -704,27 +689,14 @@ def main():
         return run(*cmd)
     elif args.cmd == "storage":
         cmd = ["storage_sync.py"]
-        storage_cfg = cfg.get("storage", {})
         lifecycle_cfg = cfg.get("execution_lifecycle", {})
-        db_path = args.db or storage_cfg.get("path")
-        journal = args.journal or cfg.get("journal", {}).get("path")
-        if db_path:
-            cmd += ["--db", resolve_project_path(db_path)]
-        if journal:
-            cmd += ["--journal", resolve_project_path(journal)]
+        extend_opt(cmd, "--db", db_path_arg(args.db))
+        extend_opt(cmd, "--journal", journal_path(args.journal))
         cmd += [
             "--pending-expiry-hours",
-            str(
-                args.pending_expiry_hours
-                if args.pending_expiry_hours is not None
-                else lifecycle_cfg.get("pending_expiry_hours", 24)
-            ),
+            str(pick(args.pending_expiry_hours, lifecycle_cfg.get("pending_expiry_hours", 24))),
             "--partial-review-hours",
-            str(
-                args.partial_review_hours
-                if args.partial_review_hours is not None
-                else lifecycle_cfg.get("partial_review_hours", 4)
-            ),
+            str(pick(args.partial_review_hours, lifecycle_cfg.get("partial_review_hours", 4))),
         ]
         for attr, flag in [
             ("tickets", "--tickets"),
@@ -741,9 +713,7 @@ def main():
         return run(*cmd)
     elif args.cmd == "ticket-lifecycle":
         cmd = ["ticket_lifecycle.py"]
-        db_path = args.db or cfg.get("storage", {}).get("path")
-        if db_path:
-            cmd += ["--db", resolve_project_path(db_path)]
+        extend_opt(cmd, "--db", db_path_arg(args.db))
         if args.status:
             cmd += ["--status", *args.status]
         if args.active:
@@ -765,16 +735,9 @@ def main():
             "--output",
             resolve_project_path(args.output or ingestion_cfg.get("snapshot_path"))
             or str(SCRIPT_DIR.parent / "state" / "public_broker_snapshot.json"),
-            "--page-size",
-            str(args.page_size if args.page_size is not None else ingestion_cfg.get("page_size", 100)),
-            "--max-pages",
-            str(args.max_pages if args.max_pages is not None else ingestion_cfg.get("max_pages", 100)),
-            "--overlap-minutes",
-            str(
-                args.overlap_minutes
-                if args.overlap_minutes is not None
-                else ingestion_cfg.get("overlap_minutes", 15)
-            ),
+            "--page-size", str(pick(args.page_size, ingestion_cfg.get("page_size", 100))),
+            "--max-pages", str(pick(args.max_pages, ingestion_cfg.get("max_pages", 100))),
+            "--overlap-minutes", str(pick(args.overlap_minutes, ingestion_cfg.get("overlap_minutes", 15))),
         ]
         if args.start:
             cmd += ["--start", args.start]
@@ -825,9 +788,7 @@ def main():
             "--min-samples",
             str(args.min_samples),
         ]
-        db_path = args.db or cfg.get("storage", {}).get("path")
-        if db_path:
-            cmd += ["--db", resolve_project_path(db_path)]
+        extend_opt(cmd, "--db", db_path_arg(args.db))
         if args.output:
             cmd += ["--output", args.output]
         if args.json:
@@ -835,9 +796,7 @@ def main():
         return run(*cmd)
     elif args.cmd == "verify":
         cmd = ["health_check.py"]
-        db_path = args.db or cfg.get("storage", {}).get("path")
-        if db_path:
-            cmd += ["--db", resolve_project_path(db_path)]
+        extend_opt(cmd, "--db", db_path_arg(args.db))
         if args.skip_tests:
             cmd += ["--skip-tests"]
         if args.skip_db:
@@ -849,18 +808,12 @@ def main():
         return run(*cmd)
     elif args.cmd == "db-maintenance":
         operations = cfg.get("operations", {})
-        db_path = args.db or cfg.get("storage", {}).get("path")
-        backup_dir = args.backup_dir or operations.get("backup_dir")
         cmd = ["database_maintenance.py"]
-        if db_path:
-            cmd += ["--db", resolve_project_path(db_path)]
-        if backup_dir:
-            cmd += ["--backup-dir", resolve_project_path(backup_dir)]
+        extend_opt(cmd, "--db", db_path_arg(args.db))
+        extend_opt(cmd, "--backup-dir", resolve_project_path(args.backup_dir or operations.get("backup_dir")))
         cmd += [
-            "--retention-days",
-            str(args.retention_days if args.retention_days is not None else operations.get("backup_retention_days", 30)),
-            "--keep-last",
-            str(args.keep_last if args.keep_last is not None else operations.get("backup_keep_last", 14)),
+            "--retention-days", str(pick(args.retention_days, operations.get("backup_retention_days", 30))),
+            "--keep-last", str(pick(args.keep_last, operations.get("backup_keep_last", 14))),
         ]
         if args.no_backup:
             cmd += ["--no-backup"]

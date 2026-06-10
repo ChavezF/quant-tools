@@ -10,11 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from trade_journal import DEFAULT_STATE_FILE, load_state
-
-
-def closed_trades(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    rows = [trade for trade in trades if trade.get("status") == "CLOSED"]
-    return sorted(rows, key=lambda trade: (str(trade.get("closed_at") or ""), str(trade.get("id") or "")))
+from trade_stats import closed_trades, pnl_breakdown, profit_factor, trade_pnl, win_rate_pct
 
 
 def score_band(score: Any) -> str:
@@ -44,28 +40,24 @@ def summarize_trades(trades: list[dict[str, Any]]) -> dict[str, Any]:
             "total_capital_at_risk": 0.0,
         }
 
-    pnls = [float(trade.get("realized_pnl") or 0) for trade in trades]
-    wins = [pnl for pnl in pnls if pnl > 0]
-    losses = [pnl for pnl in pnls if pnl <= 0]
+    breakdown = pnl_breakdown(trades)
     returns = []
     total_capital = 0.0
-    for trade, pnl in zip(trades, pnls):
+    for trade in trades:
         capital = float(trade.get("capital_at_risk") or trade.get("max_loss") or 0)
         if capital > 0:
             total_capital += capital
-            returns.append(pnl / capital * 100)
-    gross_wins = sum(wins)
-    gross_losses = abs(sum(losses))
+            returns.append(trade_pnl(trade) / capital * 100)
     return {
-        "count": len(trades),
-        "wins": len(wins),
-        "losses": len(losses),
-        "win_rate": round(len(wins) / len(trades) * 100, 1),
-        "total_pnl": round(sum(pnls), 2),
-        "expectancy": round(sum(pnls) / len(trades), 2),
-        "avg_win": round(gross_wins / len(wins), 2) if wins else 0.0,
-        "avg_loss": round(sum(losses) / len(losses), 2) if losses else 0.0,
-        "profit_factor": round(gross_wins / gross_losses, 2) if gross_losses else None,
+        "count": breakdown["count"],
+        "wins": breakdown["wins"],
+        "losses": breakdown["losses"],
+        "win_rate": win_rate_pct(breakdown["wins"], breakdown["count"]),
+        "total_pnl": round(breakdown["total_pnl"], 2),
+        "expectancy": round(breakdown["total_pnl"] / breakdown["count"], 2),
+        "avg_win": round(breakdown["gross_wins"] / breakdown["wins"], 2) if breakdown["wins"] else 0.0,
+        "avg_loss": round(breakdown["sum_losses"] / breakdown["losses"], 2) if breakdown["losses"] else 0.0,
+        "profit_factor": profit_factor(breakdown["gross_wins"], breakdown["gross_losses"]),
         "avg_return_on_risk_pct": round(sum(returns) / len(returns), 2) if returns else 0.0,
         "total_capital_at_risk": round(total_capital, 2),
     }
@@ -77,7 +69,7 @@ def equity_curve(trades: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], di
     max_drawdown = 0.0
     curve = []
     for trade in trades:
-        equity += float(trade.get("realized_pnl") or 0)
+        equity += trade_pnl(trade)
         peak = max(peak, equity)
         drawdown = peak - equity
         max_drawdown = max(max_drawdown, drawdown)
@@ -87,7 +79,7 @@ def equity_curve(trades: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], di
                 "trade_id": trade.get("id"),
                 "ticker": trade.get("ticker"),
                 "strategy": trade.get("strategy"),
-                "pnl": round(float(trade.get("realized_pnl") or 0), 2),
+                "pnl": round(trade_pnl(trade), 2),
                 "equity": round(equity, 2),
                 "drawdown": round(drawdown, 2),
             }

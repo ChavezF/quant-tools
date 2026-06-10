@@ -18,7 +18,7 @@ Usage:
 """
 import argparse
 import subprocess
-from datetime import datetime
+from datetime import date, datetime
 import sys
 import yfinance as yf
 
@@ -65,7 +65,6 @@ def get_top_setups(client, watchlist: list, max_per_ticker: int = 1) -> list[dic
         if not exps:
             continue
         # Find best expiration 30-45 DTE
-        from datetime import date
         target_dte = 35
         best_exp, best_dte, best_diff = None, None, 9999
         for exp in exps:
@@ -96,7 +95,6 @@ def get_top_setups(client, watchlist: list, max_per_ticker: int = 1) -> list[dic
 
 def get_upcoming_earnings(watchlist: list, days: int = 14) -> list[dict]:
     """Quick earnings list — no API calls needed, just yfinance."""
-    from datetime import date
     out = []
     for sym in watchlist:
         sym = sym.upper()
@@ -119,7 +117,8 @@ def get_upcoming_earnings(watchlist: list, days: int = 14) -> list[dict]:
             dte = (ed - date.today()).days
             if 0 <= dte <= days:
                 out.append({"ticker": sym, "date": str(ed), "days": dte})
-        except Exception:
+        except Exception as e:
+            print(f"  ! {sym} earnings lookup failed: {e}", file=sys.stderr)
             continue
     out.sort(key=lambda x: x["days"])
     return out
