@@ -149,6 +149,7 @@ def main():
     p_alerts = sub.add_parser("alerts", help="Generate alerts from plan and journal state")
     p_alerts.add_argument("--plan", help="Path to action_plan --json output")
     p_alerts.add_argument("--journal", help="Optional path to trade journal state")
+    p_alerts.add_argument("--db")
     p_alerts.add_argument("--min-score", type=float, default=68.0)
     p_alerts.add_argument("--profit-target-pct", type=float, default=50.0)
     p_alerts.add_argument("--dte-warning", type=int, default=21)
@@ -194,6 +195,7 @@ def main():
 
     p_analytics = sub.add_parser("analytics", help="Analyze realized journal performance")
     p_analytics.add_argument("--journal")
+    p_analytics.add_argument("--db")
     p_analytics.add_argument("--recent-window", type=int, default=10)
     p_analytics.add_argument("--output")
     p_analytics.add_argument("--json", action="store_true")
@@ -208,6 +210,7 @@ def main():
 
     p_validate = sub.add_parser("validate", help="Walk-forward validate live score thresholds")
     p_validate.add_argument("--journal")
+    p_validate.add_argument("--db")
     p_validate.add_argument("--min-train", type=int)
     p_validate.add_argument("--test-window", type=int)
     p_validate.add_argument("--thresholds", nargs="+", type=float)
@@ -217,6 +220,7 @@ def main():
 
     p_drift = sub.add_parser("drift", help="Detect recent performance and calibration drift")
     p_drift.add_argument("--journal")
+    p_drift.add_argument("--db")
     p_drift.add_argument("--recent-window", type=int)
     p_drift.add_argument("--min-baseline", type=int)
     p_drift.add_argument("--current-min-score", type=float)
@@ -565,6 +569,7 @@ def main():
         if args.reconciliation:
             cmd += ["--reconciliation", args.reconciliation]
         extend_opt(cmd, "--journal", journal_path(args.journal))
+        extend_opt(cmd, "--db", db_path_arg(args.db))
         if args.json:
             cmd += ["--json"]
         return run(*cmd)
@@ -631,6 +636,7 @@ def main():
     elif args.cmd == "analytics":
         cmd = ["historical_analytics.py"]
         extend_opt(cmd, "--journal", journal_path(args.journal))
+        extend_opt(cmd, "--db", db_path_arg(args.db))
         cmd += ["--recent-window", str(args.recent_window)]
         if args.output:
             cmd += ["--output", args.output]
@@ -654,6 +660,7 @@ def main():
         validation_cfg = cfg.get("validation", {})
         cmd = ["walk_forward_validation.py"]
         extend_opt(cmd, "--journal", journal_path(args.journal))
+        extend_opt(cmd, "--db", db_path_arg(args.db))
         cmd += [
             "--min-train", str(pick(args.min_train, validation_cfg.get("min_train", 10))),
             "--test-window", str(pick(args.test_window, validation_cfg.get("test_window", 5))),
@@ -670,6 +677,7 @@ def main():
         drift_cfg = cfg.get("drift_monitor", {})
         cmd = ["drift_monitor.py"]
         extend_opt(cmd, "--journal", journal_path(args.journal))
+        extend_opt(cmd, "--db", db_path_arg(args.db))
         cmd += [
             "--recent-window", str(pick(args.recent_window, drift_cfg.get("recent_window", 10))),
             "--min-baseline", str(pick(args.min_baseline, drift_cfg.get("min_baseline", 10))),

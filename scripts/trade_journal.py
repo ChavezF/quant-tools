@@ -63,6 +63,21 @@ def load_backend(state_file: Path, db_path: str | None) -> tuple[dict[str, Any],
     return json_state, con
 
 
+def load_journal(state_file: Path, db_path: str | None = None) -> dict[str, Any]:
+    """Read-only journal access with SQLite authoritative when configured.
+
+    With a `db_path`, the database is the source of truth (seeded once from
+    the JSON file if empty); the JSON file is the export/backup format that
+    save_backend keeps in sync on every write. Without a db this is a plain
+    JSON read. Use this in every report/consumer script so a write that only
+    reached one backend cannot give different answers to different tools.
+    """
+    state, con = load_backend(state_file, db_path)
+    if con is not None:
+        con.close()
+    return state
+
+
 def save_backend(state_file: Path, state: dict[str, Any], con: Any = None) -> None:
     save_state(state_file, state)
     if con is not None:

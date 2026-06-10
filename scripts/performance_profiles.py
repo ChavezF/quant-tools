@@ -8,7 +8,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from trade_journal import DEFAULT_STATE_FILE, load_state
+from trade_journal import DEFAULT_STATE_FILE, load_journal
 from trade_stats import closed_trades, pnl_breakdown, profit_factor, win_rate_pct
 
 
@@ -118,11 +118,12 @@ def print_profiles(profiles: dict[str, Any], section: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--state-file", default=str(DEFAULT_STATE_FILE))
+    ap.add_argument("--db", help="Optional SQLite database; authoritative over the JSON journal when set")
     ap.add_argument("--section", choices=["strategy", "ticker", "ticker_strategy"], default="ticker_strategy")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    state = load_state(Path(args.state_file))
+    state = load_journal(Path(args.state_file), args.db)
     profiles = build_profiles(state.get("trades", []))
     if args.json:
         print(json.dumps(profiles, indent=2, default=str))

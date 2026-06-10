@@ -8,7 +8,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from trade_journal import DEFAULT_STATE_FILE, load_state
+from trade_journal import DEFAULT_STATE_FILE, load_journal, load_state
 
 
 def parse_date(value: str | None) -> date | None:
@@ -218,6 +218,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", help="Path to action_plan --json output")
     ap.add_argument("--journal", default=str(DEFAULT_STATE_FILE), help="Path to trade journal state")
+    ap.add_argument("--db", help="Optional SQLite database; authoritative over the JSON journal when set")
     ap.add_argument("--min-score", type=float, default=68.0)
     ap.add_argument("--profit-target-pct", type=float, default=50.0)
     ap.add_argument("--dte-warning", type=int, default=21)
@@ -229,7 +230,10 @@ def main() -> None:
 
     plan = json.loads(Path(args.plan).read_text()) if args.plan else None
     journal_path = Path(args.journal)
-    journal_state = load_state(journal_path) if journal_path.exists() else None
+    if args.db:
+        journal_state = load_journal(journal_path, args.db)
+    else:
+        journal_state = load_state(journal_path) if journal_path.exists() else None
     validation = json.loads(Path(args.validation).read_text()) if args.validation and Path(args.validation).exists() else None
     drift = json.loads(Path(args.drift).read_text()) if args.drift and Path(args.drift).exists() else None
     reconciliation = (

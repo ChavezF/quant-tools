@@ -9,7 +9,7 @@ from statistics import mean, pstdev
 from typing import Any
 
 from historical_analytics import closed_trades, summarize_trades
-from trade_journal import DEFAULT_STATE_FILE, load_state
+from trade_journal import DEFAULT_STATE_FILE, load_journal
 
 
 DEFAULT_THRESHOLDS = [50.0, 55.0, 60.0, 65.0, 70.0, 75.0]
@@ -167,6 +167,7 @@ def print_report(report: dict[str, Any]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--journal", default=str(DEFAULT_STATE_FILE))
+    ap.add_argument("--db", help="Optional SQLite database; authoritative over the JSON journal when set")
     ap.add_argument("--min-train", type=int, default=10)
     ap.add_argument("--test-window", type=int, default=5)
     ap.add_argument("--thresholds", nargs="+", type=float, default=DEFAULT_THRESHOLDS)
@@ -176,7 +177,7 @@ def main() -> None:
     args = ap.parse_args()
 
     report = build_walk_forward_report(
-        load_state(Path(args.journal)),
+        load_journal(Path(args.journal), args.db),
         min_train=args.min_train,
         test_window=args.test_window,
         thresholds=args.thresholds,

@@ -144,10 +144,17 @@ available, with an explicit value-based fallback for older reports.
 
 ## SQLite and broker reconciliation
 
-SQLite is a durable mirror of the existing JSON workflow, so current scripts
-remain compatible while the migration proceeds. Schema creation and upgrades
-run automatically through `PRAGMA user_version`. Journal writes can dual-write
-SQLite with `journal --db state/quant_tools.db ...`.
+SQLite is the **authoritative journal store when configured**: every journal
+reader (`analytics`, `feedback`, `validate`, `drift`, `alerts`, `journal
+profiles`, `mark`) accepts `--db` and reads through
+`trade_journal.load_journal`, which prefers the database (seeding it once
+from the JSON file if empty). The operator workflow passes the configured
+`storage.path` to all of them automatically. JSON remains the continuously
+maintained export/backup format — every write still dual-writes it — so a
+write that reached only one backend can no longer give different answers to
+different tools. Schema creation and upgrades run automatically through
+`PRAGMA user_version`. Journal writes dual-write SQLite with
+`journal --db state/quant_tools.db ...`.
 
 Broker fill imports use a provider-neutral JSON snapshot:
 

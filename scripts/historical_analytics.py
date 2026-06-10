@@ -9,7 +9,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from trade_journal import DEFAULT_STATE_FILE, load_state
+from trade_journal import DEFAULT_STATE_FILE, load_journal
 from trade_stats import closed_trades, pnl_breakdown, profit_factor, trade_pnl, win_rate_pct
 
 
@@ -143,12 +143,13 @@ def print_analytics(report: dict[str, Any]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--journal", default=str(DEFAULT_STATE_FILE))
+    ap.add_argument("--db", help="Optional SQLite database; authoritative over the JSON journal when set")
     ap.add_argument("--recent-window", type=int, default=10)
     ap.add_argument("--output")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    report = build_analytics(load_state(Path(args.journal)), recent_window=args.recent_window)
+    report = build_analytics(load_journal(Path(args.journal), args.db), recent_window=args.recent_window)
     if args.output:
         Path(args.output).write_text(json.dumps(report, indent=2, default=str))
     if args.json:

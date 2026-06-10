@@ -124,6 +124,8 @@ def build_analytics_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[s
         str(SCRIPTS_DIR / "historical_analytics.py"),
         "--journal",
         journal_path(cfg, args),
+        "--db",
+        storage_db_path(cfg),
         "--json",
     ]
 
@@ -152,6 +154,8 @@ def build_validation_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[
         str(SCRIPTS_DIR / "walk_forward_validation.py"),
         "--journal",
         journal_path(cfg, args),
+        "--db",
+        storage_db_path(cfg),
         "--min-train",
         str(validation_cfg.get("min_train", 10)),
         "--test-window",
@@ -171,6 +175,8 @@ def build_drift_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[str]:
         str(SCRIPTS_DIR / "drift_monitor.py"),
         "--journal",
         journal_path(cfg, args),
+        "--db",
+        storage_db_path(cfg),
         "--recent-window",
         str(drift_cfg.get("recent_window", 10)),
         "--min-baseline",
@@ -280,6 +286,7 @@ def build_alerts_cmd(
     ]
     if journal:
         cmd += ["--journal", resolve_project_path(journal)]
+    cmd += ["--db", storage_db_path(cfg)]
     if reconciliation_report:
         cmd += ["--reconciliation", str(reconciliation_report)]
     return cmd
