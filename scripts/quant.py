@@ -330,7 +330,9 @@ def main():
     p_term.add_argument("--ticker", required=True)
     p_term.add_argument("--max-dte", type=int, default=180)
 
-    p_btest = sub.add_parser("backtest", help="Earnings strangle backtest (v1, circular math — do not trust)")
+    # v1 (earnings_backtest.py) had circular math and was removed; `backtest`
+    # now aliases v2 so saved commands keep working.
+    p_btest = sub.add_parser("backtest", help="Earnings strangle backtest (alias of backtest2)")
     p_btest.add_argument("--tickers", nargs="+", required=True)
     p_btest.add_argument("--num-events", type=int, default=8)
 
@@ -862,7 +864,7 @@ def main():
     elif args.cmd == "term-structure":
         return run("term_structure.py", "--ticker", args.ticker, "--max-dte", str(args.max_dte))
     elif args.cmd == "backtest":
-        return run("earnings_backtest.py", "--tickers", *args.tickers,
+        return run("earnings_backtest_v2.py", "--tickers", *args.tickers,
                    "--num-events", str(args.num_events))
     elif args.cmd == "backtest2":
         cmd = ["earnings_backtest_v2.py", "--tickers", *args.tickers,
@@ -925,7 +927,7 @@ def main():
                   "--watchlist", *args.watchlist,
                   "--days-ahead", str(args.days_ahead))
         print("\n\n")
-        rc |= run("earnings_backtest.py",
+        rc |= run("earnings_backtest_v2.py",
                   "--tickers", *args.watchlist,
                   "--num-events", str(args.num_events))
         return rc
