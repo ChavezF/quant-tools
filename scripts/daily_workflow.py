@@ -13,6 +13,7 @@ repeatable and auditable.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import subprocess
@@ -21,11 +22,65 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from common import PROJECT_ROOT, SCRIPTS_DIR
+from common import PROJECT_ROOT, SCRIPTS_DIR, read_json, state_lock
 from toolkit_config import add_config_argument, load_config, resolve_project_path
 
 
 PY = os.environ.get("QUANT_PYTHON", sys.executable)
+
+PROFILE_DEFAULTS = {
+    "standard": {},
+    "planning": {
+        "skip_storage": True,
+        "skip_tickets": True,
+    },
+    "executable": {
+        "skip_discovery": True,
+        "skip_scenario_stress": True,
+        "skip_brief": True,
+        "skip_validation": True,
+        "skip_drift": True,
+        "skip_database_maintenance": True,
+        "skip_health": True,
+        "skip_dashboard": True,
+    },
+}
+
+
+def profile_skips(profile: str, args: argparse.Namespace) -> dict[str, bool]:
+    defaults = PROFILE_DEFAULTS[profile]
+    names = {
+        "skip_mark", "skip_management", "skip_discovery", "skip_risk",
+        "skip_scenario_stress", "skip_allocation", "skip_brief", "skip_alerts",
+        "skip_storage", "skip_tickets", "skip_validation", "skip_drift",
+        "skip_database_maintenance", "skip_health", "skip_dashboard",
+        "skip_operator_summary",
+    }
+    return {
+        name: bool(defaults.get(name, False) or getattr(args, name, False))
+        for name in names
+    }
+
+
+def opportunity_funnel(run_dir: Path) -> dict[str, int]:
+    plan = read_json(run_dir / "plan.json")
+    allocation = read_json(run_dir / "allocation.json")
+    tickets = read_json(run_dir / "tickets.json")
+    lifecycle = read_json(run_dir / "reconciliation.json").get("ticket_lifecycle", {})
+    actions = [
+        row for row in plan.get("actions", [])
+        if row.get("action_decision") in {"APPROVE", "REDUCE"}
+    ]
+    return {
+        "morning_candidates": len(actions),
+        "surviving_candidates": int(allocation.get("summary", {}).get("selected", len(actions)) or 0),
+        "ready_tickets": int(lifecycle.get("READY", len(tickets.get("tickets", []))) or 0),
+        "submitted_orders": sum(
+            int(lifecycle.get(status, 0) or 0)
+            for status in ("SUBMITTED", "WORKING", "PARTIAL", "FILLED", "OVERFILLED", "REJECTED", "CANCEL_PENDING", "CANCELLED")
+        ),
+        "filled_orders": sum(int(lifecycle.get(status, 0) or 0) for status in ("FILLED", "OVERFILLED")),
+    }
 
 
 def timestamp() -> str:
@@ -483,6 +538,7 @@ def main() -> None:
     ap.add_argument("--profit-target-pct", type=float)
     ap.add_argument("--dte-warning", type=int)
     ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("--profile", choices=sorted(PROFILE_DEFAULTS), default="standard")
     ap.add_argument("--skip-mark", action="store_true")
     ap.add_argument("--skip-management", action="store_true")
     ap.add_argument("--skip-discovery", action="store_true")
@@ -492,13 +548,25 @@ def main() -> None:
     ap.add_argument("--skip-brief", action="store_true")
     ap.add_argument("--skip-alerts", action="store_true")
     ap.add_argument("--skip-storage", action="store_true")
+    ap.add_argument("--skip-tickets", action="store_true")
+    ap.add_argument("--skip-validation", action="store_true")
+    ap.add_argument("--skip-drift", action="store_true")
+    ap.add_argument("--skip-database-maintenance", action="store_true")
+    ap.add_argument("--skip-health", action="store_true")
+    ap.add_argument("--skip-dashboard", action="store_true")
+    ap.add_argument("--skip-operator-summary", action="store_true")
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--send", action="store_true", help="Send the daily brief instead of dry-run printing it")
     ap.add_argument("--dry-run", action="store_true", help="Print planned commands without running live API steps")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    storage_enabled = bool(cfg.get("storage", {}).get("enabled", True)) and not args.skip_storage
+    skips = profile_skips(args.profile, args)
+    workflow_lock = state_lock(f"workflow-{args.profile}")
+    workflow_lock.__enter__()
+    atexit.register(workflow_lock.__exit__, None, None, None)
+    storage_enabled = bool(cfg.get("storage", {}).get("enabled", True)) and not skips["skip_storage"]
+    tickets_enabled = not skips["skip_tickets"]
     configured_broker_snapshot = args.broker_snapshot or cfg.get("storage", {}).get("broker_snapshot")
     public_ingestion_enabled = (
         storage_enabled
@@ -506,18 +574,22 @@ def main() -> None:
         and not configured_broker_snapshot
     )
     operations = cfg.get("operations", {})
-    backup_enabled = storage_enabled and bool(operations.get("backup_on_operator", True))
-    health_enabled = bool(operations.get("health_check_on_operator", True))
+    backup_enabled = (
+        storage_enabled
+        and bool(operations.get("backup_on_operator", True))
+        and not skips["skip_database_maintenance"]
+    )
+    health_enabled = bool(operations.get("health_check_on_operator", True)) and not skips["skip_health"]
     scenario_enabled = (
         bool(cfg.get("scenario_stress", {}).get("enabled", True))
-        and not args.skip_scenario_stress
-        and not args.skip_risk
+        and not skips["skip_scenario_stress"]
+        and not skips["skip_risk"]
     )
-    allocation_enabled = bool(cfg.get("portfolio_allocation", {}).get("enabled", True)) and not args.skip_allocation
-    mark_enabled = bool(cfg.get("journal", {}).get("mark_to_market", True)) and not args.skip_mark
-    management_enabled = bool(cfg.get("position_management", {}).get("enabled", True)) and not args.skip_management
-    validation_enabled = bool(cfg.get("validation", {}).get("enabled", True))
-    drift_enabled = bool(cfg.get("drift_monitor", {}).get("enabled", True))
+    allocation_enabled = bool(cfg.get("portfolio_allocation", {}).get("enabled", True)) and not skips["skip_allocation"]
+    mark_enabled = bool(cfg.get("journal", {}).get("mark_to_market", True)) and not skips["skip_mark"]
+    management_enabled = bool(cfg.get("position_management", {}).get("enabled", True)) and not skips["skip_management"]
+    validation_enabled = bool(cfg.get("validation", {}).get("enabled", True)) and not skips["skip_validation"]
+    drift_enabled = bool(cfg.get("drift_monitor", {}).get("enabled", True)) and not skips["skip_drift"]
     run_dir = ensure_report_dir(args.report_dir)
     mark_report = run_dir / "mark_to_market.json"
     management_report = run_dir / "management.json"
@@ -537,6 +609,7 @@ def main() -> None:
 
     manifest: dict[str, Any] = {
         "created_at": datetime.now().isoformat(),
+        "profile": args.profile,
         "run_dir": str(run_dir),
         "reports": {
             "mark_to_market": str(mark_report) if mark_enabled else None,
@@ -545,15 +618,15 @@ def main() -> None:
             "feedback": str(feedback_report),
             "validation": str(validation_report) if validation_enabled else None,
             "drift": str(drift_report) if drift_enabled else None,
-            "discovery": str(discovery_report) if not args.skip_discovery else None,
+            "discovery": str(discovery_report) if not skips["skip_discovery"] else None,
             "scan": str(scan_report),
-            "risk": str(risk_report) if not args.skip_risk else None,
+            "risk": str(risk_report) if not skips["skip_risk"] else None,
             "scenario_stress": str(scenario_report) if scenario_enabled else None,
             "plan": str(plan_report),
             "allocation": str(allocation_report) if allocation_enabled else None,
-            "brief": str(run_dir / "brief.out") if not args.skip_brief else None,
-            "alerts": str(run_dir / "alerts.json") if not args.skip_alerts else None,
-            "tickets": str(run_dir / "tickets.json"),
+            "brief": str(run_dir / "brief.out") if not skips["skip_brief"] else None,
+            "alerts": str(run_dir / "alerts.json") if not skips["skip_alerts"] else None,
+            "tickets": str(run_dir / "tickets.json") if tickets_enabled else None,
             "broker_snapshot": (
                 str(public_snapshot_report)
                 if public_ingestion_enabled
@@ -564,8 +637,8 @@ def main() -> None:
             "execution_history": str(run_dir / "execution_history.json") if storage_enabled else None,
             "database_maintenance": str(run_dir / "database_maintenance.json") if backup_enabled else None,
             "health": str(run_dir / "health.json") if health_enabled else None,
-            "operator_summary": str(run_dir / "operator_summary.md"),
-            "dashboard": str(run_dir / "dashboard.html"),
+            "operator_summary": str(run_dir / "operator_summary.md") if not skips["skip_operator_summary"] else None,
+            "dashboard": str(run_dir / "dashboard.html") if not skips["skip_dashboard"] else None,
         },
         "steps": [],
     }
@@ -606,7 +679,7 @@ def main() -> None:
         if not args.dry_run and drift_meta["returncode"] == 0:
             drift_report.write_text(Path(drift_meta["stdout"]).read_text())
 
-    if not args.skip_discovery:
+    if not skips["skip_discovery"]:
         discovery_meta = run_command("discovery", build_discovery_cmd(cfg, args), run_dir, dry_run=args.dry_run)
         manifest["steps"].append(discovery_meta)
         if not args.dry_run and discovery_meta["returncode"] == 0:
@@ -616,7 +689,7 @@ def main() -> None:
     manifest["steps"].append(run_command("scan", scan_cmd, run_dir, dry_run=args.dry_run))
 
     risk_path_for_plan = None
-    if not args.skip_risk:
+    if not skips["skip_risk"]:
         risk_cmd = build_risk_cmd(args, watchlist)
         risk_meta = run_command("risk", risk_cmd, run_dir, dry_run=args.dry_run)
         manifest["steps"].append(risk_meta)
@@ -636,7 +709,7 @@ def main() -> None:
             scenario_report.write_text(Path(scenario_meta["stdout"]).read_text())
 
     if args.dry_run:
-        plan_cmd = build_plan_cmd(cfg, args, scan_report, None if args.skip_risk else risk_report)
+        plan_cmd = build_plan_cmd(cfg, args, scan_report, None if skips["skip_risk"] else risk_report)
         manifest["steps"].append(run_command("plan", plan_cmd, run_dir, dry_run=True))
     else:
         plan_cmd = build_plan_cmd(cfg, args, scan_report, risk_path_for_plan)
@@ -660,9 +733,9 @@ def main() -> None:
 
     tickets_report = run_dir / "tickets.json"
     ticket_source = allocation_report if args.dry_run and allocation_enabled else allocation_path_for_tickets or plan_report
-    if args.dry_run:
+    if tickets_enabled and args.dry_run:
         manifest["steps"].append(run_command("tickets", build_tickets_cmd(cfg, ticket_source), run_dir, dry_run=True))
-    elif plan_report.exists():
+    elif tickets_enabled and plan_report.exists():
         tickets_meta = run_command("tickets", build_tickets_cmd(cfg, ticket_source), run_dir, dry_run=False)
         manifest["steps"].append(tickets_meta)
         if tickets_meta["returncode"] == 0:
@@ -731,7 +804,7 @@ def main() -> None:
                 database_report.write_text(Path(database_meta["stdout"]).read_text())
 
     alerts_report = run_dir / "alerts.json"
-    if not args.skip_alerts:
+    if not skips["skip_alerts"]:
         if args.dry_run:
             alerts_cmd = build_alerts_cmd(
                 cfg,
@@ -759,20 +832,25 @@ def main() -> None:
         if not args.dry_run and health_meta["returncode"] == 0:
             health_report.write_text(Path(health_meta["stdout"]).read_text())
 
-    if not args.skip_brief:
+    if not skips["skip_brief"]:
         brief_cmd = build_brief_cmd(args, watchlist)
         manifest["steps"].append(run_command("brief", brief_cmd, run_dir, dry_run=args.dry_run))
 
+    manifest["opportunity_funnel"] = opportunity_funnel(run_dir) if not args.dry_run else {}
     if args.dry_run:
-        manifest["steps"].append(run_command("operator_summary", build_operator_summary_cmd(run_dir), run_dir, dry_run=True))
-        manifest["steps"].append(run_command("dashboard", build_dashboard_cmd(run_dir), run_dir, dry_run=True))
+        if not skips["skip_operator_summary"]:
+            manifest["steps"].append(run_command("operator_summary", build_operator_summary_cmd(run_dir), run_dir, dry_run=True))
+        if not skips["skip_dashboard"]:
+            manifest["steps"].append(run_command("dashboard", build_dashboard_cmd(run_dir), run_dir, dry_run=True))
         write_json(manifest_path, manifest)
     else:
         write_json(manifest_path, manifest)
-        summary_meta = run_command("operator_summary", build_operator_summary_cmd(run_dir), run_dir, dry_run=False)
-        manifest["steps"].append(summary_meta)
-        dashboard_meta = run_command("dashboard", build_dashboard_cmd(run_dir), run_dir, dry_run=False)
-        manifest["steps"].append(dashboard_meta)
+        if not skips["skip_operator_summary"]:
+            summary_meta = run_command("operator_summary", build_operator_summary_cmd(run_dir), run_dir, dry_run=False)
+            manifest["steps"].append(summary_meta)
+        if not skips["skip_dashboard"]:
+            dashboard_meta = run_command("dashboard", build_dashboard_cmd(run_dir), run_dir, dry_run=False)
+            manifest["steps"].append(dashboard_meta)
         write_json(manifest_path, manifest)
 
     print(f"\nDaily workflow report dir: {run_dir}")

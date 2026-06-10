@@ -180,6 +180,11 @@ def aggregate_fill_match(
             pass
     return {
         "ticket_id": ticket.get("ticket_id"),
+        "lifecycle_status": ticket.get("lifecycle_status"),
+        "broker_order_id": ticket.get("broker_order_id"),
+        "submitted_at": ticket.get("submitted_at"),
+        "submission_price": ticket.get("submission_price"),
+        "submission_status": ticket.get("submission_status"),
         "status": status,
         "match_score": min(score for _, _, score in selected),
         "fill_id": fill_ids[0] if fill_ids else None,
@@ -245,6 +250,11 @@ def match_tickets(
             matches.append(
                 {
                     "ticket_id": ticket.get("ticket_id"),
+                    "lifecycle_status": ticket.get("lifecycle_status"),
+                    "broker_order_id": ticket.get("broker_order_id"),
+                    "submitted_at": ticket.get("submitted_at"),
+                    "submission_price": ticket.get("submission_price"),
+                    "submission_status": ticket.get("submission_status"),
                     "status": "UNMATCHED",
                     "match_score": 0,
                     "ticker": ticket.get("ticker"),
@@ -262,6 +272,7 @@ def match_tickets(
 def reconcile_open_trades(
     trades: list[dict[str, Any]],
     positions: list[dict[str, Any]],
+    positions_available: bool = True,
 ) -> list[dict[str, Any]]:
     position_map: dict[str, list[dict[str, Any]]] = {}
     for position in positions:
@@ -292,7 +303,9 @@ def reconcile_open_trades(
             if strike is not None:
                 matched_strikes.add(float(strike))
 
-        if not matched:
+        if not positions_available:
+            status = "POSITION_UNKNOWN"
+        elif not matched:
             status = "MISSING_POSITION"
         elif expected_strikes and not expected_strikes.issubset(matched_strikes):
             status = "PARTIAL_POSITION"
@@ -426,7 +439,12 @@ def build_reconciliation(
         for fill in unmatched_fills
         if (fill.get("fill_id") or fill.get("id")) not in exit_fill_ids
     ]
-    trade_positions = reconcile_open_trades(journal.get("trades", []), positions)
+    positions_available = bool(broker_snapshot.get("positions_available", True))
+    trade_positions = reconcile_open_trades(
+        journal.get("trades", []),
+        positions,
+        positions_available=positions_available,
+    )
     return {
         "created_at": datetime.now().isoformat(),
         "summary": {
@@ -445,7 +463,12 @@ def build_reconciliation(
             "open_trades": len(trade_positions),
             "missing_positions": sum(1 for row in trade_positions if row["status"] == "MISSING_POSITION"),
             "partial_positions": sum(1 for row in trade_positions if row["status"] == "PARTIAL_POSITION"),
-            "position_exceptions": sum(1 for row in trade_positions if row["status"] != "POSITION_FOUND"),
+            "unknown_positions": sum(1 for row in trade_positions if row["status"] == "POSITION_UNKNOWN"),
+            "position_snapshot_status": "AVAILABLE" if positions_available else "UNKNOWN",
+            "position_exceptions": sum(
+                1 for row in trade_positions
+                if row["status"] in {"MISSING_POSITION", "PARTIAL_POSITION"}
+            ),
         },
         "ticket_matches": ticket_matches,
         "trade_exit_matches": exit_matches,

@@ -177,6 +177,8 @@ def allocate_portfolio(plan: dict[str, Any], config: dict[str, Any] | None = Non
     # basket was sized at cautious/normal/aggressive.
     extras = {k: configured[k] for k in ("sizing_mode", "sizing_multiplier") if k in configured}
     return {
+        "created_at": plan.get("created_at"),
+        "source_plan_created_at": plan.get("created_at"),
         "limits": {
             **limits,
             **extras,

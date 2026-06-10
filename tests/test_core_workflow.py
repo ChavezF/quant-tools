@@ -35,7 +35,7 @@ from adaptive_sizing import adaptive_size
 from alerts import build_alerts
 from broker_reconciliation import apply_journal_updates, build_reconciliation
 from dashboard import build_dashboard
-from daily_workflow import build_public_ingestion_cmd, build_storage_cmd
+from daily_workflow import build_public_ingestion_cmd, build_storage_cmd, profile_skips
 from database_maintenance import backup_database, maintain_database, prune_backups
 from drift_monitor import build_drift_report
 from execution_tickets import build_ticket_report, build_tickets
@@ -442,6 +442,26 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertEqual(stats["closed_trades"], 1)
         self.assertEqual(stats["total_realized_pnl"], 75.0)
 
+    def test_incomplete_open_trade_creates_high_priority_alert(self):
+        report = build_alerts(
+            None,
+            {
+                "trades": [
+                    {
+                        "id": "T-INCOMPLETE",
+                        "status": "OPEN",
+                        "ticker": "NVDA",
+                        "strategy": "CSP",
+                    }
+                ]
+            },
+            68,
+            50,
+            21,
+        )
+        self.assertEqual(report["summary"]["high"], 1)
+        self.assertEqual(report["alerts"][0]["kind"], "incomplete_journal")
+
     def test_performance_profiles_by_ticker_strategy(self):
         trades = [
             {"status": "CLOSED", "ticker": "SPY", "strategy": "BULL_PUT", "realized_pnl": -50},
@@ -496,6 +516,7 @@ class CoreWorkflowTests(unittest.TestCase):
                     "strategy": "BULL_PUT",
                     "unrealized_pnl_pct": 55,
                     "expiration": (date.today() + timedelta(days=5)).isoformat(),
+                    "strikes": "475/470",
                 }
             ]
         }
@@ -627,7 +648,10 @@ class CoreWorkflowTests(unittest.TestCase):
         later = build_tickets({"created_at": "2026-06-11T13:00:00+00:00", "actions": [action]})[0]
         self.assertEqual(first["ticket_id"], repeated["ticket_id"])
         self.assertNotEqual(first["ticket_id"], later["ticket_id"])
-        self.assertEqual(first["lifecycle_status"], "PENDING")
+        self.assertEqual(first["lifecycle_status"], "READY")
+        self.assertTrue(first["issued_at"])
+        self.assertTrue(first["execution_batch_id"])
+        self.assertTrue(first["expires_at"])
 
     def test_ticket_generation_suppresses_equivalent_active_setup(self):
         action = {
@@ -730,7 +754,7 @@ class CoreWorkflowTests(unittest.TestCase):
                 self.assertEqual(counts["trades"], 1)
                 self.assertEqual(counts["tickets"], 1)
                 self.assertEqual(export_journal_state(con)["trades"][0]["status"], "CLOSED")
-                self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 2)
+                self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 4)
             finally:
                 con.close()
 
@@ -764,10 +788,11 @@ class CoreWorkflowTests(unittest.TestCase):
 
             con = connect(db_path)
             try:
-                self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 2)
-                ticket = load_active_tickets(con)[0]
+                self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 4)
+                self.assertEqual(load_active_tickets(con), [])
+                ticket = list_tickets(con, ["EXPIRED"])[0]
                 self.assertEqual(ticket["ticket_id"], "QTK-LEGACY")
-                self.assertEqual(ticket["lifecycle_status"], "PENDING")
+                self.assertEqual(ticket["lifecycle_status"], "EXPIRED")
                 self.assertEqual(ticket["target_quantity"], 1.0)
             finally:
                 con.close()
@@ -1042,7 +1067,7 @@ class CoreWorkflowTests(unittest.TestCase):
                 duplicate = policy["duplicate_active_setups"][0]
                 self.assertEqual(duplicate["count"], 2)
                 self.assertEqual(duplicate["ticket_ids"], ["QTK-DUP-1", "QTK-DUP-2"])
-                self.assertEqual(ticket_lifecycle_counts(con), {"PENDING": 2})
+                self.assertEqual(ticket_lifecycle_counts(con), {"READY": 2})
             finally:
                 con.close()
 
@@ -1682,13 +1707,12 @@ class CoreWorkflowTests(unittest.TestCase):
             db_path = Path(tmp) / "quant.db"
             con = connect(db_path)
             try:
-                # Seed the ticket as live PENDING so the EXPIRED/CANCELLED
-                # filter in load_execution_records keeps it.
                 con.execute(
                     "INSERT INTO tickets(ticket_id, ticker, strategy, decision, "
-                    "expiration, lifecycle_status, payload_json, updated_at) "
+                    "expiration, lifecycle_status, broker_order_id, submitted_at, payload_json, updated_at) "
                     "VALUES ('QTK-1', 'SPY', 'BULL_PUT', 'APPROVE', "
-                    "'2026-07-17', 'PENDING', '{}', '2026-06-01T10:00:00Z')"
+                    "'2026-07-17', 'SUBMITTED', 'ORDER-1', '2026-06-01T10:00:00Z', "
+                    "'{}', '2026-06-01T10:00:00Z')"
                 )
                 con.commit()
                 record_reconciliation(
@@ -1739,19 +1763,12 @@ class CoreWorkflowTests(unittest.TestCase):
             self.assertEqual(report["summary"]["quantity_fill_rate"], 100.0)
             self.assertEqual(report["summary"]["fees_per_contract"], 1.0)
 
-    def test_execution_attribution_excludes_expired_and_cancelled_tickets(self):
-        """Regression: a bulk-EXPIRE clears the live queue but the historical
-        reconciliation_runs payloads still reference those tickets. Without
-        filtering by current lifecycle_status, the attribution would count
-        unmatched records from EXPIRED tickets as 0%-fill-rate, trip a
-        THROTTLE signal, and downgrade every trade in the next plan.
-        """
+    def test_execution_attribution_counts_only_submitted_tickets(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "quant.db"
             con = connect(db_path)
             try:
-                # Three tickets in the recon: one active PENDING, one EXPIRED
-                # (was PENDING but the operator gave up), one CANCELLED.
+                # Three recommendations exist, but only one was submitted.
                 record_reconciliation(
                     con,
                     {
@@ -1789,28 +1806,74 @@ class CoreWorkflowTests(unittest.TestCase):
                 # on conflict (intentional: that field is governed by the
                 # durable queue, not by the action plan), so we use raw SQL.
                 for tid, status in [
-                    ("QTK-ACTIVE", "PENDING"),
+                    ("QTK-ACTIVE", "SUBMITTED"),
                     ("QTK-EXPIRED", "EXPIRED"),
                     ("QTK-CANCELLED", "CANCELLED"),
                 ]:
                     con.execute(
                         "INSERT INTO tickets(ticket_id, ticker, strategy, decision, "
-                        "expiration, lifecycle_status, payload_json, updated_at) "
-                        "VALUES (?, 'X', 'BULL_PUT', 'APPROVE', '2026-07-17', ?, '{}', '2026-06-01T10:00:00Z')",
-                        (tid, status),
+                        "expiration, lifecycle_status, broker_order_id, submitted_at, payload_json, updated_at) "
+                        "VALUES (?, 'X', 'BULL_PUT', 'APPROVE', '2026-07-17', ?, ?, ?, '{}', '2026-06-01T10:00:00Z')",
+                        (
+                            tid,
+                            status,
+                            "ORDER-ACTIVE" if tid == "QTK-ACTIVE" else None,
+                            "2026-06-01T10:00:00Z" if tid == "QTK-ACTIVE" else None,
+                        ),
                     )
                 con.commit()
             finally:
                 con.close()
 
             records = load_execution_records(db_path)
-            self.assertEqual(len(records), 1, "only the active PENDING ticket should survive")
+            self.assertEqual(len(records), 1, "only the explicitly submitted ticket should survive")
             self.assertEqual(records[0]["ticket_id"], "QTK-ACTIVE")
             # The summary must show n=1, not n=3 — otherwise THROTTLE fires
             # from stale unmatched records.
             report = build_execution_attribution(records, min_samples=1)
             self.assertEqual(report["summary"]["count"], 1)
             self.assertEqual(report["summary"]["fill_rate"], 0.0)  # 0/1 unmatched, not 0/3
+
+    def test_ready_tickets_do_not_create_execution_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "quant.db"
+            con = connect(db_path)
+            try:
+                upsert_tickets(
+                    con,
+                    [{"ticket_id": "QTK-READY", "ticker": "SPY", "strategy": "CSP"}],
+                )
+                record_reconciliation(
+                    con,
+                    {
+                        "ticket_matches": [
+                            {
+                                "ticket_id": "QTK-READY",
+                                "ticker": "SPY",
+                                "strategy": "CSP",
+                                "status": "UNMATCHED",
+                            }
+                        ]
+                    },
+                )
+            finally:
+                con.close()
+            records = load_execution_records(db_path)
+            report = build_execution_attribution(records, min_samples=1)
+            self.assertEqual(records, [])
+            self.assertEqual(report["summary"]["status"], "NO_SUBMITTED_HISTORY")
+            self.assertEqual(adjustment_for_summary(report["summary"], 1)["signal"], "NO_SUBMITTED_HISTORY")
+
+    def test_workflow_profiles_separate_planning_and_execution(self):
+        planning = profile_skips("planning", Namespace())
+        executable = profile_skips("executable", Namespace())
+        self.assertTrue(planning["skip_tickets"])
+        self.assertTrue(planning["skip_storage"])
+        self.assertFalse(planning["skip_dashboard"])
+        self.assertFalse(executable["skip_tickets"])
+        self.assertFalse(executable["skip_storage"])
+        self.assertTrue(executable["skip_discovery"])
+        self.assertTrue(executable["skip_dashboard"])
 
     def test_action_plan_applies_execution_attribution(self):
         limits = RiskLimits(account_nav=30000)

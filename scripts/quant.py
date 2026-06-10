@@ -123,6 +123,7 @@ def main():
     p_daily.add_argument("--profit-target-pct", type=float)
     p_daily.add_argument("--dte-warning", type=int)
     p_daily.add_argument("--top", type=int, default=10)
+    p_daily.add_argument("--profile", choices=["standard", "planning", "executable"], default="standard")
     p_daily.add_argument("--skip-mark", action="store_true")
     p_daily.add_argument("--skip-management", action="store_true")
     p_daily.add_argument("--skip-discovery", action="store_true")
@@ -131,6 +132,14 @@ def main():
     p_daily.add_argument("--skip-allocation", action="store_true")
     p_daily.add_argument("--skip-brief", action="store_true")
     p_daily.add_argument("--skip-alerts", action="store_true")
+    p_daily.add_argument("--skip-storage", action="store_true")
+    p_daily.add_argument("--skip-tickets", action="store_true")
+    p_daily.add_argument("--skip-validation", action="store_true")
+    p_daily.add_argument("--skip-drift", action="store_true")
+    p_daily.add_argument("--skip-database-maintenance", action="store_true")
+    p_daily.add_argument("--skip-health", action="store_true")
+    p_daily.add_argument("--skip-dashboard", action="store_true")
+    p_daily.add_argument("--skip-operator-summary", action="store_true")
     p_daily.add_argument("--no-cache", action="store_true")
     p_daily.add_argument("--send", action="store_true")
     p_daily.add_argument("--dry-run", action="store_true")
@@ -196,6 +205,7 @@ def main():
     p_dashboard.add_argument("--feedback")
     p_dashboard.add_argument("--reconciliation")
     p_dashboard.add_argument("--execution-analytics")
+    p_dashboard.add_argument("--execution-history")
     p_dashboard.add_argument("--database-maintenance")
     p_dashboard.add_argument("--health")
     p_dashboard.add_argument("--scenario-stress")
@@ -241,6 +251,7 @@ def main():
 
     p_operator = sub.add_parser("operator", help="Run the complete morning decision workflow")
     p_operator.add_argument("--report-dir")
+    p_operator.add_argument("--profile", choices=["standard", "planning", "executable"], default="standard")
     p_operator.add_argument("--journal")
     p_operator.add_argument("--broker-snapshot")
     p_operator.add_argument("--sizing-mode", choices=["cautious", "normal", "aggressive"],
@@ -275,7 +286,17 @@ def main():
     p_ticket_lifecycle.add_argument("--status", nargs="+")
     p_ticket_lifecycle.add_argument("--active", action="store_true")
     p_ticket_lifecycle.add_argument("--ticket-id")
-    p_ticket_lifecycle.add_argument("--set-status", choices=["PENDING", "CANCELLED", "EXPIRED"])
+    p_ticket_lifecycle.add_argument(
+        "--set-status",
+        choices=[
+            "READY", "SUBMITTED", "WORKING", "PARTIAL", "FILLED",
+            "OVERFILLED", "REJECTED", "CANCEL_PENDING", "CANCELLED", "EXPIRED",
+        ],
+    )
+    p_ticket_lifecycle.add_argument("--broker-order-id")
+    p_ticket_lifecycle.add_argument("--submitted-at")
+    p_ticket_lifecycle.add_argument("--submission-price", type=float)
+    p_ticket_lifecycle.add_argument("--submission-status")
     p_ticket_lifecycle.add_argument("--json", action="store_true")
 
     p_broker_sync = sub.add_parser("broker-sync", help="Fetch Public.com fills and positions into a broker snapshot")
@@ -494,7 +515,7 @@ def main():
             cmd += ["--json"]
         return run(*cmd)
     elif args.cmd == "daily":
-        cmd = ["daily_workflow.py"]
+        cmd = ["daily_workflow.py", "--profile", args.profile]
         if args.config:
             cmd += ["--config", args.config]
         if args.watchlist:
@@ -543,6 +564,14 @@ def main():
             ("skip_allocation", "--skip-allocation"),
             ("skip_brief", "--skip-brief"),
             ("skip_alerts", "--skip-alerts"),
+            ("skip_storage", "--skip-storage"),
+            ("skip_tickets", "--skip-tickets"),
+            ("skip_validation", "--skip-validation"),
+            ("skip_drift", "--skip-drift"),
+            ("skip_database_maintenance", "--skip-database-maintenance"),
+            ("skip_health", "--skip-health"),
+            ("skip_dashboard", "--skip-dashboard"),
+            ("skip_operator_summary", "--skip-operator-summary"),
             ("no_cache", "--no-cache"),
             ("send", "--send"),
             ("dry_run", "--dry-run"),
@@ -651,6 +680,7 @@ def main():
             ("feedback", "--feedback"),
             ("reconciliation", "--reconciliation"),
             ("execution_analytics", "--execution-analytics"),
+            ("execution_history", "--execution-history"),
             ("database_maintenance", "--database-maintenance"),
             ("health", "--health"),
             ("scenario_stress", "--scenario-stress"),
@@ -720,7 +750,7 @@ def main():
             cmd += ["--json"]
         return run(*cmd)
     elif args.cmd == "operator":
-        cmd = ["daily_workflow.py"]
+        cmd = ["daily_workflow.py", "--profile", args.profile]
         if args.config:
             cmd += ["--config", args.config]
         if args.report_dir:
@@ -782,6 +812,15 @@ def main():
             cmd += ["--ticket-id", args.ticket_id]
         if args.set_status:
             cmd += ["--set-status", args.set_status]
+        for attr, flag in [
+            ("broker_order_id", "--broker-order-id"),
+            ("submitted_at", "--submitted-at"),
+            ("submission_price", "--submission-price"),
+            ("submission_status", "--submission-status"),
+        ]:
+            value = getattr(args, attr)
+            if value is not None:
+                cmd += [flag, str(value)]
         if args.json:
             cmd += ["--json"]
         return run(*cmd)

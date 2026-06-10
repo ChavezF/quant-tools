@@ -21,43 +21,38 @@ def as_float(value: Any) -> float | None:
 
 
 def load_execution_records(db_path: str | Path) -> list[dict[str, Any]]:
-    """Aggregate the latest reconciliation snapshot per ticket, excluding
-    tickets the operator has since closed out (EXPIRED / CANCELLED).
-
-    Why: every reconciliation_run's payload lists every ticket it tried to
-    match. A bulk EXPIRE earlier in the day clears the live queue but does
-    not rewrite the historical payloads, so a stale "unmatched" record from
-    a ticket the user never intended to execute can drag the fill_rate to
-    0% and trip a THROTTLE signal on every trade in the next plan. Joining
-    against the current lifecycle_status is the cheapest correct fix: a
-    ticket that's been EXPIRED is not part of the live execution record
-    anymore, and the attribution should not pretend otherwise.
-    """
+    """Aggregate the latest reconciliation snapshot for submitted orders only."""
     con = connect(db_path)
     try:
         runs = con.execute(
             "SELECT id, created_at, payload_json FROM reconciliation_runs ORDER BY id"
         ).fetchall()
-        # Only tickets still considered part of the live execution record.
-        # PENDING / PARTIAL / MATCHED / FILLED all mean "we expect to act on
-        # this"; EXPIRED / CANCELLED mean "we deliberately gave up on it".
         active_rows = con.execute(
-            "SELECT ticket_id FROM tickets "
-            "WHERE lifecycle_status IN ('PENDING','PARTIAL','MATCHED','FILLED')"
+            """
+            SELECT ticket_id, lifecycle_status, broker_order_id, submitted_at,
+                   submission_price, submission_status
+            FROM tickets
+            WHERE lifecycle_status IN (
+                'SUBMITTED','WORKING','PARTIAL','FILLED','OVERFILLED',
+                'REJECTED','CANCEL_PENDING','CANCELLED'
+            )
+              AND (submitted_at IS NOT NULL OR broker_order_id IS NOT NULL)
+            """
         ).fetchall()
     finally:
         con.close()
 
-    active_ids = {row["ticket_id"] for row in active_rows}
+    submitted = {row["ticket_id"]: dict(row) for row in active_rows}
     latest: dict[str, dict[str, Any]] = {}
     for run in runs:
         report = json.loads(run["payload_json"])
         for match in report.get("ticket_matches", []):
             ticket_id = str(match.get("ticket_id") or "")
-            if not ticket_id or ticket_id not in active_ids:
+            if not ticket_id or ticket_id not in submitted:
                 continue
             latest[ticket_id] = {
                 **match,
+                **submitted[ticket_id],
                 "reconciliation_run_id": int(run["id"]),
                 "reconciled_at": run["created_at"],
             }
@@ -67,6 +62,7 @@ def load_execution_records(db_path: str | Path) -> list[dict[str, Any]]:
 def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     if not records:
         return {
+            "status": "NO_SUBMITTED_HISTORY",
             "count": 0,
             "completed": 0,
             "partial": 0,
@@ -100,6 +96,7 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         if value is not None
     ]
     return {
+        "status": "AVAILABLE",
         "count": len(records),
         "completed": len(completed),
         "partial": len(partial),
@@ -121,6 +118,14 @@ def grouped(records: list[dict[str, Any]], key_fn) -> dict[str, dict[str, Any]]:
 
 def adjustment_for_summary(summary: dict[str, Any], min_samples: int = 5) -> dict[str, Any]:
     count = int(summary.get("count", 0) or 0)
+    if count == 0:
+        return {
+            "score_adjustment": 0.0,
+            "size_multiplier": 1.0,
+            "signal": "NO_SUBMITTED_HISTORY",
+            "sample_size": 0,
+            "reasons": ["no orders have been explicitly submitted"],
+        }
     if count < min_samples:
         return {
             "score_adjustment": 0.0,
@@ -219,11 +224,14 @@ def main() -> None:
         print(json.dumps(report, indent=2, default=str))
         return
     summary = report["summary"]
-    print(
-        f"Execution history: n={summary['count']} fill={summary['fill_rate']:.1f}% "
-        f"credit_vs_plan={summary['avg_credit_improvement']:+.3f} "
-        f"fees/contract=${summary['fees_per_contract']:.2f}"
-    )
+    if summary["status"] == "NO_SUBMITTED_HISTORY":
+        print("Execution history: NO_SUBMITTED_HISTORY")
+    else:
+        print(
+            f"Execution history: n={summary['count']} fill={summary['fill_rate']:.1f}% "
+            f"credit_vs_plan={summary['avg_credit_improvement']:+.3f} "
+            f"fees/contract=${summary['fees_per_contract']:.2f}"
+        )
 
 
 if __name__ == "__main__":

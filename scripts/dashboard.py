@@ -268,13 +268,15 @@ def build_dashboard(
 ) -> str:
     analytics = analytics or plan.get("historical_analytics", {})
     feedback = feedback or {}
-    reconciliation = reconciliation or {}
-    reconciliation = reconciliation.get("reconciliation", reconciliation)
+    reconciliation_wrapper = reconciliation or {}
+    lifecycle_counts = reconciliation_wrapper.get("ticket_lifecycle", {})
+    reconciliation = reconciliation_wrapper.get("reconciliation", reconciliation_wrapper)
     recon_summary = reconciliation.get("summary", {})
     execution_analytics = execution_analytics or {}
     execution_summary = execution_analytics.get("summary", {})
     execution_history = execution_history or {}
     history_summary = execution_history.get("summary", {})
+    funnel = manifest.get("opportunity_funnel", {})
     database_maintenance = database_maintenance or {}
     health = health or {}
     scenario_stress = scenario_stress or {}
@@ -340,7 +342,12 @@ def build_dashboard(
       <div class="card">Reduced<b>{esc(plan_summary.get('reduce', 0))}</b></div>
       <div class="card">Rejected<b>{esc(plan_summary.get('reject', 0))}</b></div>
       <div class="card">High Alerts<b>{esc(alert_summary.get('high', 0))}</b></div>
-      <div class="card">Tickets<b>{ticket_count}</b></div>
+      <div class="card">Planning Candidates<b>{esc(funnel.get('morning_candidates', plan_summary.get('approve', 0) + plan_summary.get('reduce', 0)))}</b></div>
+      <div class="card">Ready for Review<b>{esc(lifecycle_counts.get('READY', ticket_count))}</b></div>
+      <div class="card">Submitted Orders<b>{esc(lifecycle_counts.get('SUBMITTED', 0))}</b></div>
+      <div class="card">Working Orders<b>{esc(lifecycle_counts.get('WORKING', 0))}</b></div>
+      <div class="card">Partial Fills<b>{esc(lifecycle_counts.get('PARTIAL', 0))}</b></div>
+      <div class="card">Filled Orders<b>{esc(int(lifecycle_counts.get('FILLED', 0) or 0) + int(lifecycle_counts.get('OVERFILLED', 0) or 0))}</b></div>
       <div class="card">Expectancy<b>{money(overall.get('expectancy'))}</b></div>
       <div class="card">Max Drawdown<b>{money(drawdown.get('max_drawdown'))}</b></div>
       <div class="card">Min Score<b>{float(feedback.get('recommended_min_score') or 0):.0f}</b></div>
@@ -350,7 +357,7 @@ def build_dashboard(
       <div class="card">Duplicate Setups<b>{esc(recon_summary.get('duplicate_active_setups', 0))}</b></div>
       <div class="card">Unmatched Tickets<b>{esc(recon_summary.get('unmatched_tickets', 0))}</b></div>
       <div class="card">Position Exceptions<b>{esc(recon_summary.get('position_exceptions', recon_summary.get('missing_positions', 0)))}</b></div>
-      <div class="card">Fill Rate<b>{float(execution_summary.get('fill_rate') or 0):.0f}%</b></div>
+      <div class="card">Fill Rate<b>{esc('NO_SUBMITTED_HISTORY' if execution_summary.get('status') == 'NO_SUBMITTED_HISTORY' else f"{float(execution_summary.get('fill_rate') or 0):.0f}%")}</b></div>
       <div class="card">Quantity Fill<b>{float(execution_summary.get('quantity_fill_rate') or 0):.0f}%</b></div>
       <div class="card">Credit vs Plan<b>{float(execution_summary.get('avg_credit_improvement') or 0):+.3f}</b></div>
       <div class="card">Execution Fees<b>{money(execution_summary.get('total_fees'))}</b></div>
@@ -421,7 +428,7 @@ def build_dashboard(
       <thead><tr><th>Priority</th><th>Kind</th><th>Title</th><th>Detail</th></tr></thead>
       <tbody>{render_alerts(alerts)}</tbody>
     </table></div>
-    <h2>Execution Tickets</h2>
+    <h2>Execution Tickets: Ready for Review</h2>
     <div class="table-wrap"><table class="sortable">
       <thead><tr><th>Decision</th><th>Ticker</th><th>Strategy</th><th>Expiration</th><th>Strikes</th><th>Order</th><th>Limit</th><th>Floor</th><th>Max Loss</th></tr></thead>
       <tbody>{render_tickets(tickets)}</tbody>

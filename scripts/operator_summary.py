@@ -27,8 +27,9 @@ def build_summary(
     drift: dict[str, Any] | None = None,
     execution_history: dict[str, Any] | None = None,
 ) -> str:
-    reconciliation = reconciliation or {}
-    reconciliation = reconciliation.get("reconciliation", reconciliation)
+    reconciliation_wrapper = reconciliation or {}
+    lifecycle_counts = reconciliation_wrapper.get("ticket_lifecycle", {})
+    reconciliation = reconciliation_wrapper.get("reconciliation", reconciliation_wrapper)
     recon_summary = reconciliation.get("summary", {})
     execution_summary = (execution_analytics or {}).get("summary", {})
     execution_history = execution_history or {}
@@ -57,7 +58,12 @@ def build_summary(
         f"- Reduced: {summary.get('reduce', 0)}",
         f"- Rejected: {summary.get('reject', 0)}",
         f"- High-priority alerts: {alerts.get('summary', {}).get('high', 0)}",
-        f"- Execution tickets: {len(tickets.get('tickets', []))}",
+        f"- Planning candidates: {summary.get('approve', 0) + summary.get('reduce', 0)}",
+        f"- Ready for review: {lifecycle_counts.get('READY', len(tickets.get('tickets', [])))}",
+        f"- Submitted orders: {lifecycle_counts.get('SUBMITTED', 0)}",
+        f"- Working orders: {lifecycle_counts.get('WORKING', 0)}",
+        f"- Partial fills: {lifecycle_counts.get('PARTIAL', 0)}",
+        f"- Filled orders: {int(lifecycle_counts.get('FILLED', 0) or 0) + int(lifecycle_counts.get('OVERFILLED', 0) or 0)}",
         f"- Active execution tickets: {recon_summary.get('active_tickets', 0)}",
         f"- Tickets auto-expired: {recon_summary.get('expired_tickets', 0)}",
         f"- Stale partial fills: {recon_summary.get('stale_partial_tickets', 0)}",
@@ -66,7 +72,7 @@ def build_summary(
         f"- Partially filled tickets: {recon_summary.get('partial_tickets', 0)}",
         f"- Overfilled tickets: {recon_summary.get('overfilled_tickets', 0)}",
         f"- Broker position exceptions: {recon_summary.get('position_exceptions', recon_summary.get('missing_positions', 0))}",
-        f"- Fill rate: {float(execution_summary.get('fill_rate', 0) or 0):.1f}%",
+        f"- Fill rate: {'NO_SUBMITTED_HISTORY' if execution_summary.get('status') == 'NO_SUBMITTED_HISTORY' else f'{float(execution_summary.get('fill_rate', 0) or 0):.1f}%'}",
         f"- Quantity fill rate: {float(execution_summary.get('quantity_fill_rate', 0) or 0):.1f}%",
         f"- Average credit vs plan: {float(execution_summary.get('avg_credit_improvement', 0) or 0):+.3f}",
         f"- Execution fees: ${float(execution_summary.get('total_fees', 0) or 0):,.2f}",
@@ -131,7 +137,7 @@ def build_summary(
             f"limit {execution.get('suggested_limit_credit')}, floor {execution.get('do_not_chase_below')}"
         )
 
-    lines.extend(["", "## Execution Queue", ""])
+    lines.extend(["", "## Ready for Review", ""])
     ticket_rows = tickets.get("tickets", [])
     if not ticket_rows:
         lines.append("- No tickets.")

@@ -74,8 +74,31 @@ def build_execution_analytics(
     by_strategy = defaultdict(empty_bucket)
     by_grade = defaultdict(empty_bucket)
 
+    submitted_statuses = {
+        "SUBMITTED", "WORKING", "PARTIAL", "FILLED", "OVERFILLED",
+        "REJECTED", "CANCEL_PENDING", "CANCELLED",
+    }
+    ready_count = 0
+    skipped_unsubmitted = 0
     for ticket_id, ticket in tickets.items():
         match = matched_by_ticket.get(ticket_id, {})
+        lifecycle = str(
+            match.get("lifecycle_status") or ticket.get("lifecycle_status") or "READY"
+        ).upper()
+        submitted = bool(
+            match.get("submitted_at")
+            or match.get("broker_order_id")
+            or ticket.get("submitted_at")
+            or ticket.get("broker_order_id")
+        )
+        fill_evidence = str(match.get("status") or "").upper() in {
+            "PARTIAL", "MATCHED", "OVERFILLED"
+        }
+        if lifecycle == "READY":
+            ready_count += 1
+        if not fill_evidence and (lifecycle not in submitted_statuses or not submitted):
+            skipped_unsubmitted += 1
+            continue
         status = match.get("status", "UNMATCHED")
         planned = as_float(ticket.get("limit_credit"))
         floor = as_float(ticket.get("do_not_chase_below"))
@@ -92,6 +115,7 @@ def build_execution_analytics(
             "strategy": ticket.get("strategy"),
             "execution_grade": ticket.get("execution_grade"),
             "status": status,
+            "lifecycle_status": lifecycle,
             "planned_limit_credit": planned,
             "fill_price": fill_price,
             "target_quantity": target_quantity,
@@ -126,7 +150,10 @@ def build_execution_analytics(
     filled_quantity = sum(min(row["filled_quantity"], row["target_quantity"]) for row in rows)
     fill_delays = [row["fill_delay_seconds"] for row in rows if row["fill_delay_seconds"] is not None]
     summary = {
+        "status": "AVAILABLE" if rows else "NO_SUBMITTED_HISTORY",
         "tickets": len(rows),
+        "ready": ready_count,
+        "unsubmitted_excluded": skipped_unsubmitted,
         "matched": len(matched),
         "partial": len(partial),
         "unmatched": sum(1 for row in rows if row["status"] == "UNMATCHED"),
@@ -150,6 +177,9 @@ def build_execution_analytics(
 def print_report(report: dict[str, Any]) -> None:
     summary = report["summary"]
     print(f"\n{'#'*78}\n# EXECUTION ANALYTICS\n{'#'*78}\n")
+    if summary["status"] == "NO_SUBMITTED_HISTORY":
+        print(f"  NO_SUBMITTED_HISTORY | ready={summary['ready']}")
+        return
     print(
         f"  Tickets={summary['tickets']} matched={summary['matched']} "
         f"fill={summary['fill_rate']:.1f}% quantity_fill={summary['quantity_fill_rate']:.1f}% "

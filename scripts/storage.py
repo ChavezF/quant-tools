@@ -12,7 +12,7 @@ from common import STATE_DIR
 
 
 DEFAULT_DB_FILE = STATE_DIR / "quant_tools.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
 def now_iso() -> str:
@@ -106,6 +106,46 @@ def migrate(con: sqlite3.Connection) -> None:
             PRAGMA user_version = 2;
             """
         )
+        version = 2
+    if version < 3:
+        con.executescript(
+            """
+            ALTER TABLE tickets ADD COLUMN broker_order_id TEXT;
+            ALTER TABLE tickets ADD COLUMN submitted_at TEXT;
+            ALTER TABLE tickets ADD COLUMN submission_price REAL;
+            ALTER TABLE tickets ADD COLUMN submission_status TEXT;
+            ALTER TABLE tickets ADD COLUMN execution_batch_id TEXT;
+            ALTER TABLE tickets ADD COLUMN expires_at TEXT;
+
+            UPDATE tickets
+            SET issued_at = COALESCE(issued_at, updated_at);
+
+            UPDATE tickets
+            SET lifecycle_status = CASE
+                WHEN filled_quantity > 0 THEN 'PARTIAL'
+                ELSE 'EXPIRED'
+            END
+            WHERE lifecycle_status = 'PENDING'
+              AND broker_order_id IS NULL;
+
+            CREATE INDEX IF NOT EXISTS idx_tickets_broker_order ON tickets(broker_order_id);
+            CREATE INDEX IF NOT EXISTS idx_tickets_submitted_at ON tickets(submitted_at);
+            PRAGMA user_version = 3;
+            """
+        )
+        version = 3
+    if version < 4:
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS broker_position_snapshots (
+                snapshot_at TEXT PRIMARY KEY,
+                available INTEGER NOT NULL,
+                position_count INTEGER NOT NULL,
+                source TEXT
+            );
+            PRAGMA user_version = 4;
+            """
+        )
     con.commit()
 
 
@@ -158,6 +198,9 @@ def upsert_tickets(con: sqlite3.Connection, tickets: list[dict[str, Any]]) -> in
     for ticket in tickets:
         if not ticket.get("ticket_id"):
             continue
+        lifecycle_status = str(ticket.get("lifecycle_status") or "READY").upper()
+        if lifecycle_status == "PENDING":
+            lifecycle_status = "READY"
         rows.append(
             (
                 str(ticket.get("ticket_id")),
@@ -165,10 +208,16 @@ def upsert_tickets(con: sqlite3.Connection, tickets: list[dict[str, Any]]) -> in
                 ticket.get("strategy"),
                 ticket.get("decision"),
                 ticket.get("expiration"),
-                ticket.get("lifecycle_status") or "PENDING",
+                lifecycle_status,
                 float(ticket.get("target_quantity") or 1),
                 float(ticket.get("filled_quantity") or 0),
-                ticket.get("issued_at"),
+                ticket.get("issued_at") or ts,
+                ticket.get("broker_order_id"),
+                ticket.get("submitted_at"),
+                ticket.get("submission_price"),
+                ticket.get("submission_status"),
+                ticket.get("execution_batch_id"),
+                ticket.get("expires_at"),
                 _json(ticket),
                 ts,
             )
@@ -177,9 +226,11 @@ def upsert_tickets(con: sqlite3.Connection, tickets: list[dict[str, Any]]) -> in
         """
         INSERT INTO tickets(
             ticket_id, ticker, strategy, decision, expiration, lifecycle_status,
-            target_quantity, filled_quantity, issued_at, payload_json, updated_at
+            target_quantity, filled_quantity, issued_at, broker_order_id,
+            submitted_at, submission_price, submission_status,
+            execution_batch_id, expires_at, payload_json, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(ticket_id) DO UPDATE SET
             ticker=excluded.ticker,
             strategy=excluded.strategy,
@@ -187,6 +238,8 @@ def upsert_tickets(con: sqlite3.Connection, tickets: list[dict[str, Any]]) -> in
             expiration=excluded.expiration,
             target_quantity=excluded.target_quantity,
             issued_at=COALESCE(tickets.issued_at, excluded.issued_at),
+            execution_batch_id=COALESCE(tickets.execution_batch_id, excluded.execution_batch_id),
+            expires_at=COALESCE(tickets.expires_at, excluded.expires_at),
             payload_json=excluded.payload_json,
             updated_at=excluded.updated_at
         """,
@@ -223,6 +276,28 @@ def insert_position_snapshot(
     )
     con.commit()
     return len(rows)
+
+
+def record_position_snapshot(
+    con: sqlite3.Connection,
+    positions: list[dict[str, Any]],
+    *,
+    available: bool,
+    source: str | None = None,
+    snapshot_at: str | None = None,
+) -> int:
+    ts = snapshot_at or now_iso()
+    inserted = insert_position_snapshot(con, positions, snapshot_at=ts) if positions else 0
+    con.execute(
+        """
+        INSERT OR REPLACE INTO broker_position_snapshots(
+            snapshot_at, available, position_count, source
+        ) VALUES (?, ?, ?, ?)
+        """,
+        (ts, int(available), len(positions), source),
+    )
+    con.commit()
+    return inserted
 
 
 def fill_identity(fill: dict[str, Any], index: int = 0) -> str:
@@ -272,8 +347,41 @@ def upsert_fills(con: sqlite3.Connection, fills: list[dict[str, Any]]) -> int:
     return len(rows)
 
 
-ACTIVE_TICKET_STATUSES = ("PENDING", "PARTIAL")
-TICKET_LIFECYCLE_STATUSES = ("PENDING", "PARTIAL", "FILLED", "OVERFILLED", "CANCELLED", "EXPIRED")
+ACTIVE_TICKET_STATUSES = ("READY", "SUBMITTED", "WORKING", "PARTIAL")
+SUBMITTED_TICKET_STATUSES = (
+    "SUBMITTED",
+    "WORKING",
+    "PARTIAL",
+    "FILLED",
+    "OVERFILLED",
+    "REJECTED",
+    "CANCEL_PENDING",
+    "CANCELLED",
+)
+TICKET_LIFECYCLE_STATUSES = (
+    "READY",
+    "SUBMITTED",
+    "WORKING",
+    "PARTIAL",
+    "FILLED",
+    "OVERFILLED",
+    "REJECTED",
+    "CANCEL_PENDING",
+    "CANCELLED",
+    "EXPIRED",
+    "PENDING",
+)
+
+ALLOWED_TICKET_TRANSITIONS = {
+    "READY": {"SUBMITTED", "CANCELLED", "EXPIRED"},
+    "SUBMITTED": {"WORKING", "PARTIAL", "FILLED", "OVERFILLED", "REJECTED", "CANCEL_PENDING", "CANCELLED", "EXPIRED"},
+    "WORKING": {"PARTIAL", "FILLED", "OVERFILLED", "REJECTED", "CANCEL_PENDING", "CANCELLED", "EXPIRED"},
+    "PARTIAL": {"WORKING", "FILLED", "OVERFILLED", "CANCEL_PENDING", "CANCELLED", "EXPIRED"},
+    "CANCEL_PENDING": {"WORKING", "PARTIAL", "FILLED", "OVERFILLED", "CANCELLED"},
+    "CANCELLED": {"READY"},
+    "EXPIRED": {"READY"},
+    "PENDING": {"READY", "SUBMITTED", "CANCELLED", "EXPIRED"},
+}
 
 
 def _ticket_from_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -286,6 +394,12 @@ def _ticket_from_row(row: sqlite3.Row) -> dict[str, Any]:
             "filled_quantity": float(row["filled_quantity"] or 0),
             "issued_at": row["issued_at"],
             "last_fill_at": row["last_fill_at"],
+            "broker_order_id": row["broker_order_id"],
+            "submitted_at": row["submitted_at"],
+            "submission_price": row["submission_price"],
+            "submission_status": row["submission_status"],
+            "execution_batch_id": row["execution_batch_id"],
+            "expires_at": row["expires_at"],
             "updated_at": row["updated_at"],
         }
     )
@@ -330,13 +444,52 @@ def set_ticket_lifecycle(
     con: sqlite3.Connection,
     ticket_id: str,
     status: str,
+    *,
+    broker_order_id: str | None = None,
+    submitted_at: str | None = None,
+    submission_price: float | None = None,
+    submission_status: str | None = None,
 ) -> bool:
     normalized = str(status).upper()
+    if normalized == "PENDING":
+        normalized = "READY"
     if normalized not in TICKET_LIFECYCLE_STATUSES:
         raise ValueError(f"Unsupported ticket lifecycle status: {status}")
+    row = con.execute(
+        "SELECT lifecycle_status, submitted_at, broker_order_id FROM tickets WHERE ticket_id=?",
+        (str(ticket_id),),
+    ).fetchone()
+    if row is None:
+        return False
+    current = str(row["lifecycle_status"] or "READY").upper()
+    if current != normalized and normalized not in ALLOWED_TICKET_TRANSITIONS.get(current, set()):
+        raise ValueError(f"Unsupported ticket lifecycle transition: {current} -> {normalized}")
+    if normalized == "SUBMITTED" and not broker_order_id:
+        raise ValueError("SUBMITTED requires --broker-order-id")
+    submission_time = submitted_at
+    if normalized == "SUBMITTED" and not submission_time:
+        submission_time = now_iso()
     cur = con.execute(
-        "UPDATE tickets SET lifecycle_status=?, updated_at=? WHERE ticket_id=?",
-        (normalized, now_iso(), str(ticket_id)),
+        """
+        UPDATE tickets
+        SET lifecycle_status=?,
+            broker_order_id=COALESCE(?, broker_order_id),
+            submitted_at=COALESCE(?, submitted_at),
+            submission_price=COALESCE(?, submission_price),
+            submission_status=COALESCE(?, submission_status, ?),
+            updated_at=?
+        WHERE ticket_id=?
+        """,
+        (
+            normalized,
+            broker_order_id,
+            submission_time,
+            submission_price,
+            submission_status,
+            normalized,
+            now_iso(),
+            str(ticket_id),
+        ),
     )
     con.commit()
     return cur.rowcount > 0
@@ -386,7 +539,12 @@ def apply_lifecycle_policy(
         age = ticket_age_hours(ticket, now)
         ticket["age_hours"] = round(age, 2) if age is not None else None
         status = ticket.get("lifecycle_status")
-        if status == "PENDING" and age is not None and age >= pending_expiry_hours:
+        expires_at = parse_datetime(ticket.get("expires_at"))
+        current = now or datetime.now(timezone.utc)
+        should_expire = expires_at is not None and current.astimezone(timezone.utc) >= expires_at
+        if status == "READY" and (
+            should_expire or (age is not None and age >= pending_expiry_hours)
+        ):
             set_ticket_lifecycle(con, str(ticket["ticket_id"]), "EXPIRED")
             expired.append(
                 {
@@ -419,7 +577,7 @@ def apply_lifecycle_policy(
         if key.strip("|") and len(tickets) > 1
     ]
     return {
-        "pending_expiry_hours": pending_expiry_hours,
+        "ready_expiry_hours": pending_expiry_hours,
         "partial_review_hours": partial_review_hours,
         "expired_tickets": expired,
         "stale_partial_tickets": stale_partials,
@@ -470,12 +628,17 @@ def apply_ticket_lifecycle(con: sqlite3.Connection, ticket_matches: list[dict[st
         if not ticket_id:
             continue
         status = str(match.get("status") or "UNMATCHED")
+        current_row = con.execute(
+            "SELECT lifecycle_status FROM tickets WHERE ticket_id=?",
+            (str(ticket_id),),
+        ).fetchone()
+        current = str(current_row["lifecycle_status"]) if current_row else "READY"
         lifecycle = {
-            "UNMATCHED": "PENDING",
+            "UNMATCHED": current,
             "PARTIAL": "PARTIAL",
             "MATCHED": "FILLED",
             "OVERFILLED": "OVERFILLED",
-        }.get(status, "PENDING")
+        }.get(status, current)
         fill_ids = [str(value) for value in match.get("fill_ids", []) if value]
         last_fill_at = None
         if fill_ids:
@@ -523,9 +686,21 @@ def record_reconciliation(con: sqlite3.Connection, report: dict[str, Any]) -> in
     return int(cur.lastrowid)
 
 
-def table_counts(con: sqlite3.Connection) -> dict[str, int]:
+def table_counts(con: sqlite3.Connection) -> dict[str, Any]:
     tables = ["trades", "tickets", "broker_positions", "broker_fills", "reconciliation_runs"]
-    return {table: int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables}
+    counts = {table: int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables}
+    latest = con.execute(
+        """
+        SELECT available, position_count, snapshot_at
+        FROM broker_position_snapshots
+        ORDER BY snapshot_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    counts["current_broker_positions"] = int(latest["position_count"]) if latest and latest["available"] else 0
+    counts["broker_position_state"] = "AVAILABLE" if latest and latest["available"] else "UNKNOWN"
+    counts["latest_position_snapshot_at"] = latest["snapshot_at"] if latest else None
+    return counts
 
 
 def export_journal_state(con: sqlite3.Connection) -> dict[str, Any]:

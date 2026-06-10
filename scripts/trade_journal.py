@@ -103,7 +103,19 @@ def tags_from_text(raw: str | None) -> list[str]:
     return [tag.strip() for tag in raw.split(",") if tag.strip()]
 
 
+def validate_option_identity(expiration: str | None, strikes: str | None) -> None:
+    if not expiration:
+        raise SystemExit("Option trades require --expiration")
+    try:
+        date.fromisoformat(str(expiration)[:10])
+    except ValueError as exc:
+        raise SystemExit("--expiration must be an ISO date (YYYY-MM-DD)") from exc
+    if not str(strikes or "").strip():
+        raise SystemExit("Option trades require --strikes")
+
+
 def add_trade(state: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    validate_option_identity(args.expiration, args.strikes)
     trades = state.setdefault("trades", [])
     trade = {
         "id": args.id or next_trade_id(trades),
@@ -135,6 +147,33 @@ def add_trade(state: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
         "realized_pnl_pct": None,
     }
     trades.append(trade)
+    return trade
+
+
+def repair_trade(state: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    trade = find_trade(state, args.id)
+    updates = {
+        key: value
+        for key, value in {
+            "expiration": args.expiration,
+            "strikes": args.strikes,
+            "ticket_id": args.ticket_id,
+            "quantity": args.quantity,
+        }.items()
+        if value is not None
+    }
+    if not updates:
+        raise SystemExit("repair requires at least one replacement field")
+    candidate_expiration = updates.get("expiration", trade.get("expiration"))
+    candidate_strikes = updates.get("strikes", trade.get("strikes"))
+    validate_option_identity(candidate_expiration, candidate_strikes)
+    trade.update(updates)
+    trade.setdefault("notes", []).append(
+        {
+            "at": datetime.now().isoformat(),
+            "text": args.note or f"Journal identity repaired: {', '.join(sorted(updates))}",
+        }
+    )
     return trade
 
 
@@ -270,6 +309,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_close.add_argument("--note")
     p_close.add_argument("--json", action="store_true")
 
+    p_repair = sub.add_parser("repair", help="Repair incomplete option identity fields")
+    p_repair.add_argument("--id", required=True)
+    p_repair.add_argument("--expiration")
+    p_repair.add_argument("--strikes")
+    p_repair.add_argument("--ticket-id")
+    p_repair.add_argument("--quantity", type=float)
+    p_repair.add_argument("--note")
+    p_repair.add_argument("--json", action="store_true")
+
     p_list = sub.add_parser("list", help="List journaled trades")
     p_list.add_argument("--status", choices=["OPEN", "CLOSED", "ALL"], default="OPEN")
     p_list.add_argument("--json", action="store_true")
@@ -289,19 +337,26 @@ def main() -> None:
     args = parser.parse_args()
     state_file = Path(args.state_file)
 
-    if args.cmd in {"add", "close"}:
+    if args.cmd in {"add", "close", "repair"}:
         # Hold the journal lock across load-mutate-save so a concurrent
         # operator run or second manual command cannot interleave writes.
         with state_lock("journal"):
             state, con = load_backend(state_file, args.db)
-            trade = add_trade(state, args) if args.cmd == "add" else close_trade(state, args)
+            if args.cmd == "add":
+                trade = add_trade(state, args)
+            elif args.cmd == "close":
+                trade = close_trade(state, args)
+            else:
+                trade = repair_trade(state, args)
             save_backend(state_file, state, con)
         if args.json:
             print(json.dumps(trade, indent=2, default=str))
         elif args.cmd == "add":
             print(f"Added trade {trade['id']} ({trade['ticker']} {trade['strategy']})")
-        else:
+        elif args.cmd == "close":
             print(f"Closed trade {trade['id']}: realized P&L ${trade['realized_pnl']:,.2f}")
+        else:
+            print(f"Repaired trade {trade['id']} ({trade['expiration']} {trade['strikes']})")
         if con is not None:
             con.close()
         return

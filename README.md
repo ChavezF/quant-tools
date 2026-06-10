@@ -325,3 +325,39 @@ Do not bump in November.
 See the `mlops/quant-trading-toolkit` skill → "Extending the toolkit" section
 for the recipes: adding a new strategy, vol-regime tool, macro overlay,
 earnings backtester, position tracker, or daily-brief section.
+## Two-stage daily workflow
+
+Use the planning profile before the market is fully liquid:
+
+```bash
+python scripts/quant.py daily --profile planning
+```
+
+Planning creates research, risk, allocation-preview, alert, summary, and
+dashboard artifacts without creating or mutating execution tickets.
+
+Use the executable profile after quotes and positions have refreshed:
+
+```bash
+python scripts/quant.py daily --profile executable
+```
+
+Executable runs the shorter decision path and persists deduplicated `READY`
+tickets. Execution attribution starts only after an explicit submission:
+
+```bash
+python scripts/quant.py ticket-lifecycle \
+  --ticket-id QTK-... \
+  --set-status SUBMITTED \
+  --broker-order-id BROKER-... \
+  --submission-price 1.25
+```
+
+Repair an incomplete historical option trade explicitly:
+
+```bash
+python scripts/quant.py journal repair \
+  --id T20260610-001 \
+  --expiration 2026-07-17 \
+  --strikes 195/190
+```

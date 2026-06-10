@@ -22,7 +22,11 @@ def main() -> None:
     parser.add_argument("--status", nargs="+", choices=TICKET_LIFECYCLE_STATUSES)
     parser.add_argument("--active", action="store_true")
     parser.add_argument("--ticket-id")
-    parser.add_argument("--set-status", choices=("PENDING", "CANCELLED", "EXPIRED"))
+    parser.add_argument("--set-status", choices=TICKET_LIFECYCLE_STATUSES)
+    parser.add_argument("--broker-order-id")
+    parser.add_argument("--submitted-at")
+    parser.add_argument("--submission-price", type=float)
+    parser.add_argument("--submission-status")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -33,7 +37,15 @@ def main() -> None:
     try:
         changed = None
         if args.ticket_id:
-            changed = set_ticket_lifecycle(con, args.ticket_id, args.set_status)
+            changed = set_ticket_lifecycle(
+                con,
+                args.ticket_id,
+                args.set_status,
+                broker_order_id=args.broker_order_id,
+                submitted_at=args.submitted_at,
+                submission_price=args.submission_price,
+                submission_status=args.submission_status,
+            )
             if not changed:
                 raise SystemExit(f"Unknown ticket_id: {args.ticket_id}")
         statuses = list(ACTIVE_TICKET_STATUSES) if args.active else args.status

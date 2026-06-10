@@ -15,7 +15,7 @@ from storage import (
     connect,
     export_journal_state,
     fill_identity,
-    insert_position_snapshot,
+    record_position_snapshot,
     load_active_tickets,
     load_fills_for_reconciliation,
     record_reconciliation,
@@ -49,6 +49,8 @@ def sync_artifacts(
     fills: list[dict[str, Any]],
     lifecycle_events: list[dict[str, Any]] | None = None,
     *,
+    positions_available: bool = True,
+    position_source: str | None = None,
     pending_expiry_hours: float = 24,
     partial_review_hours: float = 4,
 ) -> dict[str, Any]:
@@ -57,7 +59,12 @@ def sync_artifacts(
         imported = {
             "trades": upsert_trades(con, journal.get("trades", [])),
             "tickets": upsert_tickets(con, tickets),
-            "positions": insert_position_snapshot(con, positions) if positions else 0,
+            "positions": record_position_snapshot(
+                con,
+                positions,
+                available=positions_available,
+                source=position_source,
+            ),
             "fills": upsert_fills(con, fills),
         }
         active_tickets = load_active_tickets(con)
@@ -71,6 +78,7 @@ def sync_artifacts(
             {"tickets": active_tickets},
             {
                 "positions": positions,
+                "positions_available": positions_available,
                 "fills": reconciliation_fills,
                 "lifecycle_events": lifecycle_events or [],
             },
@@ -88,7 +96,8 @@ def sync_artifacts(
         report["ticket_lifecycle"] = lifecycle_counts
         report["lifecycle_policy"] = lifecycle_policy
         report["summary"]["active_tickets"] = sum(
-            lifecycle_counts.get(status, 0) for status in ("PENDING", "PARTIAL")
+            lifecycle_counts.get(status, 0)
+            for status in ("READY", "SUBMITTED", "WORKING", "PARTIAL")
         )
         report["summary"]["expired_tickets"] = len(lifecycle_policy["expired_tickets"])
         report["summary"]["stale_partial_tickets"] = len(lifecycle_policy["stale_partial_tickets"])
@@ -123,7 +132,20 @@ def main() -> None:
     tickets = read_json(args.tickets).get("tickets", [])
     portfolio = read_json(args.portfolio)
     broker_snapshot = read_json(args.broker_snapshot)
-    positions = positions_from_portfolio(portfolio) or broker_snapshot.get("positions", [])
+    portfolio_has_positions = "positions" in portfolio.get("portfolio", {}) or "positions" in portfolio
+    broker_has_positions = bool(args.broker_snapshot) and "positions" in broker_snapshot
+    if portfolio_has_positions:
+        positions = positions_from_portfolio(portfolio)
+        positions_available = True
+        position_source = "portfolio"
+    elif broker_has_positions:
+        positions = broker_snapshot.get("positions", [])
+        positions_available = True
+        position_source = "broker_snapshot"
+    else:
+        positions = []
+        positions_available = False
+        position_source = None
     fills = broker_snapshot.get("fills", [])
     lifecycle_events = broker_snapshot.get("lifecycle_events", [])
     result = sync_artifacts(
@@ -133,6 +155,8 @@ def main() -> None:
         positions,
         fills,
         lifecycle_events,
+        positions_available=positions_available,
+        position_source=position_source,
         pending_expiry_hours=args.pending_expiry_hours,
         partial_review_hours=args.partial_review_hours,
     )

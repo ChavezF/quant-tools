@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def setup_key(value: dict[str, Any]) -> str:
@@ -51,6 +53,24 @@ def target_quantity(action: dict[str, Any], candidate: dict[str, Any]) -> float:
     return 1.0
 
 
+def session_expiry(issued_at: str) -> str:
+    try:
+        eastern = ZoneInfo("America/New_York")
+    except ZoneInfoNotFoundError:
+        # Windows Python installations do not always bundle IANA tzdata.
+        eastern = timezone(timedelta(hours=-4))
+    issued = datetime.fromisoformat(issued_at.replace("Z", "+00:00"))
+    if issued.tzinfo is None:
+        issued = issued.replace(tzinfo=eastern)
+    local = issued.astimezone(eastern)
+    expiry = local.replace(hour=16, minute=0, second=0, microsecond=0)
+    if local >= expiry:
+        expiry += timedelta(days=1)
+        while expiry.weekday() >= 5:
+            expiry += timedelta(days=1)
+    return expiry.isoformat()
+
+
 def build_ticket(action: dict[str, Any], batch_id: str = "") -> dict[str, Any]:
     candidate = action.get("candidate", {})
     execution = candidate.get("execution", {})
@@ -67,10 +87,13 @@ def build_ticket(action: dict[str, Any], batch_id: str = "") -> dict[str, Any]:
             batch_id,
         )
     )
+    issued_at = batch_id or datetime.now().astimezone().isoformat()
     return {
         "ticket_id": f"QTK-{hashlib.sha1(ticket_key.encode()).hexdigest()[:10].upper()}",
-        "issued_at": batch_id or None,
-        "lifecycle_status": "PENDING",
+        "issued_at": issued_at,
+        "execution_batch_id": batch_id or issued_at,
+        "expires_at": session_expiry(issued_at),
+        "lifecycle_status": "READY",
         "ticker": action.get("ticker"),
         "strategy": strategy,
         "decision": action.get("action_decision"),

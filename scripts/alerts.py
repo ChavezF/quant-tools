@@ -59,6 +59,16 @@ def journal_alerts(journal_state: dict[str, Any], profit_target_pct: float, dte_
         trade_id = trade.get("id")
         ticker = trade.get("ticker")
         strategy = trade.get("strategy")
+        if not trade.get("expiration") or not str(trade.get("strikes") or "").strip():
+            out.append(
+                alert(
+                    "HIGH",
+                    "incomplete_journal",
+                    f"Incomplete journal identity: {ticker} {strategy}",
+                    f"{trade_id} requires expiration and strikes; repair before mark or management",
+                    trade,
+                )
+            )
         pnl_pct = trade.get("unrealized_pnl_pct")
         if pnl_pct is not None and float(pnl_pct) >= profit_target_pct:
             out.append(alert(
@@ -125,6 +135,9 @@ def execution_exception_alerts(reconciliation: dict[str, Any] | None) -> list[di
     summary = report.get("summary", {})
     out = []
     for key, priority, title in (
+        ("missing_positions", "HIGH", "Journal trades missing at broker"),
+        ("partial_positions", "HIGH", "Journal trades partially represented at broker"),
+        ("unknown_positions", "MEDIUM", "Broker position state unavailable"),
         ("overfilled_tickets", "HIGH", "Overfilled execution tickets"),
         ("stale_partial_tickets", "HIGH", "Stale partial fills need review"),
         ("duplicate_active_setups", "MEDIUM", "Duplicate active execution setups"),

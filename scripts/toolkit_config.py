@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -147,6 +148,7 @@ def deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any
 
 
 def config_path(raw_path: str | None = None) -> Path:
+    raw_path = raw_path or os.environ.get("QUANT_CONFIG")
     if raw_path:
         path = Path(raw_path)
         return path if path.is_absolute() else PROJECT_ROOT / path
