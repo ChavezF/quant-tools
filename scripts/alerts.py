@@ -120,6 +120,53 @@ def model_health_alerts(
     return out
 
 
+def execution_exception_alerts(reconciliation: dict[str, Any] | None) -> list[dict[str, Any]]:
+    report = (reconciliation or {}).get("reconciliation", reconciliation or {})
+    summary = report.get("summary", {})
+    out = []
+    for key, priority, title in (
+        ("overfilled_tickets", "HIGH", "Overfilled execution tickets"),
+        ("stale_partial_tickets", "HIGH", "Stale partial fills need review"),
+        ("duplicate_active_setups", "MEDIUM", "Duplicate active execution setups"),
+        ("unmatched_fills", "MEDIUM", "Unmatched broker fills"),
+        ("unknown_effect_fills", "MEDIUM", "Unclassified opening/closing fills"),
+    ):
+        count = int(summary.get(key, 0) or 0)
+        if count:
+            out.append(
+                alert(
+                    priority,
+                    "execution_exception",
+                    title,
+                    f"{count} exception{'s' if count != 1 else ''} detected",
+                    {"metric": key, "count": count},
+                )
+            )
+    exit_count = int(summary.get("matched_exit_fills", 0) or 0)
+    if exit_count:
+        out.append(
+            alert(
+                "MEDIUM",
+                "broker_exit",
+                "Broker exits detected",
+                f"{exit_count} closing fill{'s' if exit_count != 1 else ''} awaiting journal review",
+                {"proposed_exit_updates": report.get("proposed_exit_updates", [])},
+            )
+        )
+    for event in report.get("lifecycle_events", []):
+        event_type = str(event.get("event_type") or "POSITION_EVENT")
+        out.append(
+            alert(
+                "HIGH" if event_type in {"ASSIGNMENT", "EXERCISE"} else "MEDIUM",
+                "position_event",
+                f"{event_type}: {event.get('ticker') or event.get('symbol')}",
+                str(event.get("description") or "Broker position lifecycle event"),
+                event,
+            )
+        )
+    return out
+
+
 def build_alerts(
     plan: dict[str, Any] | None,
     journal_state: dict[str, Any] | None,
@@ -128,6 +175,7 @@ def build_alerts(
     dte_warning: int,
     validation: dict[str, Any] | None = None,
     drift: dict[str, Any] | None = None,
+    reconciliation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     alerts = []
     if plan:
@@ -135,6 +183,7 @@ def build_alerts(
     if journal_state:
         alerts.extend(journal_alerts(journal_state, profit_target_pct, dte_warning))
     alerts.extend(model_health_alerts(validation, drift))
+    alerts.extend(execution_exception_alerts(reconciliation))
 
     priority_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     alerts.sort(key=lambda row: (priority_order.get(row["priority"], 9), row["kind"], row["title"]))
@@ -174,6 +223,7 @@ def main() -> None:
     ap.add_argument("--dte-warning", type=int, default=21)
     ap.add_argument("--validation")
     ap.add_argument("--drift")
+    ap.add_argument("--reconciliation")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -182,6 +232,11 @@ def main() -> None:
     journal_state = load_state(journal_path) if journal_path.exists() else None
     validation = json.loads(Path(args.validation).read_text()) if args.validation and Path(args.validation).exists() else None
     drift = json.loads(Path(args.drift).read_text()) if args.drift and Path(args.drift).exists() else None
+    reconciliation = (
+        json.loads(Path(args.reconciliation).read_text())
+        if args.reconciliation and Path(args.reconciliation).exists()
+        else None
+    )
     report = build_alerts(
         plan,
         journal_state,
@@ -190,6 +245,7 @@ def main() -> None:
         args.dte_warning,
         validation,
         drift,
+        reconciliation,
     )
     if args.json:
         print(json.dumps(report, indent=2, default=str))

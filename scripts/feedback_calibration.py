@@ -68,6 +68,7 @@ def build_feedback_report(
     *,
     current_min_score: float = 55.0,
     min_samples: int = 5,
+    execution_attribution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     analytics = build_analytics(state)
     score_floor, reason = recommended_min_score(
@@ -106,6 +107,8 @@ def build_feedback_report(
         "score_bands": analytics.get("by_score_band", {}),
         "strategy_adjustments": strategy_adjustments,
         "execution": execution_feedback(state.get("trades", [])),
+        "execution_attribution": execution_attribution or {},
+        "execution_adjustments": (execution_attribution or {}).get("strategy_adjustments", {}),
     }
 
 
@@ -128,14 +131,24 @@ def main() -> None:
     ap.add_argument("--journal", default=str(DEFAULT_STATE_FILE))
     ap.add_argument("--current-min-score", type=float, default=55.0)
     ap.add_argument("--min-samples", type=int, default=5)
+    ap.add_argument("--db")
     ap.add_argument("--output")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
+    execution_attribution = None
+    if args.db:
+        from execution_attribution import build_execution_attribution, load_execution_records
+
+        execution_attribution = build_execution_attribution(
+            load_execution_records(args.db),
+            min_samples=args.min_samples,
+        )
     report = build_feedback_report(
         load_state(Path(args.journal)),
         current_min_score=args.current_min_score,
         min_samples=args.min_samples,
+        execution_attribution=execution_attribution,
     )
     if args.output:
         Path(args.output).write_text(json.dumps(report, indent=2, default=str))

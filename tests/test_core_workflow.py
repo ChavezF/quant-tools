@@ -1,8 +1,10 @@
 import tempfile
 import unittest
+import sqlite3
 from argparse import Namespace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import sys
 
@@ -18,28 +20,51 @@ from data_reliability import quote_is_stale, retry_call, utc_now_iso
 from correlation_risk import correlation_penalty
 from execution_quality import execution_quality
 from execution_analytics import build_execution_analytics
+from execution_attribution import (
+    adjustment_for_summary,
+    build_execution_attribution,
+    load_execution_records,
+)
 from performance_profiles import build_profiles, lookup_profile
 from pretrade_check import RiskLimits, evaluate_report
 from scan_optimizer import parse_wing_widths, select_expirations
 from toolkit_config import deep_merge
 from trade_journal import add_trade, close_trade, default_state, journal_stats
-from action_plan import build_action_plan
+from action_plan import apply_performance_overlay, build_action_plan
 from adaptive_sizing import adaptive_size
 from alerts import build_alerts
 from broker_reconciliation import apply_journal_updates, build_reconciliation
 from dashboard import build_dashboard
+from daily_workflow import build_public_ingestion_cmd, build_storage_cmd
 from database_maintenance import backup_database, maintain_database, prune_backups
 from drift_monitor import build_drift_report
-from execution_tickets import build_tickets
+from execution_tickets import build_ticket_report, build_tickets
 from feedback_calibration import build_feedback_report
 from historical_analytics import build_analytics
 from opportunity_discovery import score_discovery_metrics
 from operator_summary import build_summary
 from portfolio_allocator import allocate_portfolio
+from public_fill_ingestion import build_snapshot, normalize_fills, normalize_lifecycle_events
 from scenario_stress import build_scenario_report
 from health_check import build_health_report
 from walk_forward_validation import build_walk_forward_report
-from storage import connect, export_journal_state, table_counts, upsert_tickets, upsert_trades
+from storage import (
+    apply_ticket_lifecycle,
+    apply_lifecycle_policy,
+    connect,
+    export_journal_state,
+    load_active_tickets,
+    load_fills_for_reconciliation,
+    list_tickets,
+    record_reconciliation,
+    set_ticket_lifecycle,
+    table_counts,
+    ticket_lifecycle_counts,
+    upsert_fills,
+    upsert_tickets,
+    upsert_trades,
+)
+from storage_sync import sync_artifacts
 
 
 def sample_scan_report():
@@ -87,6 +112,240 @@ def sample_scan_report():
 
 
 class CoreWorkflowTests(unittest.TestCase):
+    def test_public_history_normalizes_two_leg_bull_put(self):
+        transactions = [
+            {
+                "id": "TX-SHORT",
+                "timestamp": "2026-06-10T14:30:00+00:00",
+                "type": "TRADE",
+                "account_number": "A1",
+                "symbol": "SPY260717P00475000",
+                "security_type": "OPTION",
+                "side": "SELL",
+                "principal_amount": 120,
+                "quantity": 1,
+                "fees": 0.65,
+            },
+            {
+                "id": "TX-LONG",
+                "timestamp": "2026-06-10T14:30:00+00:00",
+                "type": "TRADE",
+                "account_number": "A1",
+                "symbol": "SPY260717P00470000",
+                "security_type": "OPTION",
+                "side": "BUY",
+                "principal_amount": -40,
+                "quantity": 1,
+                "fees": 0.65,
+            },
+        ]
+        fills = normalize_fills(transactions)
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0]["strategy"], "BULL_PUT")
+        self.assertEqual(fills[0]["ticker"], "SPY")
+        self.assertEqual(fills[0]["expiration"], "2026-07-17")
+        self.assertEqual(fills[0]["strikes"], "475/470")
+        self.assertEqual(fills[0]["net_credit"], 0.8)
+        self.assertEqual(len(fills[0]["legs"]), 2)
+        self.assertEqual(fills[0]["execution_effect"], "OPEN")
+        self.assertEqual(fills[0]["classification_confidence"], "MEDIUM")
+
+    def test_public_history_classifies_closing_bull_put_debit(self):
+        transactions = [
+            {
+                "id": "TX-CLOSE-SHORT",
+                "timestamp": "2026-06-10T15:30:00+00:00",
+                "type": "TRADE",
+                "account_number": "A1",
+                "symbol": "SPY260717P00475000",
+                "security_type": "OPTION",
+                "side": "BUY",
+                "principal_amount": -55,
+                "quantity": 1,
+                "fees": 0.65,
+            },
+            {
+                "id": "TX-CLOSE-LONG",
+                "timestamp": "2026-06-10T15:30:00+00:00",
+                "type": "TRADE",
+                "account_number": "A1",
+                "symbol": "SPY260717P00470000",
+                "security_type": "OPTION",
+                "side": "SELL",
+                "principal_amount": 15,
+                "quantity": 1,
+                "fees": 0.65,
+            },
+        ]
+        fill = normalize_fills(transactions)[0]
+        self.assertEqual(fill["strategy"], "BULL_PUT")
+        self.assertEqual(fill["strikes"], "475/470")
+        self.assertEqual(fill["execution_effect"], "CLOSE")
+        self.assertEqual(fill["net_credit"], -0.4)
+
+    def test_public_history_separates_assignment_and_expiration_events(self):
+        events = normalize_lifecycle_events(
+            [
+                {
+                    "id": "ASSIGN-1",
+                    "timestamp": "2026-06-10T20:00:00+00:00",
+                    "type": "POSITION_ADJUSTMENT",
+                    "sub_type": "MISC",
+                    "symbol": "SPY260717P00475000",
+                    "description": "Option assigned",
+                    "quantity": 1,
+                },
+                {
+                    "id": "EXPIRE-1",
+                    "timestamp": "2026-06-10T20:00:00+00:00",
+                    "type": "POSITION_ADJUSTMENT",
+                    "sub_type": "MISC",
+                    "symbol": "SPY260717P00470000",
+                    "description": "Option expired",
+                    "quantity": 1,
+                },
+            ]
+        )
+        self.assertEqual([event["event_type"] for event in events], ["ASSIGNMENT", "EXPIRATION"])
+
+    def test_public_history_keeps_partial_fills_at_different_times(self):
+        base = {
+            "type": "TRADE",
+            "account_number": "A1",
+            "symbol": "SPY260717P00475000",
+            "security_type": "OPTION",
+            "side": "SELL",
+            "principal_amount": 120,
+            "quantity": 1,
+            "fees": 0.65,
+        }
+        fills = normalize_fills(
+            [
+                {**base, "id": "TX-1", "timestamp": "2026-06-10T14:30:00+00:00"},
+                {**base, "id": "TX-2", "timestamp": "2026-06-10T14:31:00+00:00"},
+            ]
+        )
+        self.assertEqual(len(fills), 2)
+        self.assertNotEqual(fills[0]["fill_id"], fills[1]["fill_id"])
+        self.assertTrue(all(fill["strategy"] == "CSP" for fill in fills))
+
+    def test_public_snapshot_paginates_and_deduplicates_cursor_overlap(self):
+        class FakeClient:
+            def __init__(self):
+                self.requests = []
+
+            def get_history(self, request):
+                self.requests.append(request)
+                if request.next_token is None:
+                    return SimpleNamespace(
+                        transactions=[
+                            SimpleNamespace(
+                                id="OLD",
+                                timestamp=datetime(2026, 6, 10, 14, 0, tzinfo=timezone.utc),
+                                type="TRADE",
+                                sub_type="",
+                                account_number="A1",
+                                symbol="AAPL",
+                                security_type="EQUITY",
+                                side="BUY",
+                                description="",
+                                net_amount=-200,
+                                principal_amount=-200,
+                                quantity=1,
+                                direction="",
+                                fees=0,
+                            )
+                        ],
+                        next_token="page-2",
+                    )
+                return SimpleNamespace(
+                    transactions=[
+                        SimpleNamespace(
+                            id="NEW",
+                            timestamp=datetime(2026, 6, 10, 14, 5, tzinfo=timezone.utc),
+                            type="TRADE",
+                            sub_type="",
+                            account_number="A1",
+                            symbol="AAPL",
+                            security_type="EQUITY",
+                            side="BUY",
+                            description="",
+                            net_amount=-205,
+                            principal_amount=-205,
+                            quantity=1,
+                            direction="",
+                            fees=0,
+                        )
+                    ],
+                    next_token=None,
+                )
+
+            def get_portfolio(self):
+                return SimpleNamespace(
+                    positions=[
+                        SimpleNamespace(
+                            instrument=SimpleNamespace(symbol="AAPL", name="Apple", type="EQUITY"),
+                            quantity=2,
+                            current_value=410,
+                            last_price=SimpleNamespace(last_price=205),
+                            percent_of_portfolio=0.1,
+                        )
+                    ],
+                    buying_power=SimpleNamespace(
+                        buying_power=1000,
+                        cash_only_buying_power=900,
+                        options_buying_power=800,
+                    ),
+                )
+
+        client = FakeClient()
+        cursor = {
+            "last_timestamp": "2026-06-10T14:00:00+00:00",
+            "seen_transaction_ids": ["OLD"],
+        }
+        snapshot, new_cursor = build_snapshot(
+            client,
+            lambda **kwargs: SimpleNamespace(**kwargs),
+            cursor=cursor,
+            overlap_minutes=15,
+        )
+        self.assertEqual(snapshot["history"]["pages"], 2)
+        self.assertEqual(snapshot["history"]["new_transactions"], 1)
+        self.assertEqual([fill["transaction_ids"] for fill in snapshot["fills"]], [["NEW"]])
+        self.assertEqual(snapshot["positions"][0]["symbol"], "AAPL")
+        self.assertEqual(snapshot["options_bp"], 800)
+        self.assertEqual(client.requests[0].start.isoformat(), "2026-06-10T13:45:00+00:00")
+        self.assertEqual(new_cursor["last_timestamp"], "2026-06-10T14:05:00+00:00")
+        self.assertEqual(set(new_cursor["seen_transaction_ids"]), {"OLD", "NEW"})
+
+    def test_operator_commands_feed_public_snapshot_into_storage(self):
+        cfg = {
+            "journal": {"path": "state/trades.json"},
+            "storage": {"path": "state/quant_tools.db", "broker_snapshot": None},
+            "public_ingestion": {
+                "cursor_path": "state/public_fill_cursor.json",
+                "page_size": 50,
+                "max_pages": 25,
+                "overlap_minutes": 10,
+            },
+        }
+        snapshot = ROOT / "reports" / "run" / "public_broker_snapshot.json"
+        ingestion = build_public_ingestion_cmd(cfg, snapshot)
+        self.assertIn("public_fill_ingestion.py", ingestion[1])
+        self.assertEqual(ingestion[ingestion.index("--output") + 1], str(snapshot))
+        self.assertEqual(ingestion[ingestion.index("--page-size") + 1], "50")
+
+        args = Namespace(config=None, journal=None, broker_snapshot=None)
+        storage = build_storage_cmd(
+            cfg,
+            args,
+            ROOT / "reports" / "run",
+            ROOT / "reports" / "run" / "risk.json",
+            ROOT / "reports" / "run" / "tickets.json",
+            broker_snapshot_override=snapshot,
+        )
+        self.assertEqual(storage[storage.index("--broker-snapshot") + 1], str(snapshot))
+
     def test_osi_parsing(self):
         parts = parse_osi_parts("AAPL260116C00270000")
         self.assertEqual(parts["underlying"], "AAPL")
@@ -271,6 +530,37 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertIn("validation", kinds)
         self.assertIn("drift", kinds)
 
+    def test_alerts_include_execution_and_position_exceptions(self):
+        report = build_alerts(
+            None,
+            None,
+            min_score=68,
+            profit_target_pct=50,
+            dte_warning=21,
+            reconciliation={
+                "summary": {
+                    "overfilled_tickets": 1,
+                    "stale_partial_tickets": 1,
+                    "duplicate_active_setups": 1,
+                    "unmatched_fills": 1,
+                    "unknown_effect_fills": 1,
+                    "matched_exit_fills": 1,
+                },
+                "lifecycle_events": [
+                    {
+                        "event_type": "ASSIGNMENT",
+                        "ticker": "SPY",
+                        "description": "Option assigned",
+                    }
+                ],
+            },
+        )
+        kinds = {row["kind"] for row in report["alerts"]}
+        self.assertIn("execution_exception", kinds)
+        self.assertIn("broker_exit", kinds)
+        self.assertIn("position_event", kinds)
+        self.assertGreaterEqual(report["summary"]["high"], 3)
+
     def test_correlation_penalty_for_group_overlap(self):
         portfolio = {"portfolio": {"positions": [{"symbol": "AAPL", "current_value": 12000}]}}
         groups = {"mega_cap_tech": ["AAPL", "MSFT", "NVDA"]}
@@ -313,9 +603,63 @@ class CoreWorkflowTests(unittest.TestCase):
         tickets = build_tickets(plan)
         self.assertEqual(len(tickets), 1)
         self.assertEqual(tickets[0]["order_action"], "SELL_SPREAD_TO_OPEN")
+        self.assertEqual(tickets[0]["target_quantity"], 1.0)
         self.assertEqual(tickets[0]["strikes"], "475/470")
         self.assertEqual(tickets[0]["portfolio_allocation"]["rank"], 1)
         self.assertTrue(tickets[0]["ticket_id"].startswith("QTK-"))
+
+    def test_ticket_ids_are_distinct_across_plan_issuances(self):
+        action = {
+            "action_decision": "APPROVE",
+            "ticker": "SPY",
+            "strategy": "BULL_PUT",
+            "score": 72,
+            "candidate": {
+                "strategy": "BULL_PUT",
+                "expiration": "2026-07-17",
+                "short_strike": 475,
+                "long_strike": 470,
+                "execution": {},
+            },
+        }
+        first = build_tickets({"created_at": "2026-06-10T13:00:00+00:00", "actions": [action]})[0]
+        repeated = build_tickets({"created_at": "2026-06-10T13:00:00+00:00", "actions": [action]})[0]
+        later = build_tickets({"created_at": "2026-06-11T13:00:00+00:00", "actions": [action]})[0]
+        self.assertEqual(first["ticket_id"], repeated["ticket_id"])
+        self.assertNotEqual(first["ticket_id"], later["ticket_id"])
+        self.assertEqual(first["lifecycle_status"], "PENDING")
+
+    def test_ticket_generation_suppresses_equivalent_active_setup(self):
+        action = {
+            "action_decision": "APPROVE",
+            "ticker": "SPY",
+            "strategy": "BULL_PUT",
+            "score": 72,
+            "candidate": {
+                "strategy": "BULL_PUT",
+                "expiration": "2026-07-17",
+                "short_strike": 475,
+                "long_strike": 470,
+                "execution": {},
+            },
+        }
+        report = build_ticket_report(
+            {"created_at": "2026-06-10T13:00:00+00:00", "actions": [action]},
+            active_tickets=[
+                {
+                    "ticket_id": "QTK-ACTIVE",
+                    "ticker": "SPY",
+                    "strategy": "BULL_PUT",
+                    "expiration": "2026-07-17",
+                    "strikes": "475/470",
+                    "quantity": 1,
+                    "entry_credit": 1.2,
+                    "capital_at_risk": 380,
+                }
+            ],
+        )
+        self.assertEqual(report["tickets"], [])
+        self.assertEqual(report["suppressed_duplicates"][0]["active_ticket_ids"], ["QTK-ACTIVE"])
 
     def test_historical_analytics_tracks_expectancy_and_drawdown(self):
         state = {
@@ -386,6 +730,319 @@ class CoreWorkflowTests(unittest.TestCase):
                 self.assertEqual(counts["trades"], 1)
                 self.assertEqual(counts["tickets"], 1)
                 self.assertEqual(export_journal_state(con)["trades"][0]["status"], "CLOSED")
+                self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 2)
+            finally:
+                con.close()
+
+    def test_sqlite_migrates_existing_version_one_ticket_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "legacy.db"
+            legacy = sqlite3.connect(db_path)
+            try:
+                legacy.executescript(
+                    """
+                    CREATE TABLE tickets (
+                        ticket_id TEXT PRIMARY KEY,
+                        ticker TEXT,
+                        strategy TEXT,
+                        decision TEXT,
+                        expiration TEXT,
+                        payload_json TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO tickets VALUES (
+                        'QTK-LEGACY', 'SPY', 'CSP', 'APPROVE', '2026-07-17',
+                        '{"ticket_id":"QTK-LEGACY","ticker":"SPY","strategy":"CSP"}',
+                        '2026-06-10T12:00:00'
+                    );
+                    PRAGMA user_version = 1;
+                    """
+                )
+                legacy.commit()
+            finally:
+                legacy.close()
+
+            con = connect(db_path)
+            try:
+                self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 2)
+                ticket = load_active_tickets(con)[0]
+                self.assertEqual(ticket["ticket_id"], "QTK-LEGACY")
+                self.assertEqual(ticket["lifecycle_status"], "PENDING")
+                self.assertEqual(ticket["target_quantity"], 1.0)
+            finally:
+                con.close()
+
+    def test_ticket_lifecycle_completes_across_separate_sync_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "quant.db"
+            ticket = {
+                "ticket_id": "QTK-LIFECYCLE",
+                "issued_at": "2026-06-10T13:00:00+00:00",
+                "lifecycle_status": "PENDING",
+                "ticker": "SPY",
+                "strategy": "CSP",
+                "expiration": "2026-07-17",
+                "strikes": "475",
+                "target_quantity": 2,
+                "limit_credit": 1.20,
+            }
+
+            con = connect(db_path)
+            try:
+                upsert_tickets(con, [ticket])
+                upsert_fills(
+                    con,
+                    [
+                        {
+                            "fill_id": "F-DAY-1",
+                            "ticker": "SPY",
+                            "strategy": "CSP",
+                            "expiration": "2026-07-17",
+                            "strikes": "475",
+                            "quantity": 1,
+                            "net_credit": 1.18,
+                            "filled_at": "2026-06-10T14:00:00+00:00",
+                        }
+                    ],
+                )
+                active = load_active_tickets(con)
+                fills = load_fills_for_reconciliation(con, ["QTK-LIFECYCLE"], ["F-DAY-1"])
+                first_report = build_reconciliation(
+                    {"trades": []},
+                    {"tickets": active},
+                    {"positions": [], "fills": fills},
+                )
+                apply_ticket_lifecycle(con, first_report["ticket_matches"])
+                self.assertEqual(ticket_lifecycle_counts(con), {"PARTIAL": 1})
+            finally:
+                con.close()
+
+            con = connect(db_path)
+            try:
+                upsert_fills(
+                    con,
+                    [
+                        {
+                            "fill_id": "F-DAY-2",
+                            "ticker": "SPY",
+                            "strategy": "CSP",
+                            "expiration": "2026-07-17",
+                            "strikes": "475",
+                            "quantity": 1,
+                            "net_credit": 1.22,
+                            "filled_at": "2026-06-11T14:00:00+00:00",
+                        }
+                    ],
+                )
+                active = load_active_tickets(con)
+                self.assertEqual([row["ticket_id"] for row in active], ["QTK-LIFECYCLE"])
+                fills = load_fills_for_reconciliation(con, ["QTK-LIFECYCLE"], ["F-DAY-2"])
+                second_report = build_reconciliation(
+                    {"trades": []},
+                    {"tickets": active},
+                    {"positions": [], "fills": fills},
+                )
+                match = second_report["ticket_matches"][0]
+                self.assertEqual(match["status"], "MATCHED")
+                self.assertEqual(match["fill_ids"], ["F-DAY-1", "F-DAY-2"])
+                self.assertEqual(match["fill_price"], 1.2)
+                apply_ticket_lifecycle(con, second_report["ticket_matches"])
+                self.assertEqual(ticket_lifecycle_counts(con), {"FILLED": 1})
+                self.assertEqual(load_active_tickets(con), [])
+            finally:
+                con.close()
+
+    def test_storage_sync_reconciles_outstanding_ticket_without_ticket_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "quant.db"
+            ticket = {
+                "ticket_id": "QTK-SYNC",
+                "issued_at": "2026-06-10T13:00:00+00:00",
+                "ticker": "SPY",
+                "strategy": "CSP",
+                "expiration": "2026-07-17",
+                "strikes": "475",
+                "target_quantity": 2,
+                "limit_credit": 1.20,
+            }
+            first = sync_artifacts(
+                db_path,
+                {"trades": []},
+                [ticket],
+                [],
+                [
+                    {
+                        "fill_id": "F-SYNC-1",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "expiration": "2026-07-17",
+                        "strikes": "475",
+                        "quantity": 1,
+                        "net_credit": 1.18,
+                    }
+                ],
+            )
+            self.assertEqual(first["ticket_lifecycle"], {"PARTIAL": 1})
+
+            second = sync_artifacts(
+                db_path,
+                {"trades": []},
+                [],
+                [],
+                [
+                    {
+                        "fill_id": "F-SYNC-2",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "expiration": "2026-07-17",
+                        "strikes": "475",
+                        "quantity": 1,
+                        "net_credit": 1.22,
+                    }
+                ],
+            )
+            self.assertEqual(second["ticket_lifecycle"], {"FILLED": 1})
+            match = second["reconciliation"]["ticket_matches"][0]
+            self.assertEqual(match["fill_ids"], ["F-SYNC-1", "F-SYNC-2"])
+            self.assertEqual(match["fill_price"], 1.2)
+
+    def test_new_fill_completes_old_pending_ticket_before_expiry_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = sync_artifacts(
+                Path(tmp) / "quant.db",
+                {"trades": []},
+                [
+                    {
+                        "ticket_id": "QTK-OLD-FILL",
+                        "issued_at": "2026-06-01T12:00:00+00:00",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "expiration": "2026-07-17",
+                        "strikes": "475",
+                        "target_quantity": 1,
+                    }
+                ],
+                [],
+                [
+                    {
+                        "fill_id": "F-OLD-FILL",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "expiration": "2026-07-17",
+                        "strikes": "475",
+                        "quantity": 1,
+                        "net_credit": 1.2,
+                    }
+                ],
+                pending_expiry_hours=1,
+            )
+            self.assertEqual(result["ticket_lifecycle"], {"FILLED": 1})
+            self.assertEqual(result["reconciliation"]["summary"]["expired_tickets"], 0)
+
+    def test_ticket_lifecycle_can_be_cancelled_and_reopened(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            con = connect(Path(tmp) / "quant.db")
+            try:
+                upsert_tickets(
+                    con,
+                    [
+                        {
+                            "ticket_id": "QTK-CANCEL",
+                            "ticker": "SPY",
+                            "strategy": "CSP",
+                            "target_quantity": 1,
+                        }
+                    ],
+                )
+                self.assertTrue(set_ticket_lifecycle(con, "QTK-CANCEL", "CANCELLED"))
+                self.assertEqual(list_tickets(con, ["CANCELLED"])[0]["lifecycle_status"], "CANCELLED")
+                self.assertEqual(load_active_tickets(con), [])
+                self.assertTrue(set_ticket_lifecycle(con, "QTK-CANCEL", "PENDING"))
+                self.assertEqual(load_active_tickets(con)[0]["ticket_id"], "QTK-CANCEL")
+            finally:
+                con.close()
+
+    def test_lifecycle_policy_expires_pending_but_preserves_stale_partial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            con = connect(Path(tmp) / "quant.db")
+            try:
+                upsert_tickets(
+                    con,
+                    [
+                        {
+                            "ticket_id": "QTK-STALE-PENDING",
+                            "issued_at": "2026-06-08T12:00:00+00:00",
+                            "ticker": "SPY",
+                            "strategy": "CSP",
+                            "expiration": "2026-07-17",
+                            "strikes": "475",
+                        },
+                        {
+                            "ticket_id": "QTK-STALE-PARTIAL",
+                            "issued_at": "2026-06-09T12:00:00+00:00",
+                            "lifecycle_status": "PARTIAL",
+                            "filled_quantity": 1,
+                            "target_quantity": 2,
+                            "ticker": "QQQ",
+                            "strategy": "CSP",
+                            "expiration": "2026-07-17",
+                            "strikes": "450",
+                        },
+                    ],
+                )
+                con.execute(
+                    "UPDATE tickets SET lifecycle_status='PARTIAL', filled_quantity=1 WHERE ticket_id='QTK-STALE-PARTIAL'"
+                )
+                con.commit()
+                policy = apply_lifecycle_policy(
+                    con,
+                    pending_expiry_hours=24,
+                    partial_review_hours=4,
+                    now=datetime(2026, 6, 10, 16, 0, tzinfo=timezone.utc),
+                )
+                self.assertEqual(
+                    [row["ticket_id"] for row in policy["expired_tickets"]],
+                    ["QTK-STALE-PENDING"],
+                )
+                self.assertEqual(
+                    [row["ticket_id"] for row in policy["stale_partial_tickets"]],
+                    ["QTK-STALE-PARTIAL"],
+                )
+                self.assertEqual(ticket_lifecycle_counts(con), {"EXPIRED": 1, "PARTIAL": 1})
+            finally:
+                con.close()
+
+    def test_lifecycle_policy_reports_duplicate_active_setups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            con = connect(Path(tmp) / "quant.db")
+            try:
+                base = {
+                    "issued_at": "2026-06-10T12:00:00+00:00",
+                    "ticker": "SPY",
+                    "strategy": "BULL_PUT",
+                    "expiration": "2026-07-17",
+                    "strikes": "475/470",
+                    "quantity": 1,
+                    "entry_credit": 1.2,
+                    "capital_at_risk": 380,
+                }
+                upsert_tickets(
+                    con,
+                    [
+                        {**base, "ticket_id": "QTK-DUP-1"},
+                        {**base, "ticket_id": "QTK-DUP-2"},
+                    ],
+                )
+                policy = apply_lifecycle_policy(
+                    con,
+                    pending_expiry_hours=24,
+                    partial_review_hours=4,
+                    now=datetime(2026, 6, 10, 13, 0, tzinfo=timezone.utc),
+                )
+                duplicate = policy["duplicate_active_setups"][0]
+                self.assertEqual(duplicate["count"], 2)
+                self.assertEqual(duplicate["ticket_ids"], ["QTK-DUP-1", "QTK-DUP-2"])
+                self.assertEqual(ticket_lifecycle_counts(con), {"PENDING": 2})
             finally:
                 con.close()
 
@@ -627,6 +1284,265 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertEqual(partial["summary"]["partial_positions"], 1)
         self.assertEqual(partial["summary"]["position_exceptions"], 1)
 
+    def test_reconciliation_aggregates_partial_fills_by_target_quantity(self):
+        tickets = {
+            "tickets": [
+                {
+                    "ticket_id": "QTK-2",
+                    "ticker": "SPY",
+                    "strategy": "BULL_PUT",
+                    "expiration": "2026-07-17",
+                    "strikes": "475/470",
+                    "target_quantity": 2,
+                    "limit_credit": 1.10,
+                }
+            ]
+        }
+        fills = [
+            {
+                "fill_id": "F1",
+                "ticker": "SPY",
+                "strategy": "BULL_PUT",
+                "expiration": "2026-07-17",
+                "strikes": "475/470",
+                "quantity": 1,
+                "net_credit": 1.08,
+                "filled_at": "2026-06-10T14:30:00+00:00",
+            },
+            {
+                "fill_id": "F2",
+                "ticker": "SPY",
+                "strategy": "BULL_PUT",
+                "expiration": "2026-07-17",
+                "strikes": "475/470",
+                "quantity": 1,
+                "net_credit": 1.16,
+                "filled_at": "2026-06-10T14:31:00+00:00",
+            },
+        ]
+        report = build_reconciliation({"trades": []}, tickets, {"positions": [], "fills": fills})
+        match = report["ticket_matches"][0]
+        self.assertEqual(match["status"], "MATCHED")
+        self.assertEqual(match["fill_id"], "F1")
+        self.assertEqual(match["fill_ids"], ["F1", "F2"])
+        self.assertEqual(match["filled_quantity"], 2)
+        self.assertEqual(match["fill_price"], 1.12)
+        self.assertEqual(report["summary"]["unmatched_fills"], 0)
+
+    def test_reconciliation_keeps_incomplete_ticket_partial(self):
+        journal = {
+            "trades": [
+                {
+                    "id": "T-PARTIAL",
+                    "ticket_id": "QTK-3",
+                    "status": "OPEN",
+                    "ticker": "SPY",
+                    "strategy": "CSP",
+                }
+            ]
+        }
+        tickets = {
+            "tickets": [
+                {
+                    "ticket_id": "QTK-3",
+                    "ticker": "SPY",
+                    "strategy": "CSP",
+                    "expiration": "2026-07-17",
+                    "strikes": "475",
+                    "target_quantity": 2,
+                    "limit_credit": 1.20,
+                }
+            ]
+        }
+        broker = {
+            "positions": [],
+            "fills": [
+                {
+                    "fill_id": "F-PARTIAL",
+                    "ticker": "SPY",
+                    "strategy": "CSP",
+                    "expiration": "2026-07-17",
+                    "strikes": "475",
+                    "quantity": 1,
+                    "net_credit": 1.22,
+                }
+            ],
+        }
+        report = build_reconciliation(journal, tickets, broker)
+        match = report["ticket_matches"][0]
+        self.assertEqual(match["status"], "PARTIAL")
+        self.assertEqual(match["remaining_quantity"], 1)
+        self.assertEqual(report["summary"]["partial_tickets"], 1)
+        self.assertEqual(report["summary"]["matched_tickets"], 0)
+        self.assertEqual(report["proposed_journal_updates"], [])
+
+    def test_reconciliation_routes_closing_fill_to_open_trade(self):
+        journal = {
+            "trades": [
+                {
+                    "id": "T-CLOSE",
+                    "ticket_id": "QTK-OPEN",
+                    "status": "OPEN",
+                    "ticker": "SPY",
+                    "strategy": "BULL_PUT",
+                    "expiration": "2026-07-17",
+                    "strikes": "475/470",
+                    "quantity": 1,
+                    "entry_credit": 1.2,
+                    "capital_at_risk": 380,
+                }
+            ]
+        }
+        close_fill = {
+            "fill_id": "F-CLOSE",
+            "ticker": "SPY",
+            "strategy": "BULL_PUT",
+            "expiration": "2026-07-17",
+            "strikes": "475/470",
+            "quantity": 1,
+            "net_credit": -0.4,
+            "fees": 1.3,
+            "filled_at": "2026-06-10T15:30:00+00:00",
+            "execution_effect": "CLOSE",
+            "classification_confidence": "MEDIUM",
+        }
+        report = build_reconciliation(
+            journal,
+            {
+                "tickets": [
+                    {
+                        "ticket_id": "QTK-NEW",
+                        "ticker": "SPY",
+                        "strategy": "BULL_PUT",
+                        "expiration": "2026-07-17",
+                        "strikes": "475/470",
+                    }
+                ]
+            },
+            {"positions": [], "fills": [close_fill]},
+        )
+        self.assertEqual(report["ticket_matches"][0]["status"], "UNMATCHED")
+        self.assertEqual(report["summary"]["matched_exit_fills"], 1)
+        self.assertEqual(report["summary"]["unmatched_fills"], 0)
+        exit_match = report["trade_exit_matches"][0]
+        self.assertEqual(exit_match["trade_id"], "T-CLOSE")
+        self.assertEqual(exit_match["exit_price"], 0.4)
+        proposal = report["proposed_exit_updates"][0]
+        self.assertEqual(proposal["set"]["exit_debit"], 0.4)
+        self.assertEqual(proposal["set"]["status"], "CLOSED")
+        self.assertEqual(proposal["set"]["realized_pnl"], 78.7)
+        self.assertEqual(proposal["set"]["realized_return_pct"], 20.71)
+        self.assertFalse(proposal["apply_automatically"])
+
+    def test_partial_closing_fill_does_not_propose_full_trade_close(self):
+        report = build_reconciliation(
+            {
+                "trades": [
+                    {
+                        "id": "T-PARTIAL-EXIT",
+                        "status": "OPEN",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "expiration": "2026-07-17",
+                        "strikes": "475",
+                        "quantity": 2,
+                        "entry_credit": 1.2,
+                    }
+                ]
+            },
+            {"tickets": []},
+            {
+                "positions": [],
+                "fills": [
+                    {
+                        "fill_id": "F-PARTIAL-EXIT",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "expiration": "2026-07-17",
+                        "strikes": "475",
+                        "quantity": 1,
+                        "net_credit": -0.4,
+                        "execution_effect": "CLOSE",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(report["trade_exit_matches"][0]["status"], "CLOSE_PARTIAL")
+        self.assertEqual(report["proposed_exit_updates"], [])
+
+    def test_reconciliation_flags_exact_ticket_overfill(self):
+        report = build_reconciliation(
+            {"trades": []},
+            {
+                "tickets": [
+                    {
+                        "ticket_id": "QTK-OVER",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "target_quantity": 1,
+                    }
+                ]
+            },
+            {
+                "positions": [],
+                "fills": [
+                    {
+                        "fill_id": "F-OVER-1",
+                        "ticket_id": "QTK-OVER",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "quantity": 1,
+                        "price": 1.2,
+                    },
+                    {
+                        "fill_id": "F-OVER-2",
+                        "ticket_id": "QTK-OVER",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "quantity": 1,
+                        "price": 1.25,
+                    },
+                ],
+            },
+        )
+        self.assertEqual(report["ticket_matches"][0]["status"], "OVERFILLED")
+        self.assertEqual(report["ticket_matches"][0]["filled_quantity"], 2)
+        self.assertEqual(report["summary"]["overfilled_tickets"], 1)
+        self.assertEqual(report["summary"]["matched_tickets"], 1)
+
+    def test_reconciliation_never_reassigns_fill_owned_by_another_ticket(self):
+        report = build_reconciliation(
+            {"trades": []},
+            {
+                "tickets": [
+                    {
+                        "ticket_id": "QTK-NEW",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "expiration": "2026-07-17",
+                        "strikes": "475",
+                    }
+                ]
+            },
+            {
+                "positions": [],
+                "fills": [
+                    {
+                        "fill_id": "F-OWNED",
+                        "ticket_id": "QTK-OLD",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "expiration": "2026-07-17",
+                        "strikes": "475",
+                        "quantity": 1,
+                        "price": 1.2,
+                    }
+                ],
+            },
+        )
+        self.assertEqual(report["ticket_matches"][0]["status"], "UNMATCHED")
+        self.assertEqual(report["summary"]["unmatched_fills"], 1)
+
     def test_reconciliation_applies_journal_updates_explicitly(self):
         journal = {
             "trades": [
@@ -677,6 +1593,192 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertEqual(report["summary"]["fill_rate"], 100.0)
         self.assertEqual(report["summary"]["avg_credit_improvement"], -0.115)
         self.assertEqual(report["summary"]["floor_violations"], 1)
+
+    def test_execution_analytics_reports_quantity_fill_rate(self):
+        tickets = {
+            "tickets": [
+                {
+                    "ticket_id": "QTK-P",
+                    "ticker": "SPY",
+                    "strategy": "CSP",
+                    "target_quantity": 2,
+                    "limit_credit": 1.2,
+                    "do_not_chase_below": 1.1,
+                    "execution_grade": "B",
+                }
+            ]
+        }
+        reconciliation = {
+            "ticket_matches": [
+                {
+                    "ticket_id": "QTK-P",
+                    "status": "PARTIAL",
+                    "target_quantity": 2,
+                    "filled_quantity": 1,
+                    "fill_count": 1,
+                    "fill_price": 1.22,
+                }
+            ]
+        }
+        report = build_execution_analytics(tickets, reconciliation)
+        self.assertEqual(report["summary"]["fill_rate"], 0.0)
+        self.assertEqual(report["summary"]["quantity_fill_rate"], 50.0)
+        self.assertEqual(report["summary"]["partial"], 1)
+        self.assertEqual(report["by_strategy"]["CSP"]["quantity_fill_rate"], 50.0)
+
+    def test_execution_analytics_tracks_fees_delay_and_persistent_ticket_matches(self):
+        reconciliation = {
+            "ticket_matches": [
+                {
+                    "ticket_id": "QTK-OLD",
+                    "ticker": "SPY",
+                    "strategy": "CSP",
+                    "status": "MATCHED",
+                    "target_quantity": 1,
+                    "filled_quantity": 1,
+                    "planned_limit_credit": 1.2,
+                    "fill_price": 1.22,
+                    "fees": 1.3,
+                    "fill_delay_seconds": 90,
+                }
+            ]
+        }
+        report = build_execution_analytics({"tickets": []}, reconciliation)
+        self.assertEqual(report["summary"]["tickets"], 1)
+        self.assertEqual(report["summary"]["total_fees"], 1.3)
+        self.assertEqual(report["summary"]["avg_fill_delay_seconds"], 90.0)
+        self.assertEqual(report["summary"]["avg_credit_improvement"], 0.02)
+
+    def test_execution_attribution_requires_samples_and_caps_penalty(self):
+        insufficient = adjustment_for_summary(
+            {
+                "count": 4,
+                "fill_rate": 0,
+                "avg_credit_improvement": -1,
+                "fees_per_contract": 10,
+                "avg_fill_delay_seconds": 7200,
+            },
+            min_samples=5,
+        )
+        self.assertEqual(insufficient["signal"], "INSUFFICIENT")
+        self.assertEqual(insufficient["score_adjustment"], 0)
+
+        throttled = adjustment_for_summary(
+            {
+                "count": 10,
+                "fill_rate": 20,
+                "avg_credit_improvement": -0.5,
+                "fees_per_contract": 10,
+                "avg_fill_delay_seconds": 7200,
+            },
+            min_samples=5,
+        )
+        self.assertEqual(throttled["signal"], "THROTTLE")
+        self.assertEqual(throttled["score_adjustment"], -5)
+        self.assertEqual(throttled["size_multiplier"], 0.75)
+
+    def test_execution_attribution_uses_latest_ticket_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "quant.db"
+            con = connect(db_path)
+            try:
+                record_reconciliation(
+                    con,
+                    {
+                        "created_at": "2026-06-01T10:00:00Z",
+                        "ticket_matches": [
+                            {
+                                "ticket_id": "QTK-1",
+                                "ticker": "SPY",
+                                "strategy": "BULL_PUT",
+                                "status": "PARTIAL",
+                                "target_quantity": 2,
+                                "filled_quantity": 1,
+                                "planned_limit_credit": 1.2,
+                                "fill_price": 1.15,
+                                "fees": 1.0,
+                            }
+                        ],
+                    },
+                )
+                record_reconciliation(
+                    con,
+                    {
+                        "created_at": "2026-06-01T10:05:00Z",
+                        "ticket_matches": [
+                            {
+                                "ticket_id": "QTK-1",
+                                "ticker": "SPY",
+                                "strategy": "BULL_PUT",
+                                "status": "MATCHED",
+                                "target_quantity": 2,
+                                "filled_quantity": 2,
+                                "planned_limit_credit": 1.2,
+                                "fill_price": 1.18,
+                                "fees": 2.0,
+                            }
+                        ],
+                    },
+                )
+            finally:
+                con.close()
+
+            records = load_execution_records(db_path)
+            report = build_execution_attribution(records, min_samples=1)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["status"], "MATCHED")
+            self.assertEqual(report["summary"]["quantity_fill_rate"], 100.0)
+            self.assertEqual(report["summary"]["fees_per_contract"], 1.0)
+
+    def test_action_plan_applies_execution_attribution(self):
+        limits = RiskLimits(account_nav=30000)
+        baseline = build_action_plan(sample_scan_report(), None, {"trades": []}, limits)
+        attribution = {
+            "strategy_adjustments": {
+                "BULL_PUT": {
+                    "score_adjustment": -4,
+                    "size_multiplier": 0.75,
+                    "signal": "THROTTLE",
+                    "sample_size": 10,
+                }
+            }
+        }
+        adjusted = build_action_plan(
+            sample_scan_report(),
+            None,
+            {"trades": []},
+            limits,
+            execution_attribution=attribution,
+        )
+        before = next(row for row in baseline["actions"] if row["strategy"] == "BULL_PUT")
+        after = next(row for row in adjusted["actions"] if row["strategy"] == "BULL_PUT")
+        self.assertEqual(after["score"], before["score"] - 4)
+        self.assertLess(after["action_size_multiplier"], before["action_size_multiplier"])
+        self.assertEqual(after["execution_attribution"]["signal"], "THROTTLE")
+
+    def test_execution_attribution_never_overrides_hard_rejection(self):
+        rejected = apply_performance_overlay(
+            {
+                "ticker": "SPY",
+                "strategy": "BULL_PUT",
+                "risk_decision": "REJECT",
+                "size_multiplier": 0,
+                "score": 70,
+                "checks": [{"ok": False, "severity": "hard"}],
+            },
+            {},
+            feedback={
+                "execution_adjustments": {
+                    "BULL_PUT": {
+                        "score_adjustment": 5,
+                        "size_multiplier": 1.05,
+                        "signal": "BOOST",
+                    }
+                }
+            },
+        )
+        self.assertEqual(rejected["action_decision"], "REJECT")
+        self.assertEqual(rejected["action_size_multiplier"], 0)
 
     def test_dashboard_renders_core_sections(self):
         plan = {

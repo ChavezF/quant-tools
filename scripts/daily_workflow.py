@@ -122,6 +122,8 @@ def build_feedback_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[st
         str(SCRIPTS_DIR / "feedback_calibration.py"),
         "--journal",
         journal_path(cfg, args),
+        "--db",
+        storage_db_path(cfg),
         "--current-min-score",
         str(args.min_score if args.min_score is not None else cfg["risk_limits"]["min_score"]),
         "--min-samples",
@@ -187,6 +189,7 @@ def build_plan_cmd(cfg: dict[str, Any], args: argparse.Namespace, scan_report: P
         PY, str(SCRIPTS_DIR / "action_plan.py"),
         *(["--config", args.config] if args.config else []),
         "--candidates", str(scan_report),
+        "--db", storage_db_path(cfg),
         "--account-nav", str(args.account_nav if args.account_nav is not None else risk_cfg["account_nav"]),
         "--max-trade-risk-pct", str(args.max_trade_risk_pct if args.max_trade_risk_pct is not None else risk_cfg["max_trade_risk_pct"]),
         "--max-trade-bp-pct", str(args.max_trade_bp_pct if args.max_trade_bp_pct is not None else risk_cfg["max_trade_bp_pct"]),
@@ -244,7 +247,12 @@ def build_brief_cmd(args: argparse.Namespace, watchlist: list[str] | None) -> li
     return cmd
 
 
-def build_alerts_cmd(cfg: dict[str, Any], args: argparse.Namespace, plan_report: Path) -> list[str]:
+def build_alerts_cmd(
+    cfg: dict[str, Any],
+    args: argparse.Namespace,
+    plan_report: Path,
+    reconciliation_report: Path | None = None,
+) -> list[str]:
     alert_cfg = cfg.get("alerts", {})
     journal = args.journal or cfg.get("journal", {}).get("path")
     cmd = [
@@ -259,11 +267,29 @@ def build_alerts_cmd(cfg: dict[str, Any], args: argparse.Namespace, plan_report:
     ]
     if journal:
         cmd += ["--journal", resolve_project_path(journal)]
+    if reconciliation_report:
+        cmd += ["--reconciliation", str(reconciliation_report)]
     return cmd
 
 
-def build_tickets_cmd(plan_report: Path) -> list[str]:
-    return [PY, str(SCRIPTS_DIR / "execution_tickets.py"), "--plan", str(plan_report), "--json"]
+def build_tickets_cmd(cfg: dict[str, Any], plan_report: Path) -> list[str]:
+    lifecycle_cfg = cfg.get("execution_lifecycle", {})
+    cmd = [
+        PY,
+        str(SCRIPTS_DIR / "execution_tickets.py"),
+        "--plan",
+        str(plan_report),
+        "--db",
+        storage_db_path(cfg),
+        "--pending-expiry-hours",
+        str(lifecycle_cfg.get("pending_expiry_hours", 24)),
+        "--partial-review-hours",
+        str(lifecycle_cfg.get("partial_review_hours", 4)),
+        "--json",
+    ]
+    if not bool(lifecycle_cfg.get("suppress_duplicate_tickets", True)):
+        cmd += ["--allow-duplicates"]
+    return cmd
 
 
 def build_dashboard_cmd(run_dir: Path) -> list[str]:
@@ -280,8 +306,10 @@ def build_storage_cmd(
     run_dir: Path,
     risk_report: Path,
     tickets_report: Path,
+    broker_snapshot_override: Path | None = None,
 ) -> list[str]:
     storage_cfg = cfg.get("storage", {})
+    lifecycle_cfg = cfg.get("execution_lifecycle", {})
     cmd = [
         PY,
         str(SCRIPTS_DIR / "storage_sync.py"),
@@ -293,12 +321,37 @@ def build_storage_cmd(
         str(tickets_report),
         "--portfolio",
         str(risk_report),
+        "--pending-expiry-hours",
+        str(lifecycle_cfg.get("pending_expiry_hours", 24)),
+        "--partial-review-hours",
+        str(lifecycle_cfg.get("partial_review_hours", 4)),
         "--json",
     ]
-    broker_snapshot = args.broker_snapshot or storage_cfg.get("broker_snapshot")
+    broker_snapshot = broker_snapshot_override or args.broker_snapshot or storage_cfg.get("broker_snapshot")
     if broker_snapshot:
-        cmd += ["--broker-snapshot", resolve_project_path(broker_snapshot)]
+        resolved = str(broker_snapshot) if isinstance(broker_snapshot, Path) else resolve_project_path(broker_snapshot)
+        cmd += ["--broker-snapshot", resolved]
     return cmd
+
+
+def build_public_ingestion_cmd(cfg: dict[str, Any], snapshot_path: Path) -> list[str]:
+    ingestion_cfg = cfg.get("public_ingestion", {})
+    return [
+        PY,
+        str(SCRIPTS_DIR / "public_fill_ingestion.py"),
+        "--cursor",
+        resolve_project_path(ingestion_cfg.get("cursor_path"))
+        or str(PROJECT_ROOT / "state" / "public_fill_cursor.json"),
+        "--output",
+        str(snapshot_path),
+        "--page-size",
+        str(ingestion_cfg.get("page_size", 100)),
+        "--max-pages",
+        str(ingestion_cfg.get("max_pages", 100)),
+        "--overlap-minutes",
+        str(ingestion_cfg.get("overlap_minutes", 15)),
+        "--json",
+    ]
 
 
 def build_execution_analytics_cmd(tickets_report: Path, reconciliation_report: Path) -> list[str]:
@@ -309,6 +362,18 @@ def build_execution_analytics_cmd(tickets_report: Path, reconciliation_report: P
         str(tickets_report),
         "--reconciliation",
         str(reconciliation_report),
+        "--json",
+    ]
+
+
+def build_execution_history_cmd(cfg: dict[str, Any]) -> list[str]:
+    return [
+        PY,
+        str(SCRIPTS_DIR / "execution_attribution.py"),
+        "--db",
+        storage_db_path(cfg),
+        "--min-samples",
+        str(cfg.get("feedback", {}).get("min_samples", 5)),
         "--json",
     ]
 
@@ -390,6 +455,12 @@ def main() -> None:
 
     cfg = load_config(args.config)
     storage_enabled = bool(cfg.get("storage", {}).get("enabled", True)) and not args.skip_storage
+    configured_broker_snapshot = args.broker_snapshot or cfg.get("storage", {}).get("broker_snapshot")
+    public_ingestion_enabled = (
+        storage_enabled
+        and bool(cfg.get("public_ingestion", {}).get("enabled", False))
+        and not configured_broker_snapshot
+    )
     operations = cfg.get("operations", {})
     backup_enabled = storage_enabled and bool(operations.get("backup_on_operator", True))
     health_enabled = bool(operations.get("health_check_on_operator", True))
@@ -412,6 +483,7 @@ def main() -> None:
     scenario_report = run_dir / "scenario_stress.json"
     plan_report = run_dir / "plan.json"
     allocation_report = run_dir / "allocation.json"
+    public_snapshot_report = run_dir / "public_broker_snapshot.json"
     manifest_path = run_dir / "manifest.json"
     watchlist = args.watchlist or cfg["watchlists"].get(args.watchlist_name)
 
@@ -432,8 +504,14 @@ def main() -> None:
             "brief": str(run_dir / "brief.out") if not args.skip_brief else None,
             "alerts": str(run_dir / "alerts.json") if not args.skip_alerts else None,
             "tickets": str(run_dir / "tickets.json"),
+            "broker_snapshot": (
+                str(public_snapshot_report)
+                if public_ingestion_enabled
+                else resolve_project_path(configured_broker_snapshot)
+            ),
             "reconciliation": str(run_dir / "reconciliation.json") if storage_enabled else None,
             "execution_analytics": str(run_dir / "execution_analytics.json") if storage_enabled else None,
+            "execution_history": str(run_dir / "execution_history.json") if storage_enabled else None,
             "database_maintenance": str(run_dir / "database_maintenance.json") if backup_enabled else None,
             "health": str(run_dir / "health.json") if health_enabled else None,
             "operator_summary": str(run_dir / "operator_summary.md"),
@@ -516,31 +594,38 @@ def main() -> None:
             allocation_report.write_text(Path(allocation_meta["stdout"]).read_text())
             allocation_path_for_tickets = allocation_report
 
-    alerts_report = run_dir / "alerts.json"
-    if not args.skip_alerts:
-        if args.dry_run:
-            alerts_cmd = build_alerts_cmd(cfg, args, plan_report)
-            manifest["steps"].append(run_command("alerts", alerts_cmd, run_dir, dry_run=True))
-        elif plan_report.exists():
-            alerts_cmd = build_alerts_cmd(cfg, args, plan_report)
-            alerts_meta = run_command("alerts", alerts_cmd, run_dir, dry_run=False)
-            manifest["steps"].append(alerts_meta)
-            if alerts_meta["returncode"] == 0:
-                alerts_report.write_text(Path(alerts_meta["stdout"]).read_text())
-
     tickets_report = run_dir / "tickets.json"
     ticket_source = allocation_report if args.dry_run and allocation_enabled else allocation_path_for_tickets or plan_report
     if args.dry_run:
-        manifest["steps"].append(run_command("tickets", build_tickets_cmd(ticket_source), run_dir, dry_run=True))
+        manifest["steps"].append(run_command("tickets", build_tickets_cmd(cfg, ticket_source), run_dir, dry_run=True))
     elif plan_report.exists():
-        tickets_meta = run_command("tickets", build_tickets_cmd(ticket_source), run_dir, dry_run=False)
+        tickets_meta = run_command("tickets", build_tickets_cmd(cfg, ticket_source), run_dir, dry_run=False)
         manifest["steps"].append(tickets_meta)
         if tickets_meta["returncode"] == 0:
             tickets_report.write_text(Path(tickets_meta["stdout"]).read_text())
 
     reconciliation_report = run_dir / "reconciliation.json"
     if storage_enabled:
-        storage_cmd = build_storage_cmd(cfg, args, run_dir, risk_report, tickets_report)
+        broker_snapshot_override = None
+        if public_ingestion_enabled:
+            ingestion_meta = run_command(
+                "public_ingestion",
+                build_public_ingestion_cmd(cfg, public_snapshot_report),
+                run_dir,
+                dry_run=args.dry_run,
+            )
+            manifest["steps"].append(ingestion_meta)
+            if args.dry_run or ingestion_meta["returncode"] == 0:
+                broker_snapshot_override = public_snapshot_report
+
+        storage_cmd = build_storage_cmd(
+            cfg,
+            args,
+            run_dir,
+            risk_report,
+            tickets_report,
+            broker_snapshot_override=broker_snapshot_override,
+        )
         storage_meta = run_command("storage", storage_cmd, run_dir, dry_run=args.dry_run)
         manifest["steps"].append(storage_meta)
         if not args.dry_run and storage_meta["returncode"] == 0:
@@ -558,6 +643,17 @@ def main() -> None:
             if not args.dry_run and execution_meta["returncode"] == 0:
                 execution_report.write_text(Path(execution_meta["stdout"]).read_text())
 
+            history_report = run_dir / "execution_history.json"
+            history_meta = run_command(
+                "execution_history",
+                build_execution_history_cmd(cfg),
+                run_dir,
+                dry_run=args.dry_run,
+            )
+            manifest["steps"].append(history_meta)
+            if not args.dry_run and history_meta["returncode"] == 0:
+                history_report.write_text(Path(history_meta["stdout"]).read_text())
+
         if backup_enabled and (args.dry_run or storage_meta["returncode"] == 0):
             database_report = run_dir / "database_maintenance.json"
             database_meta = run_command(
@@ -569,6 +665,28 @@ def main() -> None:
             manifest["steps"].append(database_meta)
             if not args.dry_run and database_meta["returncode"] == 0:
                 database_report.write_text(Path(database_meta["stdout"]).read_text())
+
+    alerts_report = run_dir / "alerts.json"
+    if not args.skip_alerts:
+        if args.dry_run:
+            alerts_cmd = build_alerts_cmd(
+                cfg,
+                args,
+                plan_report,
+                reconciliation_report if storage_enabled else None,
+            )
+            manifest["steps"].append(run_command("alerts", alerts_cmd, run_dir, dry_run=True))
+        elif plan_report.exists():
+            alerts_cmd = build_alerts_cmd(
+                cfg,
+                args,
+                plan_report,
+                reconciliation_report if reconciliation_report.exists() else None,
+            )
+            alerts_meta = run_command("alerts", alerts_cmd, run_dir, dry_run=False)
+            manifest["steps"].append(alerts_meta)
+            if alerts_meta["returncode"] == 0:
+                alerts_report.write_text(Path(alerts_meta["stdout"]).read_text())
 
     if health_enabled:
         health_report = run_dir / "health.json"

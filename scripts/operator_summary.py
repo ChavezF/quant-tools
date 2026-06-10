@@ -32,11 +32,14 @@ def build_summary(
     allocation: dict[str, Any] | None = None,
     validation: dict[str, Any] | None = None,
     drift: dict[str, Any] | None = None,
+    execution_history: dict[str, Any] | None = None,
 ) -> str:
     reconciliation = reconciliation or {}
     reconciliation = reconciliation.get("reconciliation", reconciliation)
     recon_summary = reconciliation.get("summary", {})
     execution_summary = (execution_analytics or {}).get("summary", {})
+    execution_history = execution_history or {}
+    execution_history_summary = execution_history.get("summary", {})
     database_maintenance = database_maintenance or {}
     health = health or {}
     stress_summary = (scenario_stress or {}).get("summary", {})
@@ -62,11 +65,22 @@ def build_summary(
         f"- Rejected: {summary.get('reject', 0)}",
         f"- High-priority alerts: {alerts.get('summary', {}).get('high', 0)}",
         f"- Execution tickets: {len(tickets.get('tickets', []))}",
+        f"- Active execution tickets: {recon_summary.get('active_tickets', 0)}",
+        f"- Tickets auto-expired: {recon_summary.get('expired_tickets', 0)}",
+        f"- Stale partial fills: {recon_summary.get('stale_partial_tickets', 0)}",
+        f"- Duplicate active setups: {recon_summary.get('duplicate_active_setups', 0)}",
         f"- Unmatched tickets: {recon_summary.get('unmatched_tickets', 0)}",
+        f"- Partially filled tickets: {recon_summary.get('partial_tickets', 0)}",
+        f"- Overfilled tickets: {recon_summary.get('overfilled_tickets', 0)}",
         f"- Broker position exceptions: {recon_summary.get('position_exceptions', recon_summary.get('missing_positions', 0))}",
         f"- Fill rate: {float(execution_summary.get('fill_rate', 0) or 0):.1f}%",
+        f"- Quantity fill rate: {float(execution_summary.get('quantity_fill_rate', 0) or 0):.1f}%",
         f"- Average credit vs plan: {float(execution_summary.get('avg_credit_improvement', 0) or 0):+.3f}",
+        f"- Execution fees: ${float(execution_summary.get('total_fees', 0) or 0):,.2f}",
+        f"- Average fill delay: {float(execution_summary.get('avg_fill_delay_seconds', 0) or 0):,.0f} seconds",
         f"- Execution floor violations: {execution_summary.get('floor_violations', 0)}",
+        f"- Durable execution samples: {execution_history_summary.get('count', 0)}",
+        f"- Durable fees per contract: ${float(execution_history_summary.get('fees_per_contract', 0) or 0):,.2f}",
         f"- Database integrity: {database_status}",
         f"- Database backup: {database_maintenance.get('backup') or 'not created'}",
         f"- Health checks: {health_status}",
@@ -95,9 +109,24 @@ def build_summary(
         f"- Max drawdown: ${float(drawdown.get('max_drawdown', 0) or 0):,.2f}",
         f"- Recommended minimum score: {float(feedback.get('recommended_min_score', 0) or 0):.1f}",
         "",
-        "## Candidate Shortlist",
+        "## Execution Attribution",
         "",
     ]
+    strategy_adjustments = execution_history.get("strategy_adjustments", {})
+    if not strategy_adjustments:
+        lines.append("- Insufficient durable execution history.")
+    for strategy, row in strategy_adjustments.items():
+        lines.append(
+            f"- **{strategy}** {row.get('signal', 'UNKNOWN')}: "
+            f"score {float(row.get('score_adjustment', 0) or 0):+.1f}, "
+            f"size x{float(row.get('size_multiplier', 1) or 1):.2f}, "
+            f"n={row.get('sample_size', 0)}"
+        )
+    lines.extend([
+        "",
+        "## Candidate Shortlist",
+        "",
+    ])
     actionable = [row for row in plan.get("actions", []) if row.get("action_decision") in {"APPROVE", "REDUCE"}]
     if not actionable:
         lines.append("- No actionable candidates.")
@@ -157,6 +186,7 @@ def main() -> None:
         read_json(base / "allocation.json"),
         read_json(base / "validation.json"),
         read_json(base / "drift.json"),
+        execution_history=read_json(base / "execution_history.json"),
     )
     output.write_text(text)
     print(output)

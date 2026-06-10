@@ -79,6 +79,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "path": "state/quant_tools.db",
         "broker_snapshot": None,
     },
+    "public_ingestion": {
+        "enabled": False,
+        "cursor_path": "state/public_fill_cursor.json",
+        "snapshot_path": "state/public_broker_snapshot.json",
+        "page_size": 100,
+        "overlap_minutes": 15,
+        "max_pages": 100,
+    },
+    "execution_lifecycle": {
+        "pending_expiry_hours": 24,
+        "partial_review_hours": 4,
+        "suppress_duplicate_tickets": True,
+    },
     "operations": {
         "backup_on_operator": True,
         "backup_dir": "state/backups",

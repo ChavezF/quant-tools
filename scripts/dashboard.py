@@ -155,12 +155,34 @@ def render_execution_breakdown(execution_analytics: dict[str, Any]) -> str:
             f"<td>{esc(strategy)}</td>"
             f"<td>{esc(row.get('tickets'))}</td>"
             f"<td>{float(row.get('fill_rate') or 0):.1f}%</td>"
+            f"<td>{float(row.get('quantity_fill_rate') or 0):.1f}%</td>"
             f"<td>{float(row.get('avg_credit_improvement') or 0):+.3f}</td>"
             f"<td>{esc(row.get('floor_violations'))}</td>"
             "</tr>"
         )
     if not rows:
-        rows.append("<tr><td colspan='5'>No execution history.</td></tr>")
+        rows.append("<tr><td colspan='6'>No execution history.</td></tr>")
+    return "\n".join(rows)
+
+
+def render_execution_attribution(execution_history: dict[str, Any]) -> str:
+    rows = []
+    for strategy, row in execution_history.get("strategy_adjustments", {}).items():
+        metrics = row.get("metrics", {})
+        rows.append(
+            "<tr>"
+            f"<td>{esc(strategy)}</td>"
+            f"<td>{esc(row.get('signal'))}</td>"
+            f"<td>{float(row.get('score_adjustment') or 0):+.1f}</td>"
+            f"<td>{float(row.get('size_multiplier') or 0):.2f}</td>"
+            f"<td>{esc(row.get('sample_size'))}</td>"
+            f"<td>{float(metrics.get('fill_rate') or 0):.1f}%</td>"
+            f"<td>{float(metrics.get('avg_credit_improvement') or 0):+.3f}</td>"
+            f"<td>{money(metrics.get('fees_per_contract'))}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='8'>No durable execution attribution.</td></tr>")
     return "\n".join(rows)
 
 
@@ -243,6 +265,7 @@ def build_dashboard(
     feedback: dict[str, Any] | None = None,
     reconciliation: dict[str, Any] | None = None,
     execution_analytics: dict[str, Any] | None = None,
+    execution_history: dict[str, Any] | None = None,
     database_maintenance: dict[str, Any] | None = None,
     health: dict[str, Any] | None = None,
     scenario_stress: dict[str, Any] | None = None,
@@ -257,6 +280,8 @@ def build_dashboard(
     recon_summary = reconciliation.get("summary", {})
     execution_analytics = execution_analytics or {}
     execution_summary = execution_analytics.get("summary", {})
+    execution_history = execution_history or {}
+    history_summary = execution_history.get("summary", {})
     database_maintenance = database_maintenance or {}
     health = health or {}
     scenario_stress = scenario_stress or {}
@@ -326,10 +351,19 @@ def build_dashboard(
       <div class="card">Expectancy<b>{money(overall.get('expectancy'))}</b></div>
       <div class="card">Max Drawdown<b>{money(drawdown.get('max_drawdown'))}</b></div>
       <div class="card">Min Score<b>{float(feedback.get('recommended_min_score') or 0):.0f}</b></div>
+      <div class="card">Active Tickets<b>{esc(recon_summary.get('active_tickets', 0))}</b></div>
+      <div class="card">Expired Tickets<b>{esc(recon_summary.get('expired_tickets', 0))}</b></div>
+      <div class="card">Stale Partials<b>{esc(recon_summary.get('stale_partial_tickets', 0))}</b></div>
+      <div class="card">Duplicate Setups<b>{esc(recon_summary.get('duplicate_active_setups', 0))}</b></div>
       <div class="card">Unmatched Tickets<b>{esc(recon_summary.get('unmatched_tickets', 0))}</b></div>
       <div class="card">Position Exceptions<b>{esc(recon_summary.get('position_exceptions', recon_summary.get('missing_positions', 0)))}</b></div>
       <div class="card">Fill Rate<b>{float(execution_summary.get('fill_rate') or 0):.0f}%</b></div>
+      <div class="card">Quantity Fill<b>{float(execution_summary.get('quantity_fill_rate') or 0):.0f}%</b></div>
       <div class="card">Credit vs Plan<b>{float(execution_summary.get('avg_credit_improvement') or 0):+.3f}</b></div>
+      <div class="card">Execution Fees<b>{money(execution_summary.get('total_fees'))}</b></div>
+      <div class="card">Avg Fill Delay<b>{float(execution_summary.get('avg_fill_delay_seconds') or 0):.0f}s</b></div>
+      <div class="card">Execution History<b>{esc(history_summary.get('count', 0))}</b></div>
+      <div class="card">Fees / Contract<b>{money(history_summary.get('fees_per_contract'))}</b></div>
       <div class="card">DB Integrity<b>{database_status}</b></div>
       <div class="card">Health<b>{health_status}</b></div>
       <div class="card">Worst Stress<b>{esc(stress_summary.get('worst_scenario') or 'N/A')}</b></div>
@@ -381,8 +415,13 @@ def build_dashboard(
     </div>
     <h2>Execution Quality</h2>
     <div class="table-wrap"><table class="sortable">
-      <thead><tr><th data-sort>Strategy</th><th data-sort>Tickets</th><th data-sort>Fill Rate</th><th data-sort>Credit vs Plan</th><th data-sort>Floor Violations</th></tr></thead>
+      <thead><tr><th data-sort>Strategy</th><th data-sort>Tickets</th><th data-sort>Fill Rate</th><th data-sort>Quantity Fill</th><th data-sort>Credit vs Plan</th><th data-sort>Floor Violations</th></tr></thead>
       <tbody>{render_execution_breakdown(execution_analytics)}</tbody>
+    </table></div>
+    <h2>Durable Execution Attribution</h2>
+    <div class="table-wrap"><table class="sortable">
+      <thead><tr><th data-sort>Strategy</th><th data-sort>Signal</th><th data-sort>Score</th><th data-sort>Size</th><th data-sort>N</th><th data-sort>Fill Rate</th><th data-sort>Credit vs Plan</th><th data-sort>Fees / Contract</th></tr></thead>
+      <tbody>{render_execution_attribution(execution_history)}</tbody>
     </table></div>
     <h2>Alerts</h2>
     <div class="table-wrap"><table class="sortable">
@@ -434,6 +473,7 @@ def main() -> None:
     ap.add_argument("--feedback")
     ap.add_argument("--reconciliation")
     ap.add_argument("--execution-analytics")
+    ap.add_argument("--execution-history")
     ap.add_argument("--database-maintenance")
     ap.add_argument("--health")
     ap.add_argument("--scenario-stress")
@@ -452,6 +492,7 @@ def main() -> None:
     feedback_path = Path(args.feedback) if args.feedback else base / "feedback.json"
     reconciliation_path = Path(args.reconciliation) if args.reconciliation else base / "reconciliation.json"
     execution_path = Path(args.execution_analytics) if args.execution_analytics else base / "execution_analytics.json"
+    execution_history_path = Path(args.execution_history) if args.execution_history else base / "execution_history.json"
     database_path = Path(args.database_maintenance) if args.database_maintenance else base / "database_maintenance.json"
     health_path = Path(args.health) if args.health else base / "health.json"
     scenario_path = Path(args.scenario_stress) if args.scenario_stress else base / "scenario_stress.json"
@@ -470,6 +511,7 @@ def main() -> None:
         feedback=read_json(feedback_path),
         reconciliation=read_json(reconciliation_path),
         execution_analytics=read_json(execution_path),
+        execution_history=read_json(execution_history_path),
         database_maintenance=read_json(database_path),
         health=read_json(health_path),
         scenario_stress=read_json(scenario_path),

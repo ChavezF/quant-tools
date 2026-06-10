@@ -78,6 +78,7 @@ def main():
     p_plan.add_argument("--candidates", required=True, help="Path to options_screener JSON report")
     p_plan.add_argument("--portfolio", help="Optional path to portfolio_risk --json output")
     p_plan.add_argument("--journal", help="Optional path to trade journal state")
+    p_plan.add_argument("--db")
     p_plan.add_argument("--account-nav", type=float)
     p_plan.add_argument("--max-trade-risk-pct", type=float)
     p_plan.add_argument("--max-trade-bp-pct", type=float)
@@ -145,6 +146,7 @@ def main():
     p_alerts.add_argument("--dte-warning", type=int, default=21)
     p_alerts.add_argument("--validation")
     p_alerts.add_argument("--drift")
+    p_alerts.add_argument("--reconciliation")
     p_alerts.add_argument("--json", action="store_true")
 
     p_discover = sub.add_parser("discover", help="Discover symbols worth scanning")
@@ -158,6 +160,10 @@ def main():
     p_tickets = sub.add_parser("tickets", help="Build execution tickets from an action plan")
     p_tickets.add_argument("--plan", required=True)
     p_tickets.add_argument("--approve-only", action="store_true")
+    p_tickets.add_argument("--db")
+    p_tickets.add_argument("--allow-duplicates", action="store_true")
+    p_tickets.add_argument("--pending-expiry-hours", type=float)
+    p_tickets.add_argument("--partial-review-hours", type=float)
     p_tickets.add_argument("--json", action="store_true")
 
     p_dashboard = sub.add_parser("dashboard", help="Generate static HTML dashboard from reports")
@@ -186,6 +192,7 @@ def main():
 
     p_feedback = sub.add_parser("feedback", help="Recommend score and sizing calibration")
     p_feedback.add_argument("--journal")
+    p_feedback.add_argument("--db")
     p_feedback.add_argument("--current-min-score", type=float)
     p_feedback.add_argument("--min-samples", type=int)
     p_feedback.add_argument("--output")
@@ -234,7 +241,28 @@ def main():
     p_storage.add_argument("--broker-snapshot")
     p_storage.add_argument("--output")
     p_storage.add_argument("--export-journal")
+    p_storage.add_argument("--pending-expiry-hours", type=float)
+    p_storage.add_argument("--partial-review-hours", type=float)
     p_storage.add_argument("--json", action="store_true")
+
+    p_ticket_lifecycle = sub.add_parser("ticket-lifecycle", help="Inspect or close persistent execution tickets")
+    p_ticket_lifecycle.add_argument("--db")
+    p_ticket_lifecycle.add_argument("--status", nargs="+")
+    p_ticket_lifecycle.add_argument("--active", action="store_true")
+    p_ticket_lifecycle.add_argument("--ticket-id")
+    p_ticket_lifecycle.add_argument("--set-status", choices=["PENDING", "CANCELLED", "EXPIRED"])
+    p_ticket_lifecycle.add_argument("--json", action="store_true")
+
+    p_broker_sync = sub.add_parser("broker-sync", help="Fetch Public.com fills and positions into a broker snapshot")
+    p_broker_sync.add_argument("--cursor")
+    p_broker_sync.add_argument("--output")
+    p_broker_sync.add_argument("--start")
+    p_broker_sync.add_argument("--end")
+    p_broker_sync.add_argument("--page-size", type=int)
+    p_broker_sync.add_argument("--max-pages", type=int)
+    p_broker_sync.add_argument("--overlap-minutes", type=int)
+    p_broker_sync.add_argument("--full-refresh", action="store_true")
+    p_broker_sync.add_argument("--json", action="store_true")
 
     p_reconcile = sub.add_parser("reconcile", help="Reconcile tickets and journal against broker data")
     p_reconcile.add_argument("--journal", required=True)
@@ -251,6 +279,15 @@ def main():
     p_execution.add_argument("--reconciliation", required=True)
     p_execution.add_argument("--output")
     p_execution.add_argument("--json", action="store_true")
+
+    p_execution_history = sub.add_parser(
+        "execution-history",
+        help="Build durable execution attribution from reconciliation history",
+    )
+    p_execution_history.add_argument("--db")
+    p_execution_history.add_argument("--min-samples", type=int, default=5)
+    p_execution_history.add_argument("--output")
+    p_execution_history.add_argument("--json", action="store_true")
 
     p_verify = sub.add_parser("verify", help="Run repository and runtime health checks")
     p_verify.add_argument("--db")
@@ -396,6 +433,9 @@ def main():
         journal = args.journal or cfg.get("journal", {}).get("path")
         if journal:
             cmd += ["--journal", resolve_project_path(journal)]
+        db_path = args.db or cfg.get("storage", {}).get("path")
+        if db_path:
+            cmd += ["--db", resolve_project_path(db_path)]
         if args.json:
             cmd += ["--json"]
         return run(*cmd)
@@ -493,6 +533,8 @@ def main():
             cmd += ["--validation", args.validation]
         if args.drift:
             cmd += ["--drift", args.drift]
+        if args.reconciliation:
+            cmd += ["--reconciliation", args.reconciliation]
         journal = args.journal or cfg.get("journal", {}).get("path")
         if journal:
             cmd += ["--journal", resolve_project_path(journal)]
@@ -522,6 +564,26 @@ def main():
         cmd = ["execution_tickets.py", "--plan", args.plan]
         if args.approve_only:
             cmd += ["--approve-only"]
+        db_path = args.db or cfg.get("storage", {}).get("path")
+        if db_path:
+            cmd += ["--db", resolve_project_path(db_path)]
+        lifecycle_cfg = cfg.get("execution_lifecycle", {})
+        cmd += [
+            "--pending-expiry-hours",
+            str(
+                args.pending_expiry_hours
+                if args.pending_expiry_hours is not None
+                else lifecycle_cfg.get("pending_expiry_hours", 24)
+            ),
+            "--partial-review-hours",
+            str(
+                args.partial_review_hours
+                if args.partial_review_hours is not None
+                else lifecycle_cfg.get("partial_review_hours", 4)
+            ),
+        ]
+        if args.allow_duplicates:
+            cmd += ["--allow-duplicates"]
         if args.json:
             cmd += ["--json"]
         return run(*cmd)
@@ -565,6 +627,9 @@ def main():
         journal = args.journal or cfg.get("journal", {}).get("path")
         if journal:
             cmd += ["--journal", resolve_project_path(journal)]
+        db_path = args.db or cfg.get("storage", {}).get("path")
+        if db_path:
+            cmd += ["--db", resolve_project_path(db_path)]
         cmd += [
             "--current-min-score",
             str(args.current_min_score if args.current_min_score is not None else risk_cfg["min_score"]),
@@ -640,12 +705,27 @@ def main():
     elif args.cmd == "storage":
         cmd = ["storage_sync.py"]
         storage_cfg = cfg.get("storage", {})
+        lifecycle_cfg = cfg.get("execution_lifecycle", {})
         db_path = args.db or storage_cfg.get("path")
         journal = args.journal or cfg.get("journal", {}).get("path")
         if db_path:
             cmd += ["--db", resolve_project_path(db_path)]
         if journal:
             cmd += ["--journal", resolve_project_path(journal)]
+        cmd += [
+            "--pending-expiry-hours",
+            str(
+                args.pending_expiry_hours
+                if args.pending_expiry_hours is not None
+                else lifecycle_cfg.get("pending_expiry_hours", 24)
+            ),
+            "--partial-review-hours",
+            str(
+                args.partial_review_hours
+                if args.partial_review_hours is not None
+                else lifecycle_cfg.get("partial_review_hours", 4)
+            ),
+        ]
         for attr, flag in [
             ("tickets", "--tickets"),
             ("portfolio", "--portfolio"),
@@ -656,6 +736,52 @@ def main():
             value = getattr(args, attr)
             if value:
                 cmd += [flag, value]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "ticket-lifecycle":
+        cmd = ["ticket_lifecycle.py"]
+        db_path = args.db or cfg.get("storage", {}).get("path")
+        if db_path:
+            cmd += ["--db", resolve_project_path(db_path)]
+        if args.status:
+            cmd += ["--status", *args.status]
+        if args.active:
+            cmd += ["--active"]
+        if args.ticket_id:
+            cmd += ["--ticket-id", args.ticket_id]
+        if args.set_status:
+            cmd += ["--set-status", args.set_status]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "broker-sync":
+        ingestion_cfg = cfg.get("public_ingestion", {})
+        cmd = [
+            "public_fill_ingestion.py",
+            "--cursor",
+            resolve_project_path(args.cursor or ingestion_cfg.get("cursor_path"))
+            or str(SCRIPT_DIR.parent / "state" / "public_fill_cursor.json"),
+            "--output",
+            resolve_project_path(args.output or ingestion_cfg.get("snapshot_path"))
+            or str(SCRIPT_DIR.parent / "state" / "public_broker_snapshot.json"),
+            "--page-size",
+            str(args.page_size if args.page_size is not None else ingestion_cfg.get("page_size", 100)),
+            "--max-pages",
+            str(args.max_pages if args.max_pages is not None else ingestion_cfg.get("max_pages", 100)),
+            "--overlap-minutes",
+            str(
+                args.overlap_minutes
+                if args.overlap_minutes is not None
+                else ingestion_cfg.get("overlap_minutes", 15)
+            ),
+        ]
+        if args.start:
+            cmd += ["--start", args.start]
+        if args.end:
+            cmd += ["--end", args.end]
+        if args.full_refresh:
+            cmd += ["--full-refresh"]
         if args.json:
             cmd += ["--json"]
         return run(*cmd)
@@ -688,6 +814,20 @@ def main():
             "--reconciliation",
             args.reconciliation,
         ]
+        if args.output:
+            cmd += ["--output", args.output]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "execution-history":
+        cmd = [
+            "execution_attribution.py",
+            "--min-samples",
+            str(args.min_samples),
+        ]
+        db_path = args.db or cfg.get("storage", {}).get("path")
+        if db_path:
+            cmd += ["--db", resolve_project_path(db_path)]
         if args.output:
             cmd += ["--output", args.output]
         if args.json:

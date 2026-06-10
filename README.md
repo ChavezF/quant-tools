@@ -43,6 +43,8 @@ cd /home/chavez_f/code/quant-tools/scripts
 /usr/bin/python3.12 quant.py validate --journal state/trades.json --json
 /usr/bin/python3.12 quant.py drift --journal state/trades.json --json
 /usr/bin/python3.12 quant.py operator --report-dir reports
+/usr/bin/python3.12 quant.py broker-sync --json
+/usr/bin/python3.12 quant.py ticket-lifecycle --active --json
 /usr/bin/python3.12 quant.py storage --journal state/trades.json --tickets reports/latest/tickets.json --portfolio reports/latest/risk.json
 /usr/bin/python3.12 quant.py reconcile --journal state/trades.json --tickets reports/latest/tickets.json --broker-snapshot state/broker_snapshot.json
 /usr/bin/python3.12 quant.py reconcile --journal state/trades.json --tickets reports/latest/tickets.json --broker-snapshot state/broker_snapshot.json --apply-updates --db state/quant_tools.db
@@ -144,6 +146,104 @@ Ticket IDs are matched first. Ticker, strategy, expiration, and strikes are
 used only as a fallback. Reconciliation proposes journal updates but never
 applies fill data unless `--apply-updates` is passed explicitly, and it never
 places orders automatically.
+
+`broker-sync` can build this snapshot directly from Public.com account history.
+It paginates the history endpoint, stores a bounded transaction cursor in
+`state/public_fill_cursor.json`, deduplicates the overlap window, and includes
+the current portfolio positions. Option legs sharing the exact account,
+timestamp, underlying, and expiration are normalized as one spread execution;
+fills at different timestamps remain separate so partial executions are not
+silently combined.
+
+Native ingestion is opt-in. Enable it for the operator workflow in
+`config.json`:
+
+```json
+{
+  "public_ingestion": {
+    "enabled": true,
+    "cursor_path": "state/public_fill_cursor.json",
+    "page_size": 100,
+    "overlap_minutes": 15,
+    "max_pages": 100
+  }
+}
+```
+
+When enabled and no manual `storage.broker_snapshot` or
+`operator --broker-snapshot` is supplied, the operator writes a run-local
+`public_broker_snapshot.json` before storage reconciliation. An explicit
+snapshot always takes precedence. The history API does not expose the toolkit's
+ticket ID, so matching uses strategy structure as a fallback and remains a
+proposed update until explicitly applied.
+
+Execution tickets include a target quantity. Reconciliation can assign multiple
+fills to one ticket, computes a quantity-weighted fill price, and reports
+`PARTIAL`, `MATCHED`, or `OVERFILLED` without merging unrelated executions.
+Execution analytics reports both completed-ticket fill rate and quantity fill
+rate, so a two-contract ticket with one contract filled is visible as partial
+rather than being counted as either fully filled or entirely missed.
+
+Durable execution attribution aggregates the latest reconciliation state for
+each ticket across all SQLite runs:
+
+```bash
+/usr/bin/python3.12 quant.py execution-history --json
+```
+
+The report breaks fill rate, quantity fill rate, credit improvement or
+slippage, fees per contract, and fill delay down by strategy, ticker, and
+ticker-strategy pair. Strategy adjustments require at least five samples by
+default, are bounded to +/-5 score points, and use modest sizing multipliers.
+The action plan and portfolio allocator consume these adjustments on the next
+run. Execution history can reduce an otherwise approved setup, but it cannot
+override a hard risk rejection.
+
+SQLite retains `PENDING` and `PARTIAL` tickets across operator runs. A later
+broker snapshot is reconciled against that durable queue, including fills
+already assigned on prior days, so the original timestamped report directory
+does not need to be resubmitted. Ticket IDs include the action-plan issuance
+timestamp, preventing a repeated setup from colliding with an older completed
+trade.
+
+Inspect or close the queue explicitly:
+
+```bash
+/usr/bin/python3.12 quant.py ticket-lifecycle --active
+/usr/bin/python3.12 quant.py ticket-lifecycle --status FILLED OVERFILLED --json
+/usr/bin/python3.12 quant.py ticket-lifecycle --ticket-id QTK-ABC123 --set-status CANCELLED
+/usr/bin/python3.12 quant.py ticket-lifecycle --ticket-id QTK-ABC123 --set-status EXPIRED
+```
+
+Manual lifecycle changes do not place or cancel broker orders. They only record
+the operator's decision in the local execution ledger.
+
+Queue governance defaults to expiring untouched pending tickets after 24 hours
+and flagging partial fills for review after 4 hours. Partial tickets are never
+auto-expired. Equivalent active setups are reported as duplicates but remain
+open until the operator closes them. Configure the thresholds with:
+
+```json
+{
+  "execution_lifecycle": {
+    "pending_expiry_hours": 24,
+    "partial_review_hours": 4,
+    "suppress_duplicate_tickets": true
+  }
+}
+```
+
+Public history does not expose a dedicated opening/closing field. The ingestion
+adapter records `execution_effect`, classification confidence, and the evidence
+used. Explicit description text wins; otherwise supported short-premium option
+trades infer opening from net credit and closing from net debit. Unknown effects
+never match new tickets. Assignments, exercises, and expirations are emitted as
+separate lifecycle events.
+
+Completed closing fills are matched to open journal trades and produce proposed
+closure updates containing exit debit, fees, close timestamp, realized P&L, and
+return on risk. Partial exits remain review-only. As with entry reconciliation,
+the journal changes require the explicit `reconcile --apply-updates` action.
 
 ## Project vs skill — what's where
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +98,15 @@ def apply_performance_overlay(
             adjusted = "REDUCE"
 
     calibrated_floor = float((feedback or {}).get("recommended_min_score", 0) or 0)
+    execution_adjustment = (
+        (feedback or {}).get("execution_adjustments", {}).get(strategy, {})
+    )
+    score_adjustment = float(execution_adjustment.get("score_adjustment", 0) or 0)
+    out["score"] = round(max(0.0, min(100.0, float(out.get("score") or 0) + score_adjustment)), 1)
+    execution_multiplier = float(execution_adjustment.get("size_multiplier", 1.0) or 1.0)
+    multiplier *= execution_multiplier
+    if adjusted == "APPROVE" and execution_adjustment.get("signal") == "THROTTLE":
+        adjusted = "REDUCE"
     if adjusted != "REJECT" and calibrated_floor > 0 and float(out.get("score") or 0) < calibrated_floor:
         adjusted = "REDUCE"
         multiplier = min(multiplier, 0.5)
@@ -113,6 +123,7 @@ def apply_performance_overlay(
         "recommended_min_score": calibrated_floor,
         "threshold_reason": (feedback or {}).get("threshold_reason"),
     }
+    out["execution_attribution"] = execution_adjustment
     return out
 
 
@@ -124,6 +135,7 @@ def build_action_plan(
     correlation_groups: dict[str, list[str]] | None = None,
     adaptive_config: dict[str, Any] | None = None,
     feedback_config: dict[str, Any] | None = None,
+    execution_attribution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     score_results(screener_report)
     risk_report = evaluate_report(screener_report, portfolio_report, limits)
@@ -135,6 +147,7 @@ def build_action_plan(
         journal_state or {"trades": []},
         current_min_score=limits.min_score,
         min_samples=int((feedback_config or {}).get("min_samples", 5)),
+        execution_attribution=execution_attribution,
     )
     actions = []
     for decision in risk_report.get("decisions", []):
@@ -157,6 +170,7 @@ def build_action_plan(
     rejected = [a for a in actions if a["action_decision"] == "REJECT"]
 
     return {
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "limits": risk_report["limits"],
         "journal_stats": journal_stats(journal_state.get("trades", [])) if journal_state else None,
         "historical_analytics": analytics,
@@ -227,6 +241,7 @@ def main() -> None:
     ap.add_argument("--top", type=int, default=10)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--correlation-groups", help="Optional JSON file containing correlation_groups")
+    ap.add_argument("--db", help="SQLite history used for execution-cost attribution")
     args = ap.parse_args()
 
     screener_report = json.loads(Path(args.candidates).read_text())
@@ -237,6 +252,14 @@ def main() -> None:
     correlation_groups = cfg.get("correlation_groups", {})
     if args.correlation_groups:
         correlation_groups = json.loads(Path(args.correlation_groups).read_text())
+    execution_attribution = None
+    if args.db:
+        from execution_attribution import build_execution_attribution, load_execution_records
+
+        execution_attribution = build_execution_attribution(
+            load_execution_records(args.db),
+            min_samples=int(cfg.get("feedback", {}).get("min_samples", 5)),
+        )
 
     # Prefer the live NAV from the risk report so account-size changes
     # (deposits, withdrawals, P&L) flow through automatically without code
@@ -262,6 +285,7 @@ def main() -> None:
         correlation_groups,
         cfg.get("adaptive_sizing", {}),
         cfg.get("feedback", {}),
+        execution_attribution,
     )
     if args.json:
         print(json.dumps(plan, indent=2, default=str))
