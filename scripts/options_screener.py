@@ -39,9 +39,6 @@ from toolkit_config import add_config_argument, load_config
 
 configure_public_imports()
 
-import yfinance as yf
-import numpy as np
-
 
 # ---------------------------------------------------------------------------
 # Public.com helpers
@@ -236,6 +233,10 @@ def fetch_chain_with_greeks(client, symbol: str, expiration: str, spot: float,
 # ---------------------------------------------------------------------------
 
 def fetch_underlying_metrics_uncached(symbol: str) -> dict:
+    # Lazy so the screen logic stays importable without yfinance/numpy
+    import numpy as np
+    import yfinance as yf
+
     try:
         t = yf.Ticker(symbol)
         hist = t.history(period="6mo", auto_adjust=True)
@@ -276,7 +277,7 @@ def fetch_underlying_metrics(symbol: str, ttl_seconds: int = 0) -> dict:
     )
 
 
-def _next_earnings(t: yf.Ticker) -> dict:
+def _next_earnings(t) -> dict:
     try:
         cal = t.calendar
         if cal is None:
