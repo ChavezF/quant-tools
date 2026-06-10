@@ -311,8 +311,11 @@ Do not bump in November.
 - Account `5OG66124` is BROKERAGE (not paper). All tools handle an empty
   account — risk dashboard uses `--target-watchlist` for demo mode, screener
   still scans from live option chains.
-- The risk dashboard's VaR is delta-normal — fine for small shocks, breaks in
-  fat-tail events.
+- The risk dashboard reports two VaR numbers: the legacy delta-normal figure
+  (fine for small shocks, breaks in fat tails) and a bootstrap VaR/expected
+  shortfall that jointly resamples a year of the underlyings' actual daily
+  returns — correlation and fat tails come from data. **Size off the
+  bootstrap number**; the delta-normal one is kept for continuity.
 - Backtester uses estimated premium and approximate strikes — real-money
   results will typically be 0.5–2% worse per trade due to bid/ask spread,
   slippage, commissions.

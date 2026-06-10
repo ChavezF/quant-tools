@@ -21,6 +21,13 @@ from mark_to_market import mark_open_trades, mark_trade, parse_strikes, trade_le
 from position_management import build_management_report
 from trade_journal import default_state, load_state
 
+try:
+    import numpy as np
+    from portfolio_risk import bootstrap_var
+    HAVE_NUMPY = True
+except ImportError:  # CI runs dependency-light; numpy-backed tests skip there
+    HAVE_NUMPY = False
+
 
 def open_trade(**overrides):
     trade = {
@@ -350,6 +357,56 @@ class DataQualityGateTests(unittest.TestCase):
 
         spreads = screen_bull_put(chain, spot=480.0, dte=35, short_delta=-0.20, wing_width=5.0, min_oi=50)
         self.assertTrue(all(row["short_strike"] != 470.0 for row in spreads))
+
+
+@unittest.skipUnless(HAVE_NUMPY, "numpy not installed (CI runs dependency-light)")
+class BootstrapVarTests(unittest.TestCase):
+    def test_hedged_book_has_near_zero_var_and_outright_book_does_not(self):
+        rng = np.random.default_rng(7)
+        returns = [float(r) for r in rng.normal(0, 0.015, 500)]
+        inverse = [-r for r in returns]
+        hedged = bootstrap_var(
+            {"LONG": {"delta_dollars": 10000.0}, "SHORT": {"delta_dollars": 10000.0}},
+            {"LONG": returns, "SHORT": inverse},
+        )
+        outright = bootstrap_var(
+            {"LONG": {"delta_dollars": 20000.0}},
+            {"LONG": returns},
+        )
+        # Perfectly offsetting exposures: the joint sampling must see the hedge
+        self.assertLess(hedged["var_1d_95"], 1.0)
+        self.assertGreater(outright["var_1d_95"], 200.0)
+        self.assertGreaterEqual(outright["var_1d_99"], outright["var_1d_95"])
+        self.assertGreaterEqual(outright["expected_shortfall_95"], outright["var_1d_95"])
+
+    def test_short_gamma_loses_in_both_directions(self):
+        rng = np.random.default_rng(11)
+        returns = [float(r) for r in rng.normal(0, 0.02, 400)]
+        flat_delta_short_gamma = bootstrap_var(
+            {"SPY": {"delta_dollars": 0.0, "gamma_dollars": -5_000_000.0}},
+            {"SPY": returns},
+        )
+        self.assertGreater(flat_delta_short_gamma["var_1d_95"], 0.0)
+
+    def test_insufficient_history_returns_empty(self):
+        self.assertEqual(bootstrap_var({"SPY": {"delta_dollars": 1000.0}}, {"SPY": [0.01] * 10}), {})
+        self.assertEqual(bootstrap_var({}, {}), {})
+
+    def test_correlated_book_riskier_than_diversified(self):
+        rng = np.random.default_rng(3)
+        market = rng.normal(0, 0.012, 500)
+        a = [float(r) for r in market + rng.normal(0, 0.002, 500)]  # highly correlated
+        b = [float(r) for r in market + rng.normal(0, 0.002, 500)]
+        independent = [float(r) for r in rng.normal(0, 0.012, 500)]
+        correlated = bootstrap_var(
+            {"A": {"delta_dollars": 10000.0}, "B": {"delta_dollars": 10000.0}},
+            {"A": a, "B": b},
+        )
+        diversified = bootstrap_var(
+            {"A": {"delta_dollars": 10000.0}, "B": {"delta_dollars": 10000.0}},
+            {"A": a, "B": independent},
+        )
+        self.assertGreater(correlated["var_1d_95"], diversified["var_1d_95"])
 
 
 if __name__ == "__main__":
