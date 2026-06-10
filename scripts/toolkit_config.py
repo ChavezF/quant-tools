@@ -126,6 +126,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "recent_window": 10,
         "min_baseline": 10,
     },
+    "position_management": {
+        "enabled": True,
+        "profit_target_pct": 50.0,
+        "stop_loss_pct": 200.0,
+        "manage_dte": 21,
+        "urgent_dte": 7,
+    },
 }
 
 

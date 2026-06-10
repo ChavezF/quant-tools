@@ -11,11 +11,14 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+from datetime import date
+
 import common
 from common import atomic_write_json, state_lock
 from alerts import build_alerts
 from data_reliability import hard_quote_issues, option_leg_issues, quote_issues
 from mark_to_market import mark_open_trades, mark_trade, parse_strikes, trade_legs
+from position_management import build_management_report
 from trade_journal import default_state, load_state
 
 
@@ -242,6 +245,60 @@ class MarkToMarketTests(unittest.TestCase):
         )
         kinds = {alert["kind"] for alert in report["alerts"]}
         self.assertNotIn("profit_target", kinds)
+
+
+class PositionManagementTests(unittest.TestCase):
+    TODAY = date(2026, 6, 10)
+
+    def manage(self, *trades):
+        report = build_management_report({"trades": list(trades)}, today=self.TODAY)
+        return {row["trade_id"]: row for row in report["actions"]}, report
+
+    def test_take_profit_and_stop_loss_close_signals(self):
+        rows, _ = self.manage(
+            open_trade(id="WIN", expiration="2026-07-17", unrealized_pnl_pct=62.0),
+            open_trade(id="BROKEN", expiration="2026-07-17", unrealized_pnl_pct=-230.0),
+            open_trade(id="OK", expiration="2026-07-17", unrealized_pnl_pct=10.0),
+        )
+        self.assertEqual(rows["WIN"]["action"], "CLOSE")
+        self.assertIn("TAKE_PROFIT", rows["WIN"]["reasons"][0])
+        self.assertEqual(rows["BROKEN"]["action"], "CLOSE")
+        self.assertIn("STOP_LOSS", rows["BROKEN"]["reasons"][0])
+        self.assertEqual(rows["OK"]["action"], "HOLD")
+
+    def test_dte_management_and_urgency_escalation(self):
+        rows, _ = self.manage(
+            open_trade(id="GAMMA", expiration="2026-06-25", unrealized_pnl_pct=20.0),  # 15 DTE
+            open_trade(id="URGENT", expiration="2026-06-15", unrealized_pnl_pct=20.0),  # 5 DTE
+        )
+        self.assertEqual(rows["GAMMA"]["action"], "ROLL_OR_CLOSE")
+        self.assertEqual(rows["GAMMA"]["urgency"], "MEDIUM")
+        self.assertEqual(rows["URGENT"]["action"], "ROLL_OR_CLOSE")
+        self.assertEqual(rows["URGENT"]["urgency"], "HIGH")
+
+    def test_profit_target_wins_over_dte_rule(self):
+        rows, _ = self.manage(
+            open_trade(id="BOTH", expiration="2026-06-25", unrealized_pnl_pct=55.0),  # 15 DTE + target
+        )
+        self.assertEqual(rows["BOTH"]["action"], "CLOSE")
+        self.assertIn("TAKE_PROFIT", rows["BOTH"]["reasons"][0])
+
+    def test_unmarked_or_unparseable_trades_are_review_not_hold(self):
+        unmarked = open_trade(id="NOMARK", expiration="2026-08-21")
+        no_data = open_trade(id="NODATA", expiration="")
+        rows, report = self.manage(unmarked, no_data)
+        self.assertEqual(rows["NOMARK"]["action"], "REVIEW")
+        self.assertEqual(rows["NODATA"]["action"], "REVIEW")
+        self.assertEqual(report["summary"]["review"], 2)
+
+    def test_closed_trades_are_ignored_and_high_urgency_sorts_first(self):
+        _, report = self.manage(
+            open_trade(id="HOLD", expiration="2026-08-21", unrealized_pnl_pct=5.0),
+            open_trade(id="WIN", expiration="2026-08-21", unrealized_pnl_pct=70.0),
+            open_trade(id="DONE", status="CLOSED", realized_pnl=50.0),
+        )
+        self.assertEqual(report["summary"]["open_trades"], 2)
+        self.assertEqual(report["actions"][0]["trade_id"], "WIN")
 
 
 class DataQualityGateTests(unittest.TestCase):

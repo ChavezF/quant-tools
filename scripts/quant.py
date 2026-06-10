@@ -124,6 +124,7 @@ def main():
     p_daily.add_argument("--dte-warning", type=int)
     p_daily.add_argument("--top", type=int, default=10)
     p_daily.add_argument("--skip-mark", action="store_true")
+    p_daily.add_argument("--skip-management", action="store_true")
     p_daily.add_argument("--skip-discovery", action="store_true")
     p_daily.add_argument("--skip-risk", action="store_true")
     p_daily.add_argument("--skip-scenario-stress", action="store_true")
@@ -133,6 +134,16 @@ def main():
     p_daily.add_argument("--no-cache", action="store_true")
     p_daily.add_argument("--send", action="store_true")
     p_daily.add_argument("--dry-run", action="store_true")
+
+    p_manage = sub.add_parser("manage", help="Exit/roll review of open journal trades")
+    p_manage.add_argument("--journal")
+    p_manage.add_argument("--db")
+    p_manage.add_argument("--profit-target-pct", type=float)
+    p_manage.add_argument("--stop-loss-pct", type=float)
+    p_manage.add_argument("--manage-dte", type=int)
+    p_manage.add_argument("--urgent-dte", type=int)
+    p_manage.add_argument("--output")
+    p_manage.add_argument("--json", action="store_true")
 
     p_mark = sub.add_parser("mark", help="Mark open journal trades to market (refresh unrealized P&L)")
     p_mark.add_argument("--journal")
@@ -240,6 +251,7 @@ def main():
     p_operator.add_argument("--skip-brief", action="store_true")
     p_operator.add_argument("--skip-alerts", action="store_true")
     p_operator.add_argument("--skip-mark", action="store_true")
+    p_operator.add_argument("--skip-management", action="store_true")
     p_operator.add_argument("--skip-discovery", action="store_true")
     p_operator.add_argument("--skip-storage", action="store_true")
     p_operator.add_argument("--skip-scenario-stress", action="store_true")
@@ -524,6 +536,7 @@ def main():
             cmd += ["--report-dir", args.report_dir]
         for flag_name, flag in [
             ("skip_mark", "--skip-mark"),
+            ("skip_management", "--skip-management"),
             ("skip_discovery", "--skip-discovery"),
             ("skip_risk", "--skip-risk"),
             ("skip_scenario_stress", "--skip-scenario-stress"),
@@ -536,6 +549,21 @@ def main():
         ]:
             if getattr(args, flag_name):
                 cmd += [flag]
+        return run(*cmd)
+    elif args.cmd == "manage":
+        management_cfg = cfg.get("position_management", {})
+        cmd = ["position_management.py"]
+        extend_opt(cmd, "--journal", journal_path(args.journal))
+        extend_opt(cmd, "--db", db_path_arg(args.db))
+        cmd += [
+            "--profit-target-pct", str(pick(args.profit_target_pct, management_cfg.get("profit_target_pct", 50.0))),
+            "--stop-loss-pct", str(pick(args.stop_loss_pct, management_cfg.get("stop_loss_pct", 200.0))),
+            "--manage-dte", str(pick(args.manage_dte, management_cfg.get("manage_dte", 21))),
+            "--urgent-dte", str(pick(args.urgent_dte, management_cfg.get("urgent_dte", 7))),
+        ]
+        extend_opt(cmd, "--output", args.output)
+        if args.json:
+            cmd += ["--json"]
         return run(*cmd)
     elif args.cmd == "mark":
         cmd = ["mark_to_market.py"]
@@ -709,6 +737,7 @@ def main():
             ("skip_brief", "--skip-brief"),
             ("skip_alerts", "--skip-alerts"),
             ("skip_mark", "--skip-mark"),
+            ("skip_management", "--skip-management"),
             ("skip_discovery", "--skip-discovery"),
             ("skip_storage", "--skip-storage"),
             ("skip_scenario_stress", "--skip-scenario-stress"),
