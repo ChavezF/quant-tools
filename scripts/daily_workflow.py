@@ -105,6 +105,19 @@ def journal_path(cfg: dict[str, Any], args: argparse.Namespace) -> str:
     return resolve_project_path(args.journal or cfg.get("journal", {}).get("path")) or ""
 
 
+def build_mark_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    """Mark open journal trades to market so profit-target alerts can fire."""
+    return [
+        PY,
+        str(SCRIPTS_DIR / "mark_to_market.py"),
+        "--journal",
+        journal_path(cfg, args),
+        "--db",
+        storage_db_path(cfg),
+        "--json",
+    ]
+
+
 def build_analytics_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[str]:
     return [
         PY,
@@ -441,6 +454,7 @@ def main() -> None:
     ap.add_argument("--profit-target-pct", type=float)
     ap.add_argument("--dte-warning", type=int)
     ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("--skip-mark", action="store_true")
     ap.add_argument("--skip-discovery", action="store_true")
     ap.add_argument("--skip-risk", action="store_true")
     ap.add_argument("--skip-scenario-stress", action="store_true")
@@ -470,9 +484,11 @@ def main() -> None:
         and not args.skip_risk
     )
     allocation_enabled = bool(cfg.get("portfolio_allocation", {}).get("enabled", True)) and not args.skip_allocation
+    mark_enabled = bool(cfg.get("journal", {}).get("mark_to_market", True)) and not args.skip_mark
     validation_enabled = bool(cfg.get("validation", {}).get("enabled", True))
     drift_enabled = bool(cfg.get("drift_monitor", {}).get("enabled", True))
     run_dir = ensure_report_dir(args.report_dir)
+    mark_report = run_dir / "mark_to_market.json"
     analytics_report = run_dir / "analytics.json"
     feedback_report = run_dir / "feedback.json"
     validation_report = run_dir / "validation.json"
@@ -491,6 +507,7 @@ def main() -> None:
         "created_at": datetime.now().isoformat(),
         "run_dir": str(run_dir),
         "reports": {
+            "mark_to_market": str(mark_report) if mark_enabled else None,
             "analytics": str(analytics_report),
             "feedback": str(feedback_report),
             "validation": str(validation_report) if validation_enabled else None,
@@ -519,6 +536,14 @@ def main() -> None:
         },
         "steps": [],
     }
+
+    # Refresh unrealized P&L on open trades first so the alerts step (and the
+    # operator) see live profit-target status instead of last run's marks.
+    if mark_enabled:
+        mark_meta = run_command("mark_to_market", build_mark_cmd(cfg, args), run_dir, dry_run=args.dry_run)
+        manifest["steps"].append(mark_meta)
+        if not args.dry_run and mark_meta["returncode"] == 0:
+            mark_report.write_text(Path(mark_meta["stdout"]).read_text())
 
     analytics_meta = run_command("analytics", build_analytics_cmd(cfg, args), run_dir, dry_run=args.dry_run)
     manifest["steps"].append(analytics_meta)

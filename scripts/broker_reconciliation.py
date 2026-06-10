@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from common import parse_osi_parts
+from common import atomic_write_json, parse_osi_parts, state_lock
 
 
 def normalize(value: Any) -> str:
@@ -469,39 +470,42 @@ def main() -> None:
     args = ap.parse_args()
 
     journal_path = Path(args.journal)
-    journal = json.loads(journal_path.read_text())
-    report = build_reconciliation(
-        journal,
-        json.loads(Path(args.tickets).read_text()),
-        json.loads(Path(args.broker_snapshot).read_text()),
-    )
-    if args.apply_updates:
-        applied = apply_journal_updates(
+    # Hold the journal lock across read-reconcile-write when applying so a
+    # concurrent journal add/close or mark-to-market run cannot interleave.
+    with state_lock("journal") if args.apply_updates else nullcontext():
+        journal = json.loads(journal_path.read_text())
+        report = build_reconciliation(
             journal,
-            [
-                *report.get("proposed_journal_updates", []),
-                *report.get("proposed_exit_updates", []),
-            ],
+            json.loads(Path(args.tickets).read_text()),
+            json.loads(Path(args.broker_snapshot).read_text()),
         )
-        output_path = Path(args.journal_output) if args.journal_output else journal_path
-        output_path.write_text(json.dumps(applied["journal"], indent=2, default=str))
-        if args.db:
-            from storage import connect, upsert_trades
+        if args.apply_updates:
+            applied = apply_journal_updates(
+                journal,
+                [
+                    *report.get("proposed_journal_updates", []),
+                    *report.get("proposed_exit_updates", []),
+                ],
+            )
+            output_path = Path(args.journal_output) if args.journal_output else journal_path
+            atomic_write_json(output_path, applied["journal"])
+            if args.db:
+                from storage import connect, upsert_trades
 
-            con = connect(args.db)
-            try:
-                upsert_trades(con, applied["journal"].get("trades", []))
-            finally:
-                con.close()
-        report["applied_journal_updates"] = applied["applied_updates"]
-        report["applied_exit_updates"] = [
-            update
-            for update in applied["applied_updates"]
-            if update.get("set", {}).get("status") == "CLOSED"
-        ]
-        report["summary"]["applied_journal_updates"] = len(applied["applied_updates"])
-        report["journal_output"] = str(output_path)
-        report["database_updated"] = bool(args.db)
+                con = connect(args.db)
+                try:
+                    upsert_trades(con, applied["journal"].get("trades", []))
+                finally:
+                    con.close()
+            report["applied_journal_updates"] = applied["applied_updates"]
+            report["applied_exit_updates"] = [
+                update
+                for update in applied["applied_updates"]
+                if update.get("set", {}).get("status") == "CLOSED"
+            ]
+            report["summary"]["applied_journal_updates"] = len(applied["applied_updates"])
+            report["journal_output"] = str(output_path)
+            report["database_updated"] = bool(args.db)
     if args.output:
         Path(args.output).write_text(json.dumps(report, indent=2, default=str))
     if args.json:

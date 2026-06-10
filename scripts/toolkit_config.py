@@ -38,6 +38,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "journal": {
         "path": "state/trades.json",
+        "mark_to_market": True,
     },
     "cache": {
         "enabled": True,

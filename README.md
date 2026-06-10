@@ -31,6 +31,7 @@ cd /home/chavez_f/code/quant-tools/scripts
 /usr/bin/python3.12 quant.py scan --watchlist SPY QQQ NVDA --strategies csp bull_put --min-dte 21 --max-dte 45
 /usr/bin/python3.12 quant.py scan --watchlist SPY QQQ NVDA --strategies csp bull_put --ranked --max-expirations 2 --wing-widths 2.5 5 10
 /usr/bin/python3.12 quant.py pretrade --candidates reports/scan.json --account-nav 30000
+/usr/bin/python3.12 quant.py mark --json
 /usr/bin/python3.12 quant.py journal add --ticker SPY --strategy BULL_PUT --entry-credit 1.20 --capital-at-risk 380 --score 66 --thesis "defined risk, acceptable liquidity"
 /usr/bin/python3.12 quant.py journal profiles --section ticker_strategy
 /usr/bin/python3.12 quant.py plan --candidates reports/scan.json --portfolio reports/risk.json --journal state/trades.json --account-nav 30000
@@ -96,6 +97,32 @@ allocator ranks actionable trades by quality and capital efficiency, then
 selects a basket within aggregate capital, tail-loss, ticker, correlation-group,
 position-count, and delta limits. Execution tickets are created from that
 selected basket rather than every individually approved candidate.
+
+The `mark` command (`mark_to_market.py`) prices every OPEN journal trade
+against the live option chain and stamps `unrealized_pnl`,
+`unrealized_pnl_pct`, `mark_cost_to_close`, and `marked_at` onto the trade.
+`unrealized_pnl_pct` is the percent of **max profit** captured (100 = the
+position could be closed for zero debit), matching the standard "close at 50%"
+short-premium rule and the `alerts --profit-target-pct` threshold — without a
+fresh mark the profit-target alert cannot fire. The operator workflow runs the
+mark step first (before analytics and alerts); disable it with
+`journal.mark_to_market: false` in config or `--skip-mark`. Supported
+structures: CSP, CC, bull put / bear call spreads, short strangle, iron
+condor. Debit structures and unrecognized strategies are reported as SKIPPED,
+never guessed.
+
+## State safety
+
+Journal, position, cursor, and cache writes go through an atomic
+temp-file-plus-rename (`common.atomic_write_json`), so a crash mid-write can
+never truncate a state file. A **corrupt** `trades.json` or `positions.json`
+now refuses to load with a restore hint instead of silently starting from an
+empty state (which previously let the next save overwrite the only copy of
+the history). Journal mutations (`journal add/close`, `mark`,
+`reconcile --apply-updates`, position-tracker updates) take an advisory lock
+in `state/` so the morning cron and a manual command cannot interleave
+writes; a holder that crashed is detected by lock age and broken
+automatically after 30 minutes.
 
 The `validate` command uses expanding training windows to select a score
 threshold, then measures that threshold on the next unseen block of closed

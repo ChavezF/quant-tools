@@ -24,7 +24,8 @@
     "min_pop_pct": 55
   },
   "journal": {
-    "path": "state/trades.json"
+    "path": "state/trades.json",
+    "mark_to_market": true
   },
   "cache": {
     "enabled": true,

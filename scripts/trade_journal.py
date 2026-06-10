@@ -13,7 +13,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from common import STATE_DIR
+from common import STATE_DIR, atomic_write_json, state_lock
 from trade_stats import pnl_breakdown, profit_factor, trade_pnl
 
 
@@ -29,17 +29,24 @@ def load_state(path: Path) -> dict[str, Any]:
         return default_state()
     try:
         state = json.loads(path.read_text())
-        state.setdefault("version", 1)
-        state.setdefault("trades", [])
-        return state
-    except json.JSONDecodeError:
-        return default_state()
+    except json.JSONDecodeError as exc:
+        # Never fall back to an empty journal here: every downstream report
+        # (analytics, calibration, drift) would silently compute from nothing
+        # and the next save would overwrite the only copy of the history.
+        raise SystemExit(
+            f"Trade journal {path} is corrupt ({exc}). Refusing to continue. "
+            "Restore it from state/backups (db-maintenance keeps SQLite "
+            "backups; `storage --export-journal` can rebuild the JSON) "
+            "before rerunning."
+        ) from exc
+    state.setdefault("version", 1)
+    state.setdefault("trades", [])
+    return state
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     state["last_updated"] = datetime.now().isoformat()
-    path.write_text(json.dumps(state, indent=2, default=str))
+    atomic_write_json(path, state)
 
 
 def load_backend(state_file: Path, db_path: str | None) -> tuple[dict[str, Any], Any]:
@@ -266,23 +273,26 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     state_file = Path(args.state_file)
-    state, con = load_backend(state_file, args.db)
 
-    if args.cmd == "add":
-        trade = add_trade(state, args)
-        save_backend(state_file, state, con)
+    if args.cmd in {"add", "close"}:
+        # Hold the journal lock across load-mutate-save so a concurrent
+        # operator run or second manual command cannot interleave writes.
+        with state_lock("journal"):
+            state, con = load_backend(state_file, args.db)
+            trade = add_trade(state, args) if args.cmd == "add" else close_trade(state, args)
+            save_backend(state_file, state, con)
         if args.json:
             print(json.dumps(trade, indent=2, default=str))
-        else:
+        elif args.cmd == "add":
             print(f"Added trade {trade['id']} ({trade['ticker']} {trade['strategy']})")
-    elif args.cmd == "close":
-        trade = close_trade(state, args)
-        save_backend(state_file, state, con)
-        if args.json:
-            print(json.dumps(trade, indent=2, default=str))
         else:
             print(f"Closed trade {trade['id']}: realized P&L ${trade['realized_pnl']:,.2f}")
-    elif args.cmd == "list":
+        if con is not None:
+            con.close()
+        return
+
+    state, con = load_backend(state_file, args.db)
+    if args.cmd == "list":
         trades = filter_trades(state.get("trades", []), args.status)
         if args.json:
             print(json.dumps(trades, indent=2, default=str))

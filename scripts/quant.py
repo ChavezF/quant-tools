@@ -123,6 +123,7 @@ def main():
     p_daily.add_argument("--profit-target-pct", type=float)
     p_daily.add_argument("--dte-warning", type=int)
     p_daily.add_argument("--top", type=int, default=10)
+    p_daily.add_argument("--skip-mark", action="store_true")
     p_daily.add_argument("--skip-discovery", action="store_true")
     p_daily.add_argument("--skip-risk", action="store_true")
     p_daily.add_argument("--skip-scenario-stress", action="store_true")
@@ -132,6 +133,13 @@ def main():
     p_daily.add_argument("--no-cache", action="store_true")
     p_daily.add_argument("--send", action="store_true")
     p_daily.add_argument("--dry-run", action="store_true")
+
+    p_mark = sub.add_parser("mark", help="Mark open journal trades to market (refresh unrealized P&L)")
+    p_mark.add_argument("--journal")
+    p_mark.add_argument("--db")
+    p_mark.add_argument("--output")
+    p_mark.add_argument("--dry-run", action="store_true")
+    p_mark.add_argument("--json", action="store_true")
 
     p_journal = sub.add_parser("journal", help="Trade journal add/list/close/stats")
     p_journal.add_argument("--state-file")
@@ -227,6 +235,7 @@ def main():
     p_operator.add_argument("--send", action="store_true")
     p_operator.add_argument("--skip-brief", action="store_true")
     p_operator.add_argument("--skip-alerts", action="store_true")
+    p_operator.add_argument("--skip-mark", action="store_true")
     p_operator.add_argument("--skip-discovery", action="store_true")
     p_operator.add_argument("--skip-storage", action="store_true")
     p_operator.add_argument("--skip-scenario-stress", action="store_true")
@@ -508,6 +517,7 @@ def main():
         if args.report_dir:
             cmd += ["--report-dir", args.report_dir]
         for flag_name, flag in [
+            ("skip_mark", "--skip-mark"),
             ("skip_discovery", "--skip-discovery"),
             ("skip_risk", "--skip-risk"),
             ("skip_scenario_stress", "--skip-scenario-stress"),
@@ -520,6 +530,16 @@ def main():
         ]:
             if getattr(args, flag_name):
                 cmd += [flag]
+        return run(*cmd)
+    elif args.cmd == "mark":
+        cmd = ["mark_to_market.py"]
+        extend_opt(cmd, "--journal", journal_path(args.journal))
+        extend_opt(cmd, "--db", db_path_arg(args.db))
+        extend_opt(cmd, "--output", args.output)
+        if args.dry_run:
+            cmd += ["--dry-run"]
+        if args.json:
+            cmd += ["--json"]
         return run(*cmd)
     elif args.cmd == "journal":
         cmd = ["trade_journal.py"]
@@ -678,6 +698,7 @@ def main():
             ("send", "--send"),
             ("skip_brief", "--skip-brief"),
             ("skip_alerts", "--skip-alerts"),
+            ("skip_mark", "--skip-mark"),
             ("skip_discovery", "--skip-discovery"),
             ("skip_storage", "--skip-storage"),
             ("skip_scenario_stress", "--skip-scenario-stress"),
