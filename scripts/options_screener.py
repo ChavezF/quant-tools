@@ -26,15 +26,18 @@ from pathlib import Path
 from cache_utils import cached
 from common import configure_public_imports, get_public_client, parse_osi_strike
 from candidate_scoring import score_results
-from data_reliability import quote_is_stale, retry_call, utc_now_iso
+from data_reliability import (
+    hard_quote_issues,
+    option_leg_issues,
+    quote_is_stale,
+    quote_issues,
+    retry_call,
+    utc_now_iso,
+)
 from scan_optimizer import parse_wing_widths, select_expirations
 from toolkit_config import add_config_argument, load_config
 
 configure_public_imports()
-
-from public_api_sdk import (
-    OrderInstrument, InstrumentType, OptionChainRequest,
-)
 
 import yfinance as yf
 import numpy as np
@@ -84,7 +87,7 @@ def fetch_quote(client, symbol: str, reliability_cfg: dict | None = None) -> dic
 
 def fetch_option_expirations(client, symbol: str, reliability_cfg: dict | None = None) -> list[str]:
     """Use the dedicated expirations endpoint. Returns list of YYYY-MM-DD strings."""
-    from public_api_sdk import OptionExpirationsRequest
+    from public_api_sdk import InstrumentType, OptionExpirationsRequest, OrderInstrument
 
     reliability_cfg = reliability_cfg or {}
 
@@ -107,6 +110,8 @@ def fetch_chain_with_greeks(client, symbol: str, expiration: str, spot: float,
     Pull the chain and selectively fetch Greeks for strikes within
     ±10% of spot. Returns dict {'calls': {strike: {...}}, 'puts': {...}}.
     """
+    from public_api_sdk import InstrumentType, OptionChainRequest, OrderInstrument
+
     reliability_cfg = reliability_cfg or {}
 
     def _chain_call():
@@ -176,6 +181,8 @@ def fetch_chain_with_greeks(client, symbol: str, expiration: str, spot: float,
         except Exception as e:
             print(f"  ! greeks batch failed (will proceed without): {e}", file=sys.stderr)
 
+    quality = {"dropped_legs": 0, "sanitized_iv": 0}
+
     def build_legs(legs, side):
         out = {}
         for leg in legs:
@@ -190,8 +197,17 @@ def fetch_chain_with_greeks(client, symbol: str, expiration: str, spot: float,
             bid = float(leg.bid) if leg.bid else 0.0
             ask = float(leg.ask) if leg.ask else 0.0
             last = float(leg.last) if leg.last else 0.0
+            g = dict(greeks_map.get(osi, {}))
+            issues = option_leg_issues(bid, ask, g.get("iv"))
+            if "negative quote" in issues or "crossed market" in issues:
+                # A crossed or negative leg quote is feed corruption — a mid
+                # priced from it would produce a fake candidate downstream.
+                quality["dropped_legs"] += 1
+                continue
+            if "implausible IV" in issues:
+                quality["sanitized_iv"] += 1
+                g["iv"] = None
             mark = (bid + ask) / 2 if (bid and ask) else last
-            g = greeks_map.get(osi, {})
             out[strike] = {
                 "bid": bid,
                 "ask": ask,
@@ -205,7 +221,14 @@ def fetch_chain_with_greeks(client, symbol: str, expiration: str, spot: float,
             }
         return out
 
-    return {"calls": build_legs(calls, "call"), "puts": build_legs(puts, "put")}
+    result = {"calls": build_legs(calls, "call"), "puts": build_legs(puts, "put"), "data_quality": quality}
+    if quality["dropped_legs"] or quality["sanitized_iv"]:
+        print(
+            f"  ! chain quality {symbol} {expiration}: dropped {quality['dropped_legs']} bad legs, "
+            f"sanitized {quality['sanitized_iv']} IVs",
+            file=sys.stderr,
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +319,8 @@ def screen_csp(chain: dict, spot: float, dte: int, target_delta: float = -0.30,
             continue
         if leg["volume"] < min_volume:
             continue
+        if leg["bid"] <= 0:  # no bid = the short leg cannot actually be sold
+            continue
         if leg["mark"] <= 0.05:
             continue
         # Strike must be below spot for a put you want assigned-or-expire
@@ -340,6 +365,8 @@ def screen_cc(chain: dict, spot: float, dte: int, target_delta: float = 0.30,
             continue
         if strike < spot * 0.99:  # skip deep ITM
             continue
+        if leg["bid"] <= 0:  # no bid = the short leg cannot actually be sold
+            continue
         if leg["mark"] <= 0.05:
             continue
         credit = leg["mark"]
@@ -379,6 +406,8 @@ def screen_bull_put(chain: dict, spot: float, dte: int,
         if abs(short_leg["delta"] - short_delta) > 0.08:
             continue
         if short_leg["open_interest"] < min_oi:
+            continue
+        if short_leg["bid"] <= 0:  # no bid = the short leg cannot actually be sold
             continue
         # Try integer / 0.5 / 1.0 strikes
         for delta in (0, 0.5, 1.0):
@@ -468,6 +497,13 @@ def main():
             continue
 
         metrics = fetch_underlying_metrics(symbol, ttl_seconds=metrics_ttl)
+        issues = quote_issues(quote, reference_price=metrics.get("last_close"))
+        hard_issues = hard_quote_issues(issues)
+        if hard_issues:
+            print(f"  ! unusable quote ({'; '.join(hard_issues)}), skipping", file=sys.stderr)
+            continue
+        if issues:
+            print(f"  ! quote warnings: {'; '.join(issues)}", file=sys.stderr)
         rv = metrics.get("rv_21d_pct", 0)
         iv_rank = metrics.get("iv_rank_proxy_pct", 0)
         print(f"  spot=${spot:.2f}  RV21d={rv:.1f}%  IV-rank-prox={iv_rank:.0f}  "
@@ -492,6 +528,7 @@ def main():
             "data_quality": {
                 "quote": quote.get("_meta", {}),
                 "quote_stale": quote.get("stale", True),
+                "quote_issues": issues,
             },
             "strategies": {},
         }

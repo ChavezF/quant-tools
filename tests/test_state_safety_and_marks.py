@@ -14,6 +14,7 @@ if str(SCRIPTS) not in sys.path:
 import common
 from common import atomic_write_json, state_lock
 from alerts import build_alerts
+from data_reliability import hard_quote_issues, option_leg_issues, quote_issues
 from mark_to_market import mark_open_trades, mark_trade, parse_strikes, trade_legs
 from trade_journal import default_state, load_state
 
@@ -241,6 +242,57 @@ class MarkToMarketTests(unittest.TestCase):
         )
         kinds = {alert["kind"] for alert in report["alerts"]}
         self.assertNotIn("profit_target", kinds)
+
+
+class DataQualityGateTests(unittest.TestCase):
+    def test_quote_issues_flags_broken_and_suspect_quotes(self):
+        self.assertEqual(quote_issues({"last": 480.0, "bid": 479.9, "ask": 480.1}), [])
+        self.assertIn("non-positive last", quote_issues({"last": 0.0}))
+        self.assertIn("crossed market (bid > ask)", quote_issues({"last": 480.0, "bid": 481.0, "ask": 480.0}))
+        self.assertIn("negative bid", quote_issues({"last": 480.0, "bid": -1.0, "ask": 480.1}))
+        self.assertIn("stale quote", quote_issues({"last": 480.0, "stale": True}))
+        diverged = quote_issues({"last": 480.0}, reference_price=400.0)
+        self.assertTrue(any("diverges" in issue for issue in diverged))
+        # 10% default tolerance: a 5% move vs reference close is fine
+        self.assertEqual(quote_issues({"last": 420.0}, reference_price=400.0), [])
+
+    def test_hard_quote_issues_excludes_warnings(self):
+        issues = quote_issues({"last": -1.0, "stale": True}, reference_price=400.0)
+        hard = hard_quote_issues(issues)
+        self.assertEqual(hard, ["non-positive last"])
+
+    def test_option_leg_issues(self):
+        self.assertEqual(option_leg_issues(1.0, 1.2, iv=0.35), [])
+        self.assertIn("crossed market", option_leg_issues(1.5, 1.2))
+        self.assertIn("negative quote", option_leg_issues(-0.5, 1.2))
+        self.assertIn("implausible IV", option_leg_issues(1.0, 1.2, iv=9.0))
+        self.assertIn("implausible IV", option_leg_issues(1.0, 1.2, iv=0.0))
+        self.assertEqual(option_leg_issues(0.0, 1.2), [])  # no bid is a side-specific concern
+
+    def test_screens_reject_unsellable_zero_bid_short_legs(self):
+        from options_screener import screen_bull_put, screen_csp
+
+        def put_leg(strike, bid, ask, delta):
+            return {
+                "bid": bid, "ask": ask, "last": (bid + ask) / 2, "mark": (bid + ask) / 2,
+                "volume": 500, "open_interest": 1000, "osi": f"SPY260717P{int(strike*1000):08d}",
+                "side": "put", "delta": delta, "iv": 0.30,
+            }
+
+        chain = {"puts": {
+            470.0: put_leg(470.0, 0.0, 2.4, -0.30),   # no bid: mid is fiction
+            465.0: put_leg(465.0, 1.0, 1.2, -0.30),   # healthy
+            460.0: put_leg(460.0, 0.4, 0.6, -0.20),   # spread long-wing candidate
+            455.0: put_leg(455.0, 0.2, 0.4, -0.12),
+        }, "calls": {}}
+
+        csp = screen_csp(chain, spot=480.0, dte=35, target_delta=-0.30, min_oi=50)
+        strikes = [row["strike"] for row in csp]
+        self.assertNotIn(470.0, strikes)  # zero-bid short leg rejected
+        self.assertIn(465.0, strikes)
+
+        spreads = screen_bull_put(chain, spot=480.0, dte=35, short_delta=-0.20, wing_width=5.0, min_oi=50)
+        self.assertTrue(all(row["short_strike"] != 470.0 for row in spreads))
 
 
 if __name__ == "__main__":
