@@ -229,6 +229,8 @@ def main():
     p_dashboard.add_argument("--drift")
     p_dashboard.add_argument("--scorecard")
     p_dashboard.add_argument("--management")
+    p_dashboard.add_argument("--brief")
+    p_dashboard.add_argument("--iv-ranks")
     p_dashboard.add_argument("--output")
 
     p_analytics = sub.add_parser("analytics", help="Analyze realized journal performance")
@@ -752,6 +754,8 @@ def main():
             ("drift", "--drift"),
             ("scorecard", "--scorecard"),
             ("management", "--management"),
+            ("brief", "--brief"),
+            ("iv_ranks", "--iv-ranks"),
             ("output", "--output"),
         ]:
             value = getattr(args, attr)

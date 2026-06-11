@@ -12,6 +12,7 @@ if str(SCRIPTS) not in sys.path:
 
 from hermes_ops import (
     _classify_ivr,
+    categorize_executable_tickets,
     compose_executable_message,
     compose_planning_message,
     planning_brief,
@@ -229,6 +230,31 @@ class HermesOpsTests(unittest.TestCase):
         self.assertIn("EXECUTABLE (2 approved):", message)
         self.assertIn("NEWCO", message)
         self.assertNotIn("HELD BY IVR", message)
+
+    def test_categorize_executable_tickets_is_the_shared_gate(self):
+        # dashboard.py renders the EXECUTABLE / HELD BY IVR split from this
+        # function, and format_executable_tickets formats from it — pin the
+        # category semantics directly so the shared contract can't drift.
+        report = {
+            "tickets": [
+                {"decision": "APPROVE", "ticker": "QQQ", "score": 63.3},
+                {"decision": "STRONG", "ticker": "NVDA", "score": 57.3},
+                {"decision": "REDUCE", "ticker": "MSFT", "score": 62.1},
+                {"decision": "HOLD", "ticker": "TSLA", "score": 40.0},
+            ]
+        }
+        gated = categorize_executable_tickets(report, {"QQQ": 88.0, "NVDA": 43.0})
+        self.assertEqual([t["ticker"] for t in gated["executable"]], ["QQQ"])
+        self.assertEqual([t["ticker"] for t in gated["held_by_ivr"]], ["NVDA"])
+        self.assertEqual([t["ticker"] for t in gated["reduced"]], ["MSFT"])
+        # No iv_ranks (or empty dict) -> gate bypassed, nothing held.
+        for iv_ranks in (None, {}):
+            ungated = categorize_executable_tickets(report, iv_ranks)
+            self.assertEqual([t["ticker"] for t in ungated["executable"]], ["QQQ", "NVDA"])
+            self.assertEqual(ungated["held_by_ivr"], [])
+        # Ticker missing from iv_ranks stays executable (no hold on missing data).
+        partial = categorize_executable_tickets(report, {"QQQ": 88.0})
+        self.assertEqual([t["ticker"] for t in partial["executable"]], ["QQQ", "NVDA"])
 
     def test_ivr_classifier_matches_iv_rank_module(self):
         # The local _classify_ivr in hermes_ops must stay in lockstep with
