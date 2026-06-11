@@ -1,0 +1,7 @@
+# Pinned runtime dependencies for reproducible installs (June 2026).
+# pyproject.toml carries the compatible ranges; this file pins the exact
+# versions the toolkit is verified against. yfinance breaks its calendar API
+# regularly — bump it deliberately, with `quant.py verify` green, not by accident.
+numpy==2.4.6
+pandas==3.0.3
+yfinance==1.4.1

@@ -302,7 +302,7 @@ def main() -> int:
 
     # 4. Send
     if not send_telegram(composed):
-        print(f"⚠️ Telegram send failed", file=sys.stderr)
+        print("⚠️ Telegram send failed", file=sys.stderr)
         return 1
 
     print(f"✅ Executable scan delivered {now_str()} ({len(composed)} chars); reports at {latest}")

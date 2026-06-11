@@ -8,6 +8,8 @@ permissions:
   contents: read
 
 jobs:
+  # Dependency-light guard: the core logic and tests must keep working with
+  # nothing but the standard library installed (numpy-backed tests skip).
   verify:
     strategy:
       fail-fast: false
@@ -23,3 +25,34 @@ jobs:
         run: python scripts/health_check.py --skip-db --json
       - name: CLI smoke test
         run: python scripts/quant.py --help
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff==0.14.5
+      - name: Lint
+        run: ruff check scripts tests ops
+
+  # Full-dependency run: install the pinned requirements so the numpy-backed
+  # tests (bootstrap VaR) execute instead of skipping, and the package
+  # actually installs with its console entry point.
+  tests-full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package with pinned dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install .
+      - name: Unit tests (full)
+        run: python -m unittest discover -s tests
+      - name: Installed entry point smoke test
+        run: quant --help
