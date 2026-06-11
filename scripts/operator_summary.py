@@ -25,6 +25,8 @@ def build_summary(
     validation: dict[str, Any] | None = None,
     drift: dict[str, Any] | None = None,
     execution_history: dict[str, Any] | None = None,
+    scorecard: dict[str, Any] | None = None,
+    management: dict[str, Any] | None = None,
 ) -> str:
     reconciliation_wrapper = reconciliation or {}
     lifecycle_counts = reconciliation_wrapper.get("ticket_lifecycle", {})
@@ -41,8 +43,16 @@ def build_summary(
     drift = drift or {}
     drift_summary = drift.get("summary", {})
     drift_comparison = drift.get("comparison", {})
+    scorecard = scorecard or {}
+    pop_summary = scorecard.get("pop_calibration", {})
+    monthly = scorecard.get("monthly", {})
+    latest_month = monthly[max(monthly)] if monthly else {}
+    management = management or {}
+    management_summary = management.get("summary", {})
     database_status = "NOT RUN" if not database_maintenance else ("OK" if database_maintenance.get("ok") else "FAILED")
     health_status = "NOT RUN" if not health else ("OK" if health.get("ok") else "FAILED")
+    projected_es = allocation_summary.get("projected_expected_shortfall_95")
+    projected_es_text = "N/A" if projected_es is None else f"${float(projected_es):,.2f}"
     summary = plan.get("summary", {})
     overall = analytics.get("overall", {})
     drawdown = analytics.get("drawdown", {})
@@ -57,6 +67,10 @@ def build_summary(
         f"- Reduced: {summary.get('reduce', 0)}",
         f"- Rejected: {summary.get('reject', 0)}",
         f"- High-priority alerts: {alerts.get('summary', {}).get('high', 0)}",
+        f"- Open positions managed: {management_summary.get('open_trades', 0)}",
+        f"- High-urgency position actions: {management_summary.get('high_urgency', 0)}",
+        f"- Strike threats: {management_summary.get('strike_threats', 0)}",
+        f"- Event-spanning positions: {management_summary.get('event_spans', 0)}",
         f"- Planning candidates: {summary.get('approve', 0) + summary.get('reduce', 0)}",
         f"- Ready for review: {lifecycle_counts.get('READY', len(tickets.get('tickets', [])))}",
         f"- Submitted orders: {lifecycle_counts.get('SUBMITTED', 0)}",
@@ -90,6 +104,8 @@ def build_summary(
         f"- Capital allocated: ${float(allocation_summary.get('capital_allocated', 0) or 0):,.2f} "
         f"({float(allocation_summary.get('capital_utilization_pct', 0) or 0):.1f}% of budget)",
         f"- Tail-loss budget used: {float(allocation_summary.get('tail_budget_utilization_pct', 0) or 0):.1f}%",
+        f"- Allocation risk model: {(allocation or {}).get('limits', {}).get('risk_model', 'NOT RUN')}",
+        f"- Projected 95% expected shortfall: {projected_es_text}",
         f"- Walk-forward validation: {validation_summary.get('status') or 'NOT RUN'} "
         f"({float(validation_summary.get('profitable_fold_pct', 0) or 0):.1f}% profitable folds)",
         f"- OOS expectancy: ${float(validation_summary.get('avg_oos_expectancy', 0) or 0):,.2f}",
@@ -106,6 +122,11 @@ def build_summary(
         f"- Total realized P&L: ${float(overall.get('total_pnl', 0) or 0):,.2f}",
         f"- Max drawdown: ${float(drawdown.get('max_drawdown', 0) or 0):,.2f}",
         f"- Recommended minimum score: {float(feedback.get('recommended_min_score', 0) or 0):.1f}",
+        f"- POP calibration samples: {pop_summary.get('sample_size', 0)} "
+        f"({pop_summary.get('status', 'NO_POP_HISTORY')})",
+        f"- Latest monthly account return: {float(latest_month.get('account_return_pct', 0) or 0):+.2f}%",
+        f"- Latest monthly excess vs SPY: "
+        f"{'N/A' if latest_month.get('excess_return_vs_spy_pct') is None else f'{float(latest_month.get('excess_return_vs_spy_pct')):+.2f}%'}",
         "",
         "## Execution Attribution",
         "",
@@ -149,6 +170,35 @@ def build_summary(
             f"({rank_text}size x{float(ticket.get('size_multiplier', 0) or 0):.2f})"
         )
 
+    lines.extend(["", "## Open Position Management", ""])
+    management_rows = management.get("actions", [])
+    if not management_rows:
+        lines.append("- No open positions requiring management.")
+    for row in management_rows[:10]:
+        threat = row.get("strike_threat", {})
+        roll = row.get("roll_proposal") or {}
+        detail = (row.get("reasons") or ["No active management rule."])[0]
+        lines.append(
+            f"- **{row.get('urgency')} {row.get('ticker')} {row.get('strategy')}** "
+            f"{row.get('action')} at {row.get('dte')} DTE: {detail}"
+        )
+        if threat.get("status") in {"THREAT", "BREACHED"}:
+            lines.append(
+                f"  Strike {threat.get('status')}: {threat.get('sigma_distance')} sigma "
+                f"from {threat.get('option_type')}{threat.get('short_strike')}."
+            )
+        if row.get("event_span"):
+            events = ", ".join(
+                f"{event.get('event_type')} {event.get('date')}"
+                for event in row["event_span"]
+            )
+            lines.append(f"  Spans: {events}.")
+        if roll.get("status") == "CREDIT_AVAILABLE":
+            lines.append(
+                f"  Credit roll: {roll.get('to_expiration')} {roll.get('to_strike')} "
+                f"for at least {roll.get('net_credit')}."
+            )
+
     lines.extend(
         [
             "",
@@ -185,6 +235,8 @@ def main() -> None:
         read_json(base / "validation.json"),
         read_json(base / "drift.json"),
         execution_history=read_json(base / "execution_history.json"),
+        scorecard=read_json(base / "scorecard.json"),
+        management=read_json(base / "management.json"),
     )
     output.write_text(text)
     print(output)

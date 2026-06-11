@@ -18,7 +18,8 @@ from common import atomic_write_json, state_lock
 from alerts import build_alerts
 from data_reliability import hard_quote_issues, option_leg_issues, quote_issues
 from mark_to_market import mark_open_trades, mark_trade, parse_strikes, trade_legs
-from position_management import build_management_report
+from intraday_sentinel import alertable_states, compare_states
+from position_management import LiveManagementSource, build_management_report
 from trade_journal import default_state, load_state
 
 try:
@@ -255,6 +256,79 @@ class MarkToMarketTests(unittest.TestCase):
 
 
 class PositionManagementTests(unittest.TestCase):
+    def test_sigma_strike_threat_escalates_hold(self):
+        report = build_management_report(
+            {"trades": [open_trade(expiration="2026-07-17", unrealized_pnl_pct=10)]},
+            today=date(2026, 6, 11),
+            market_contexts={
+                "T20260601-001": {
+                    "spot": 476,
+                    "iv": 0.20,
+                    "events": [],
+                }
+            },
+        )
+        action = report["actions"][0]
+        self.assertEqual(action["strike_threat"]["status"], "THREAT")
+        self.assertEqual(action["urgency"], "HIGH")
+        self.assertEqual(action["action"], "ROLL_OR_CLOSE")
+
+    def test_open_trade_spanning_earnings_or_fomc_is_reviewed(self):
+        report = build_management_report(
+            {"trades": [open_trade(expiration="2026-07-17", unrealized_pnl_pct=10)]},
+            today=date(2026, 6, 11),
+            market_contexts={
+                "T20260601-001": {
+                    "events": [
+                        {"event_type": "EARNINGS", "date": "2026-06-25", "ticker": "SPY"},
+                        {"event_type": "FOMC", "date": "2026-06-17"},
+                    ]
+                }
+            },
+        )
+        action = report["actions"][0]
+        self.assertEqual(action["action"], "REVIEW")
+        self.assertEqual(action["urgency"], "HIGH")
+        self.assertEqual(report["summary"]["event_spans"], 1)
+
+    def test_single_leg_roll_proposal_requires_net_credit(self):
+        source = LiveManagementSource.__new__(LiveManagementSource)
+        source.today = date(2026, 6, 11)
+        source.thresholds = {"roll_min_dte": 28, "roll_max_dte": 50}
+        source.spot = lambda ticker: 500
+        source.expirations = lambda ticker: ["2026-07-17", "2026-07-24"]
+        source.chain = lambda ticker, expiration: {
+            "puts": {
+                470.0: {"delta": -0.29, "bid": 1.35, "ask": 1.45, "mark": 1.4}
+            },
+            "calls": {},
+        }
+        proposal = source.roll_proposal(
+            open_trade(expiration="2026-07-17", strikes="475"),
+            {
+                "puts": {
+                    475.0: {"delta": -0.30, "bid": 0.95, "ask": 1.05, "mark": 1.0}
+                },
+                "calls": {},
+            },
+        )
+        self.assertEqual(proposal["status"], "CREDIT_AVAILABLE")
+        self.assertEqual(proposal["to_strike"], 470.0)
+        self.assertEqual(proposal["net_credit"], 0.3)
+
+    def test_intraday_state_dedup_only_emits_changes(self):
+        report = build_management_report(
+            {"trades": [open_trade(expiration="2026-07-17", unrealized_pnl_pct=10)]},
+            today=date(2026, 6, 11),
+            market_contexts={
+                "T20260601-001": {"spot": 476, "iv": 0.2, "events": []}
+            },
+        )
+        current = alertable_states(report)
+        self.assertEqual(len(compare_states({}, current)["changed"]), 1)
+        self.assertEqual(compare_states(current, current)["changed"], [])
+        self.assertEqual(len(compare_states(current, {})["resolved"]), 1)
+
     TODAY = date(2026, 6, 10)
 
     def manage(self, *trades):

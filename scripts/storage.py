@@ -12,7 +12,7 @@ from common import STATE_DIR
 
 
 DEFAULT_DB_FILE = STATE_DIR / "quant_tools.db"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 
 def now_iso() -> str:
@@ -146,6 +146,65 @@ def migrate(con: sqlite3.Connection) -> None:
             PRAGMA user_version = 4;
             """
         )
+        version = 4
+    if version < 5:
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS option_chain_snapshots (
+                captured_at TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                expiration TEXT NOT NULL,
+                option_type TEXT NOT NULL,
+                strike REAL NOT NULL,
+                spot REAL,
+                dte INTEGER,
+                osi TEXT,
+                bid REAL,
+                ask REAL,
+                last REAL,
+                mark REAL,
+                volume INTEGER,
+                open_interest INTEGER,
+                delta REAL,
+                gamma REAL,
+                theta REAL,
+                vega REAL,
+                rho REAL,
+                iv REAL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (captured_at, ticker, expiration, option_type, strike)
+            );
+            CREATE INDEX IF NOT EXISTS idx_chain_snapshot_contract
+                ON option_chain_snapshots(ticker, expiration, option_type, strike, captured_at);
+            CREATE INDEX IF NOT EXISTS idx_chain_snapshot_time
+                ON option_chain_snapshots(captured_at);
+            PRAGMA user_version = 5;
+            """
+        )
+        version = 5
+    if version < 6:
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS equity_lots (
+                id TEXT PRIMARY KEY,
+                ticker TEXT NOT NULL,
+                status TEXT NOT NULL,
+                acquired_at TEXT,
+                quantity REAL NOT NULL,
+                cost_basis_per_share REAL NOT NULL,
+                source_trade_id TEXT,
+                assignment_event_id TEXT,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_equity_lots_ticker_status
+                ON equity_lots(ticker, status);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_equity_lots_assignment_event
+                ON equity_lots(assignment_event_id)
+                WHERE assignment_event_id IS NOT NULL;
+            PRAGMA user_version = 6;
+            """
+        )
     con.commit()
 
 
@@ -183,6 +242,49 @@ def upsert_trades(con: sqlite3.Connection, trades: list[dict[str, Any]]) -> int:
             strategy=excluded.strategy,
             opened_at=excluded.opened_at,
             closed_at=excluded.closed_at,
+            payload_json=excluded.payload_json,
+            updated_at=excluded.updated_at
+        """,
+        rows,
+    )
+    con.commit()
+    return len(rows)
+
+
+def upsert_equity_lots(con: sqlite3.Connection, lots: list[dict[str, Any]]) -> int:
+    rows = []
+    ts = now_iso()
+    for lot in lots:
+        if not lot.get("id") or not lot.get("ticker"):
+            continue
+        rows.append(
+            (
+                str(lot["id"]),
+                str(lot["ticker"]).upper(),
+                str(lot.get("status") or "OPEN").upper(),
+                lot.get("acquired_at"),
+                float(lot.get("quantity") or 0),
+                float(lot.get("cost_basis_per_share") or 0),
+                lot.get("source_trade_id"),
+                lot.get("assignment_event_id"),
+                _json(lot),
+                ts,
+            )
+        )
+    con.executemany(
+        """
+        INSERT INTO equity_lots(
+            id, ticker, status, acquired_at, quantity, cost_basis_per_share,
+            source_trade_id, assignment_event_id, payload_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            ticker=excluded.ticker,
+            status=excluded.status,
+            acquired_at=excluded.acquired_at,
+            quantity=excluded.quantity,
+            cost_basis_per_share=excluded.cost_basis_per_share,
+            source_trade_id=excluded.source_trade_id,
+            assignment_event_id=excluded.assignment_event_id,
             payload_json=excluded.payload_json,
             updated_at=excluded.updated_at
         """,
@@ -298,6 +400,58 @@ def record_position_snapshot(
     )
     con.commit()
     return inserted
+
+
+def insert_option_chain_snapshot(
+    con: sqlite3.Connection,
+    *,
+    captured_at: str,
+    ticker: str,
+    expiration: str,
+    spot: float,
+    dte: int,
+    chain: dict[str, Any],
+) -> int:
+    rows = []
+    for side_key, option_type in (("calls", "CALL"), ("puts", "PUT")):
+        for strike, leg in chain.get(side_key, {}).items():
+            rows.append(
+                (
+                    captured_at,
+                    str(ticker).upper(),
+                    expiration,
+                    option_type,
+                    float(strike),
+                    float(spot),
+                    int(dte),
+                    leg.get("osi"),
+                    float(leg.get("bid") or 0),
+                    float(leg.get("ask") or 0),
+                    float(leg.get("last") or 0),
+                    float(leg.get("mark") or 0),
+                    int(leg.get("volume") or 0),
+                    int(leg.get("open_interest") or 0),
+                    leg.get("delta"),
+                    leg.get("gamma"),
+                    leg.get("theta"),
+                    leg.get("vega"),
+                    leg.get("rho"),
+                    leg.get("iv"),
+                    _json(leg),
+                )
+            )
+    con.executemany(
+        """
+        INSERT OR REPLACE INTO option_chain_snapshots(
+            captured_at, ticker, expiration, option_type, strike, spot, dte,
+            osi, bid, ask, last, mark, volume, open_interest,
+            delta, gamma, theta, vega, rho, iv, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    con.commit()
+    return len(rows)
 
 
 def fill_identity(fill: dict[str, Any], index: int = 0) -> str:
@@ -438,6 +592,14 @@ def list_tickets(
         params,
     ).fetchall()
     return [_ticket_from_row(row) for row in rows]
+
+
+def get_ticket(con: sqlite3.Connection, ticket_id: str) -> dict[str, Any] | None:
+    row = con.execute(
+        "SELECT * FROM tickets WHERE ticket_id=?",
+        (str(ticket_id),),
+    ).fetchone()
+    return _ticket_from_row(row) if row else None
 
 
 def set_ticket_lifecycle(
@@ -687,7 +849,15 @@ def record_reconciliation(con: sqlite3.Connection, report: dict[str, Any]) -> in
 
 
 def table_counts(con: sqlite3.Connection) -> dict[str, Any]:
-    tables = ["trades", "tickets", "broker_positions", "broker_fills", "reconciliation_runs"]
+    tables = [
+        "trades",
+        "tickets",
+        "broker_positions",
+        "broker_fills",
+        "reconciliation_runs",
+        "option_chain_snapshots",
+        "equity_lots",
+    ]
     counts = {table: int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables}
     latest = con.execute(
         """
@@ -705,4 +875,10 @@ def table_counts(con: sqlite3.Connection) -> dict[str, Any]:
 
 def export_journal_state(con: sqlite3.Connection) -> dict[str, Any]:
     rows = con.execute("SELECT payload_json FROM trades ORDER BY opened_at, id").fetchall()
-    return {"version": 1, "last_updated": now_iso(), "trades": [json.loads(row["payload_json"]) for row in rows]}
+    lots = con.execute("SELECT payload_json FROM equity_lots ORDER BY acquired_at, id").fetchall()
+    return {
+        "version": 1,
+        "last_updated": now_iso(),
+        "trades": [json.loads(row["payload_json"]) for row in rows],
+        "equity_lots": [json.loads(row["payload_json"]) for row in lots],
+    }

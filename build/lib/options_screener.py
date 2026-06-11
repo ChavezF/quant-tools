@@ -469,6 +469,8 @@ def main():
                     help="Score all candidates and print a unified ranked list")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--report", type=str)
+    ap.add_argument("--db", help="SQLite path for durable option-chain snapshots")
+    ap.add_argument("--no-chain-snapshots", action="store_true")
     args = ap.parse_args()
     cfg = load_config(args.config)
     scan_cfg = cfg.get("scan", {})
@@ -479,6 +481,11 @@ def main():
     wing_widths = parse_wing_widths(args.wing_widths or scan_cfg.get("wing_widths", [5.0]))
 
     client = get_client()
+    chain_con = None
+    if args.db and not args.no_chain_snapshots:
+        from storage import connect
+
+        chain_con = connect(args.db)
     all_results = {
         "as_of": datetime.now().isoformat(),
         "params": vars(args),
@@ -543,6 +550,18 @@ def main():
                        sum(1 for leg in chain["puts"].values() if "delta" in leg)
             print(f"  {exp}: {len(chain['calls'])} calls, {len(chain['puts'])} puts "
                   f"({n_greeks} with greeks)", file=sys.stderr)
+            if chain_con is not None:
+                from storage import insert_option_chain_snapshot
+
+                insert_option_chain_snapshot(
+                    chain_con,
+                    captured_at=all_results["as_of"],
+                    ticker=symbol,
+                    expiration=exp,
+                    spot=spot,
+                    dte=dte,
+                    chain=chain,
+                )
             for strat in args.strategies:
                 if strat == "csp":
                     res = screen_csp(chain, spot, dte, target_delta=-args.target_delta, min_oi=args.min_oi)
@@ -582,6 +601,8 @@ def main():
         with open(args.report, "w") as f:
             json.dump(all_results, f, indent=2, default=str)
         print(f"\nReport: {args.report}", file=sys.stderr)
+    if chain_con is not None:
+        chain_con.close()
 
 
 def print_report(results: dict):

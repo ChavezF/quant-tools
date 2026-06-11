@@ -110,6 +110,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_positions": 6,
         "max_total_capital_pct": 0.35,
         "max_tail_loss_pct": 0.08,
+        "max_expected_shortfall_pct": 0.08,
         "max_ticker_capital_pct": 0.15,
         "max_group_exposure_pct": 0.35,
         "stress_loss_fraction": 0.65,

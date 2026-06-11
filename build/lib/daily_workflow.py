@@ -43,6 +43,7 @@ PROFILE_DEFAULTS = {
         "skip_database_maintenance": True,
         "skip_health": True,
         "skip_dashboard": True,
+        "skip_scorecard": True,
     },
 }
 
@@ -54,7 +55,7 @@ def profile_skips(profile: str, args: argparse.Namespace) -> dict[str, bool]:
         "skip_scenario_stress", "skip_allocation", "skip_brief", "skip_alerts",
         "skip_storage", "skip_tickets", "skip_validation", "skip_drift",
         "skip_database_maintenance", "skip_health", "skip_dashboard",
-        "skip_operator_summary",
+        "skip_operator_summary", "skip_scorecard",
     }
     return {
         name: bool(defaults.get(name, False) or getattr(args, name, False))
@@ -141,6 +142,7 @@ def build_scan_cmd(cfg: dict[str, Any], args: argparse.Namespace, scan_report: P
         "--ranked",
         "--json",
         "--report", str(scan_report),
+        "--db", storage_db_path(cfg),
         *(["--no-cache"] if args.no_cache else []),
     ]
 
@@ -179,6 +181,7 @@ def build_management_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[
     return [
         PY,
         str(SCRIPTS_DIR / "position_management.py"),
+        *(["--config", args.config] if args.config else []),
         "--journal",
         journal_path(cfg, args),
         "--db",
@@ -191,6 +194,8 @@ def build_management_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[
         str(management_cfg.get("manage_dte", 21)),
         "--urgent-dte",
         str(management_cfg.get("urgent_dte", 7)),
+        "--strike-threat-sigma",
+        str(management_cfg.get("strike_threat_sigma", 0.5)),
         "--json",
     ]
 
@@ -203,6 +208,20 @@ def build_analytics_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[s
         journal_path(cfg, args),
         "--db",
         storage_db_path(cfg),
+        "--json",
+    ]
+
+
+def build_scorecard_cmd(cfg: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    return [
+        PY,
+        str(SCRIPTS_DIR / "model_scorecard.py"),
+        "--journal",
+        journal_path(cfg, args),
+        "--db",
+        storage_db_path(cfg),
+        "--account-nav",
+        str(args.account_nav if args.account_nav is not None else cfg["risk_limits"]["account_nav"]),
         "--json",
     ]
 
@@ -319,7 +338,12 @@ def build_scenario_stress_cmd(cfg: dict[str, Any], risk_report: Path) -> list[st
     return cmd
 
 
-def build_allocation_cmd(cfg: dict[str, Any], args: argparse.Namespace, plan_report: Path) -> list[str]:
+def build_allocation_cmd(
+    cfg: dict[str, Any],
+    args: argparse.Namespace,
+    plan_report: Path,
+    risk_report: Path | None = None,
+) -> list[str]:
     cmd = [
         PY,
         str(SCRIPTS_DIR / "portfolio_allocator.py"),
@@ -329,6 +353,8 @@ def build_allocation_cmd(cfg: dict[str, Any], args: argparse.Namespace, plan_rep
         "--sizing-mode", str(getattr(args, "sizing_mode", "normal") or "normal"),
         "--json",
     ]
+    if risk_report:
+        cmd += ["--risk", str(risk_report)]
     return cmd
 
 
@@ -422,6 +448,7 @@ def build_storage_cmd(
         str(lifecycle_cfg.get("pending_expiry_hours", 24)),
         "--partial-review-hours",
         str(lifecycle_cfg.get("partial_review_hours", 4)),
+        "--apply-assignments",
         "--json",
     ]
     broker_snapshot = broker_snapshot_override or args.broker_snapshot or storage_cfg.get("broker_snapshot")
@@ -555,6 +582,7 @@ def main() -> None:
     ap.add_argument("--skip-health", action="store_true")
     ap.add_argument("--skip-dashboard", action="store_true")
     ap.add_argument("--skip-operator-summary", action="store_true")
+    ap.add_argument("--skip-scorecard", action="store_true")
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--send", action="store_true", help="Send the daily brief instead of dry-run printing it")
     ap.add_argument("--dry-run", action="store_true", help="Print planned commands without running live API steps")
@@ -594,6 +622,7 @@ def main() -> None:
     mark_report = run_dir / "mark_to_market.json"
     management_report = run_dir / "management.json"
     analytics_report = run_dir / "analytics.json"
+    scorecard_report = run_dir / "scorecard.json"
     feedback_report = run_dir / "feedback.json"
     validation_report = run_dir / "validation.json"
     drift_report = run_dir / "drift.json"
@@ -615,6 +644,7 @@ def main() -> None:
             "mark_to_market": str(mark_report) if mark_enabled else None,
             "management": str(management_report) if management_enabled else None,
             "analytics": str(analytics_report),
+            "scorecard": str(scorecard_report) if not skips["skip_scorecard"] else None,
             "feedback": str(feedback_report),
             "validation": str(validation_report) if validation_enabled else None,
             "drift": str(drift_report) if drift_enabled else None,
@@ -661,6 +691,12 @@ def main() -> None:
     manifest["steps"].append(analytics_meta)
     if not args.dry_run and analytics_meta["returncode"] == 0:
         analytics_report.write_text(Path(analytics_meta["stdout"]).read_text())
+
+    if not skips["skip_scorecard"]:
+        scorecard_meta = run_command("scorecard", build_scorecard_cmd(cfg, args), run_dir, dry_run=args.dry_run)
+        manifest["steps"].append(scorecard_meta)
+        if not args.dry_run and scorecard_meta["returncode"] == 0:
+            scorecard_report.write_text(Path(scorecard_meta["stdout"]).read_text())
 
     feedback_meta = run_command("feedback", build_feedback_cmd(cfg, args), run_dir, dry_run=args.dry_run)
     manifest["steps"].append(feedback_meta)
@@ -722,7 +758,12 @@ def main() -> None:
     if allocation_enabled and (args.dry_run or plan_report.exists()):
         allocation_meta = run_command(
             "allocation",
-            build_allocation_cmd(cfg, args, plan_report),
+            build_allocation_cmd(
+                cfg,
+                args,
+                plan_report,
+                risk_report if args.dry_run and not skips["skip_risk"] else risk_path_for_plan,
+            ),
             run_dir,
             dry_run=args.dry_run,
         )

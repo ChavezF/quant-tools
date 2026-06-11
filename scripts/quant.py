@@ -48,6 +48,8 @@ def main():
     p_scan.add_argument("--max-expirations", type=int)
     p_scan.add_argument("--wing-widths", nargs="+", type=float)
     p_scan.add_argument("--no-cache", action="store_true")
+    p_scan.add_argument("--db")
+    p_scan.add_argument("--no-chain-snapshots", action="store_true")
     p_scan.add_argument("--ranked", action="store_true")
     p_scan.add_argument("--json", action="store_true", help="Emit screener output as JSON (pipe into pretrade/plan)")
     p_scan.add_argument("--report", help="Path to write the screener JSON report")
@@ -92,6 +94,7 @@ def main():
 
     p_allocate = sub.add_parser("allocate", help="Select a portfolio-level basket from an action plan")
     p_allocate.add_argument("--plan", required=True)
+    p_allocate.add_argument("--risk")
     p_allocate.add_argument("--output")
     p_allocate.add_argument("--json", action="store_true")
 
@@ -140,6 +143,7 @@ def main():
     p_daily.add_argument("--skip-health", action="store_true")
     p_daily.add_argument("--skip-dashboard", action="store_true")
     p_daily.add_argument("--skip-operator-summary", action="store_true")
+    p_daily.add_argument("--skip-scorecard", action="store_true")
     p_daily.add_argument("--no-cache", action="store_true")
     p_daily.add_argument("--send", action="store_true")
     p_daily.add_argument("--dry-run", action="store_true")
@@ -151,6 +155,8 @@ def main():
     p_manage.add_argument("--stop-loss-pct", type=float)
     p_manage.add_argument("--manage-dte", type=int)
     p_manage.add_argument("--urgent-dte", type=int)
+    p_manage.add_argument("--strike-threat-sigma", type=float)
+    p_manage.add_argument("--no-live-context", action="store_true")
     p_manage.add_argument("--output")
     p_manage.add_argument("--json", action="store_true")
 
@@ -195,6 +201,14 @@ def main():
     p_tickets.add_argument("--partial-review-hours", type=float)
     p_tickets.add_argument("--json", action="store_true")
 
+    p_stage = sub.add_parser("stage", help="Build a broker-ready manual order from a READY ticket")
+    p_stage.add_argument("--ticket-id", required=True)
+    p_stage.add_argument("--db")
+    p_stage.add_argument("--journal")
+    p_stage.add_argument("--order-helper")
+    p_stage.add_argument("--confirm", action="store_true")
+    p_stage.add_argument("--json", action="store_true")
+
     p_dashboard = sub.add_parser("dashboard", help="Generate static HTML dashboard from reports")
     p_dashboard.add_argument("--report-dir")
     p_dashboard.add_argument("--plan")
@@ -212,6 +226,8 @@ def main():
     p_dashboard.add_argument("--allocation")
     p_dashboard.add_argument("--validation")
     p_dashboard.add_argument("--drift")
+    p_dashboard.add_argument("--scorecard")
+    p_dashboard.add_argument("--management")
     p_dashboard.add_argument("--output")
 
     p_analytics = sub.add_parser("analytics", help="Analyze realized journal performance")
@@ -220,6 +236,21 @@ def main():
     p_analytics.add_argument("--recent-window", type=int, default=10)
     p_analytics.add_argument("--output")
     p_analytics.add_argument("--json", action="store_true")
+
+    p_scorecard = sub.add_parser("scorecard", help="Report POP calibration and monthly account performance")
+    p_scorecard.add_argument("--journal")
+    p_scorecard.add_argument("--db")
+    p_scorecard.add_argument("--account-nav", type=float)
+    p_scorecard.add_argument("--output")
+    p_scorecard.add_argument("--json", action="store_true")
+
+    p_sentinel = sub.add_parser("sentinel", help="Run the quiet intraday open-position guard")
+    p_sentinel.add_argument("--journal")
+    p_sentinel.add_argument("--db")
+    p_sentinel.add_argument("--state-file")
+    p_sentinel.add_argument("--management-report")
+    p_sentinel.add_argument("--send", action="store_true")
+    p_sentinel.add_argument("--json", action="store_true")
 
     p_feedback = sub.add_parser("feedback", help="Recommend score and sizing calibration")
     p_feedback.add_argument("--journal")
@@ -279,6 +310,7 @@ def main():
     p_storage.add_argument("--export-journal")
     p_storage.add_argument("--pending-expiry-hours", type=float)
     p_storage.add_argument("--partial-review-hours", type=float)
+    p_storage.add_argument("--apply-assignments", action="store_true")
     p_storage.add_argument("--json", action="store_true")
 
     p_ticket_lifecycle = sub.add_parser("ticket-lifecycle", help="Inspect or close persistent execution tickets")
@@ -437,20 +469,29 @@ def main():
         min_oi = pick(args.min_oi, scan_cfg["min_oi"])
         max_expirations = pick(args.max_expirations, scan_cfg.get("max_expirations", 1))
         wing_widths = args.wing_widths or scan_cfg.get("wing_widths", [5.0])
-        return run("options_screener.py",
-                   *(["--config", args.config] if args.config else []),
-                   "--watchlist", *watchlist,
-                   "--strategies", *strategies,
-                   "--min-dte", str(min_dte),
-                   "--max-dte", str(max_dte),
-                   "--target-delta", str(target_delta),
-                   "--min-oi", str(min_oi),
-                   "--max-expirations", str(max_expirations),
-                   "--wing-widths", *[str(w) for w in wing_widths],
-                   *(["--no-cache"] if args.no_cache else []),
-                   *(["--ranked"] if args.ranked else []),
-                   *(["--json"] if args.json else []),
-                   *(["--report", args.report] if args.report else []))
+        cmd = [
+            "options_screener.py",
+            *(["--config", args.config] if args.config else []),
+            "--watchlist", *watchlist,
+            "--strategies", *strategies,
+            "--min-dte", str(min_dte),
+            "--max-dte", str(max_dte),
+            "--target-delta", str(target_delta),
+            "--min-oi", str(min_oi),
+            "--max-expirations", str(max_expirations),
+            "--wing-widths", *[str(w) for w in wing_widths],
+        ]
+        extend_opt(cmd, "--db", db_path_arg(args.db))
+        if args.no_chain_snapshots:
+            cmd += ["--no-chain-snapshots"]
+        if args.no_cache:
+            cmd += ["--no-cache"]
+        if args.ranked:
+            cmd += ["--ranked"]
+        if args.json:
+            cmd += ["--json"]
+        extend_opt(cmd, "--report", args.report)
+        return run(*cmd)
     elif args.cmd == "risk":
         cmd = ["portfolio_risk.py"]
         if args.target_watchlist:
@@ -500,6 +541,8 @@ def main():
         cmd = ["portfolio_allocator.py", "--plan", args.plan]
         if args.config:
             cmd += ["--config", args.config]
+        if args.risk:
+            cmd += ["--risk", args.risk]
         if args.output:
             cmd += ["--output", args.output]
         if args.json:
@@ -572,6 +615,7 @@ def main():
             ("skip_health", "--skip-health"),
             ("skip_dashboard", "--skip-dashboard"),
             ("skip_operator_summary", "--skip-operator-summary"),
+            ("skip_scorecard", "--skip-scorecard"),
             ("no_cache", "--no-cache"),
             ("send", "--send"),
             ("dry_run", "--dry-run"),
@@ -582,6 +626,8 @@ def main():
     elif args.cmd == "manage":
         management_cfg = cfg.get("position_management", {})
         cmd = ["position_management.py"]
+        if args.config:
+            cmd += ["--config", args.config]
         extend_opt(cmd, "--journal", journal_path(args.journal))
         extend_opt(cmd, "--db", db_path_arg(args.db))
         cmd += [
@@ -590,6 +636,10 @@ def main():
             "--manage-dte", str(pick(args.manage_dte, management_cfg.get("manage_dte", 21))),
             "--urgent-dte", str(pick(args.urgent_dte, management_cfg.get("urgent_dte", 7))),
         ]
+        if args.strike_threat_sigma is not None:
+            cmd += ["--strike-threat-sigma", str(args.strike_threat_sigma)]
+        if args.no_live_context:
+            cmd += ["--no-live-context"]
         extend_opt(cmd, "--output", args.output)
         if args.json:
             cmd += ["--json"]
@@ -668,6 +718,16 @@ def main():
         if args.json:
             cmd += ["--json"]
         return run(*cmd)
+    elif args.cmd == "stage":
+        cmd = ["order_staging.py", "--ticket-id", args.ticket_id]
+        extend_opt(cmd, "--db", db_path_arg(args.db))
+        extend_opt(cmd, "--journal", journal_path(args.journal))
+        extend_opt(cmd, "--order-helper", args.order_helper)
+        if args.confirm:
+            cmd += ["--confirm"]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
     elif args.cmd == "dashboard":
         cmd = ["dashboard.py"]
         for attr, flag in [
@@ -687,6 +747,8 @@ def main():
             ("allocation", "--allocation"),
             ("validation", "--validation"),
             ("drift", "--drift"),
+            ("scorecard", "--scorecard"),
+            ("management", "--management"),
             ("output", "--output"),
         ]:
             value = getattr(args, attr)
@@ -700,6 +762,28 @@ def main():
         cmd += ["--recent-window", str(args.recent_window)]
         if args.output:
             cmd += ["--output", args.output]
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "scorecard":
+        cmd = ["model_scorecard.py"]
+        extend_opt(cmd, "--journal", journal_path(args.journal))
+        extend_opt(cmd, "--db", db_path_arg(args.db))
+        cmd += ["--account-nav", str(pick(args.account_nav, risk_cfg["account_nav"]))]
+        extend_opt(cmd, "--output", args.output)
+        if args.json:
+            cmd += ["--json"]
+        return run(*cmd)
+    elif args.cmd == "sentinel":
+        cmd = ["intraday_sentinel.py"]
+        if args.config:
+            cmd += ["--config", args.config]
+        extend_opt(cmd, "--journal", journal_path(args.journal))
+        extend_opt(cmd, "--db", db_path_arg(args.db))
+        extend_opt(cmd, "--state-file", args.state_file)
+        extend_opt(cmd, "--management-report", args.management_report)
+        if args.send:
+            cmd += ["--send"]
         if args.json:
             cmd += ["--json"]
         return run(*cmd)
@@ -798,6 +882,8 @@ def main():
             value = getattr(args, attr)
             if value:
                 cmd += [flag, value]
+        if args.apply_assignments:
+            cmd += ["--apply-assignments"]
         if args.json:
             cmd += ["--json"]
         return run(*cmd)

@@ -122,6 +122,23 @@ def render_score_bands(analytics: dict[str, Any]) -> str:
     return "\n".join(rows)
 
 
+def render_pop_calibration(scorecard: dict[str, Any]) -> str:
+    rows = []
+    for bucket, row in scorecard.get("pop_calibration", {}).get("buckets", {}).items():
+        rows.append(
+            "<tr>"
+            f"<td>{esc(bucket)}</td>"
+            f"<td>{esc(row.get('count'))}</td>"
+            f"<td>{float(row.get('expected_pop_pct') or 0):.1f}%</td>"
+            f"<td>{float(row.get('realized_win_rate_pct') or 0):.1f}%</td>"
+            f"<td>{float(row.get('calibration_error_pct') or 0):+.1f}%</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='5'>No closed trades with recorded POP.</td></tr>")
+    return "\n".join(rows)
+
+
 def render_strategy_feedback(feedback: dict[str, Any]) -> str:
     rows = []
     for strategy, row in feedback.get("strategy_adjustments", {}).items():
@@ -214,6 +231,40 @@ def render_allocation(allocation: dict[str, Any]) -> str:
     return "\n".join(rows)
 
 
+def render_management(management: dict[str, Any]) -> str:
+    rows = []
+    for row in management.get("actions", [])[:25]:
+        threat = row.get("strike_threat", {})
+        events = ", ".join(
+            f"{event.get('event_type')} {event.get('date')}"
+            for event in row.get("event_span", [])
+        )
+        roll = row.get("roll_proposal") or {}
+        roll_text = "-"
+        if roll.get("status") == "CREDIT_AVAILABLE":
+            roll_text = (
+                f"{roll.get('to_expiration')} {roll.get('to_strike')} "
+                f"credit {roll.get('net_credit')}"
+            )
+        rows.append(
+            "<tr>"
+            f"<td>{esc(row.get('urgency'))}</td>"
+            f"<td>{esc(row.get('ticker'))}</td>"
+            f"<td>{esc(row.get('strategy'))}</td>"
+            f"<td>{esc(row.get('dte'))}</td>"
+            f"<td>{esc(row.get('unrealized_pnl_pct'))}</td>"
+            f"<td>{esc(row.get('action'))}</td>"
+            f"<td>{esc(threat.get('status'))}</td>"
+            f"<td>{esc(events or '-')}</td>"
+            f"<td>{esc(roll_text)}</td>"
+            f"<td>{esc((row.get('reasons') or [''])[0])}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='10'>No open position management actions.</td></tr>")
+    return "\n".join(rows)
+
+
 def render_validation(validation: dict[str, Any]) -> str:
     rows = []
     scopes = {"OVERALL": validation.get("overall", {}), **validation.get("by_strategy", {})}
@@ -264,6 +315,8 @@ def build_dashboard(
     allocation: dict[str, Any] | None = None,
     validation: dict[str, Any] | None = None,
     drift: dict[str, Any] | None = None,
+    scorecard: dict[str, Any] | None = None,
+    management: dict[str, Any] | None = None,
 ) -> str:
     analytics = analytics or plan.get("historical_analytics", {})
     feedback = feedback or {}
@@ -287,6 +340,12 @@ def build_dashboard(
     drift = drift or {}
     drift_summary = drift.get("summary", {})
     drift_comparison = drift.get("comparison", {})
+    scorecard = scorecard or {}
+    pop_summary = scorecard.get("pop_calibration", {})
+    monthly = scorecard.get("monthly", {})
+    latest_month = monthly[max(monthly)] if monthly else {}
+    management = management or {}
+    management_summary = management.get("summary", {})
     database_status = "N/A" if not database_maintenance else ("OK" if database_maintenance.get("ok") else "FAIL")
     health_status = "N/A" if not health else ("OK" if health.get("ok") else "FAIL")
     plan_summary = plan.get("summary", {})
@@ -341,6 +400,10 @@ def build_dashboard(
       <div class="card">Reduced<b>{esc(plan_summary.get('reduce', 0))}</b></div>
       <div class="card">Rejected<b>{esc(plan_summary.get('reject', 0))}</b></div>
       <div class="card">High Alerts<b>{esc(alert_summary.get('high', 0))}</b></div>
+      <div class="card">Open Positions<b>{esc(management_summary.get('open_trades', 0))}</b></div>
+      <div class="card">Position Actions<b>{esc(management_summary.get('high_urgency', 0))}</b></div>
+      <div class="card">Strike Threats<b>{esc(management_summary.get('strike_threats', 0))}</b></div>
+      <div class="card">Event Spans<b>{esc(management_summary.get('event_spans', 0))}</b></div>
       <div class="card">Planning Candidates<b>{esc(funnel.get('morning_candidates', plan_summary.get('approve', 0) + plan_summary.get('reduce', 0)))}</b></div>
       <div class="card">Ready for Review<b>{esc(lifecycle_counts.get('READY', ticket_count))}</b></div>
       <div class="card">Submitted Orders<b>{esc(lifecycle_counts.get('SUBMITTED', 0))}</b></div>
@@ -371,10 +434,15 @@ def build_dashboard(
       <div class="card">Basket Selected<b>{esc(allocation_summary.get('selected', 0))}</b></div>
       <div class="card">Capital Allocated<b>{money(allocation_summary.get('capital_allocated'))}</b></div>
       <div class="card">Tail Budget Used<b>{float(allocation_summary.get('tail_budget_utilization_pct') or 0):.1f}%</b></div>
+      <div class="card">Allocation Risk Model<b>{esc(allocation.get('limits', {}).get('risk_model') or 'N/A')}</b></div>
+      <div class="card">Projected 95% ES<b>{money(allocation_summary.get('projected_expected_shortfall_95'))}</b></div>
       <div class="card">Validation<b>{esc(validation_summary.get('status') or 'N/A')}</b></div>
       <div class="card">OOS Expectancy<b>{money(validation_summary.get('avg_oos_expectancy'))}</b></div>
       <div class="card">Drift Status<b>{esc(drift_summary.get('status') or 'N/A')}</b></div>
       <div class="card">Recent Expectancy Change<b>{money(drift_comparison.get('expectancy_change'))}</b></div>
+      <div class="card">POP Samples<b>{esc(pop_summary.get('sample_size', 0))}</b></div>
+      <div class="card">Monthly Account Return<b>{float(latest_month.get('account_return_pct') or 0):+.2f}%</b></div>
+      <div class="card">Monthly Excess vs SPY<b>{esc('N/A' if latest_month.get('excess_return_vs_spy_pct') is None else f"{float(latest_month.get('excess_return_vs_spy_pct')):+.2f}%")}</b></div>
     </section>
     <h2>Walk-Forward Validation</h2>
     <div class="table-wrap"><table class="sortable">
@@ -396,6 +464,11 @@ def build_dashboard(
       <thead><tr><th data-sort>Action</th><th data-sort>Ticker</th><th data-sort>Strategy</th><th data-sort>Score</th><th data-sort>Size</th><th data-sort>Limit</th><th data-sort>Floor</th><th data-sort>Exec</th><th data-sort>Profile</th><th>Rationale</th></tr></thead>
       <tbody>{render_actions(plan)}</tbody>
     </table></div>
+    <h2>Open Position Management</h2>
+    <div class="table-wrap"><table class="sortable">
+      <thead><tr><th data-sort>Urgency</th><th data-sort>Ticker</th><th data-sort>Strategy</th><th data-sort>DTE</th><th data-sort>P&amp;L %</th><th data-sort>Action</th><th data-sort>Strike</th><th>Events</th><th>Credit Roll</th><th>Reason</th></tr></thead>
+      <tbody>{render_management(management)}</tbody>
+    </table></div>
     <div class="split">
       <section>
         <h2>Score-Band Performance</h2>
@@ -412,6 +485,11 @@ def build_dashboard(
         </table></div>
       </section>
     </div>
+    <h2>POP Calibration</h2>
+    <div class="table-wrap"><table class="sortable">
+      <thead><tr><th data-sort>POP Bucket</th><th data-sort>N</th><th data-sort>Expected</th><th data-sort>Realized Win</th><th data-sort>Error</th></tr></thead>
+      <tbody>{render_pop_calibration(scorecard)}</tbody>
+    </table></div>
     <h2>Execution Quality</h2>
     <div class="table-wrap"><table class="sortable">
       <thead><tr><th data-sort>Strategy</th><th data-sort>Tickets</th><th data-sort>Fill Rate</th><th data-sort>Quantity Fill</th><th data-sort>Credit vs Plan</th><th data-sort>Floor Violations</th></tr></thead>
@@ -479,6 +557,8 @@ def main() -> None:
     ap.add_argument("--allocation")
     ap.add_argument("--validation")
     ap.add_argument("--drift")
+    ap.add_argument("--scorecard")
+    ap.add_argument("--management")
     ap.add_argument("--output")
     args = ap.parse_args()
 
@@ -498,6 +578,8 @@ def main() -> None:
     allocation_path = Path(args.allocation) if args.allocation else base / "allocation.json"
     validation_path = Path(args.validation) if args.validation else base / "validation.json"
     drift_path = Path(args.drift) if args.drift else base / "drift.json"
+    scorecard_path = Path(args.scorecard) if args.scorecard else base / "scorecard.json"
+    management_path = Path(args.management) if args.management else base / "management.json"
     output_path = Path(args.output) if args.output else base / "dashboard.html"
 
     html_out = build_dashboard(
@@ -517,6 +599,8 @@ def main() -> None:
         allocation=read_json(allocation_path),
         validation=read_json(validation_path),
         drift=read_json(drift_path),
+        scorecard=read_json(scorecard_path),
+        management=read_json(management_path),
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html_out, encoding="utf-8")

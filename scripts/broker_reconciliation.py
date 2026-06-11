@@ -342,6 +342,7 @@ def proposed_journal_updates(
             continue
         trade = trades_by_ticket.get(normalize(match.get("ticket_id")))
         if trade:
+            staged = normalize(trade.get("status")) == "STAGED"
             updates.append(
                 {
                     "trade_id": trade.get("id"),
@@ -352,6 +353,8 @@ def proposed_journal_updates(
                         "broker_fill_id": match.get("fill_id"),
                         "broker_fill_ids": match.get("fill_ids"),
                         "filled_quantity": match.get("filled_quantity"),
+                        "status": "OPEN" if staged else None,
+                        "opened_at": match.get("first_fill_at") if staged else None,
                     },
                     "apply_automatically": False,
                 }
@@ -403,6 +406,91 @@ def proposed_exit_updates(
     return updates
 
 
+def proposed_assignment_updates(
+    journal: dict[str, Any],
+    lifecycle_events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    updates = []
+    existing_events = {
+        str(lot.get("assignment_event_id"))
+        for lot in journal.get("equity_lots", [])
+        if lot.get("assignment_event_id")
+    }
+    for event in lifecycle_events:
+        event_id = str(event.get("event_id") or "")
+        if (
+            normalize(event.get("event_type")) != "ASSIGNMENT"
+            or normalize(event.get("option_type")) != "P"
+            or not event_id
+            or event_id in existing_events
+        ):
+            continue
+        try:
+            event_strike = float(event.get("strike"))
+        except (TypeError, ValueError):
+            continue
+        matching = []
+        for trade in journal.get("trades", []):
+            if normalize(trade.get("status")) != "OPEN" or normalize(trade.get("strategy")) != "CSP":
+                continue
+            try:
+                trade_strike = float(str(trade.get("strikes") or "").split("/")[0])
+            except (TypeError, ValueError):
+                continue
+            if (
+                normalize(trade.get("ticker")) == normalize(event.get("ticker"))
+                and str(trade.get("expiration") or "")[:10] == str(event.get("expiration") or "")[:10]
+                and abs(trade_strike - event_strike) < 0.001
+            ):
+                matching.append(trade)
+        if len(matching) != 1:
+            continue
+        trade = matching[0]
+        # Assignment feeds vary: some report option contracts, others report
+        # delivered shares. The exactly matched journal trade is authoritative.
+        contracts = as_quantity(trade.get("quantity"), 1.0) or 1.0
+        premium = float(trade.get("entry_credit") or 0) - float(trade.get("entry_debit") or 0)
+        shares = contracts * 100
+        basis = event_strike - premium
+        updates.append(
+            {
+                "event_id": event_id,
+                "trade_id": trade.get("id"),
+                "trade_set": {
+                    "status": "CLOSED",
+                    "closed_at": event.get("occurred_at"),
+                    "option_outcome": "ASSIGNED",
+                    "assignment_event_id": event_id,
+                    "assignment_premium_transferred": round(premium * shares, 2),
+                    "realized_pnl": 0.0,
+                    "realized_pnl_pct": 0.0,
+                },
+                "equity_lot": {
+                    "id": f"LOT-{event_id}",
+                    "status": "OPEN",
+                    "ticker": normalize(event.get("ticker")),
+                    "acquired_at": event.get("occurred_at"),
+                    "quantity": shares,
+                    "assignment_strike": event_strike,
+                    "premium_per_share": round(premium, 4),
+                    "cost_basis_per_share": round(basis, 4),
+                    "total_cost_basis": round(basis * shares, 2),
+                    "source_trade_id": trade.get("id"),
+                    "source_ticket_id": trade.get("ticket_id"),
+                    "assignment_event_id": event_id,
+                    "broker_reported_quantity": event.get("quantity"),
+                    "covered_call_ready": shares >= 100,
+                },
+                "economics": (
+                    "Short-put premium transferred into assigned-share cost basis; "
+                    "not double-counted as realized option P&L."
+                ),
+                "apply_automatically": False,
+            }
+        )
+    return updates
+
+
 def apply_journal_updates(journal: dict[str, Any], updates: list[dict[str, Any]]) -> dict[str, Any]:
     trades_by_id = {str(trade.get("id")): trade for trade in journal.get("trades", [])}
     applied = []
@@ -418,6 +506,38 @@ def apply_journal_updates(journal: dict[str, Any], updates: list[dict[str, Any]]
         if changed:
             applied.append({"trade_id": update.get("trade_id"), "ticket_id": update.get("ticket_id"), "set": changed})
     return {"journal": journal, "applied_updates": applied}
+
+
+def apply_assignment_updates(
+    journal: dict[str, Any],
+    updates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    trades = {str(trade.get("id")): trade for trade in journal.get("trades", [])}
+    lots = journal.setdefault("equity_lots", [])
+    lot_ids = {str(lot.get("id")) for lot in lots}
+    applied = []
+    for update in updates:
+        lot = update.get("equity_lot", {})
+        lot_id = str(lot.get("id") or "")
+        trade = trades.get(str(update.get("trade_id")))
+        if not trade or not lot_id or lot_id in lot_ids:
+            continue
+        changed = {}
+        for key, value in update.get("trade_set", {}).items():
+            if value is not None and trade.get(key) != value:
+                trade[key] = value
+                changed[key] = value
+        lots.append(dict(lot))
+        lot_ids.add(lot_id)
+        applied.append(
+            {
+                "event_id": update.get("event_id"),
+                "trade_id": update.get("trade_id"),
+                "trade_set": changed,
+                "equity_lot_id": lot_id,
+            }
+        )
+    return {"journal": journal, "applied_assignment_updates": applied}
 
 
 def build_reconciliation(
@@ -445,6 +565,7 @@ def build_reconciliation(
         positions,
         positions_available=positions_available,
     )
+    lifecycle_events = broker_snapshot.get("lifecycle_events", [])
     return {
         "created_at": datetime.now().isoformat(),
         "summary": {
@@ -476,7 +597,8 @@ def build_reconciliation(
         "trade_positions": trade_positions,
         "proposed_journal_updates": proposed_journal_updates(journal, ticket_matches),
         "proposed_exit_updates": proposed_exit_updates(journal, exit_matches),
-        "lifecycle_events": broker_snapshot.get("lifecycle_events", []),
+        "lifecycle_events": lifecycle_events,
+        "proposed_assignment_updates": proposed_assignment_updates(journal, lifecycle_events),
     }
 
 
@@ -510,23 +632,30 @@ def main() -> None:
                     *report.get("proposed_exit_updates", []),
                 ],
             )
+            assignments = apply_assignment_updates(
+                applied["journal"],
+                report.get("proposed_assignment_updates", []),
+            )
             output_path = Path(args.journal_output) if args.journal_output else journal_path
-            atomic_write_json(output_path, applied["journal"])
+            atomic_write_json(output_path, assignments["journal"])
             if args.db:
-                from storage import connect, upsert_trades
+                from storage import connect, upsert_equity_lots, upsert_trades
 
                 con = connect(args.db)
                 try:
-                    upsert_trades(con, applied["journal"].get("trades", []))
+                    upsert_trades(con, assignments["journal"].get("trades", []))
+                    upsert_equity_lots(con, assignments["journal"].get("equity_lots", []))
                 finally:
                     con.close()
             report["applied_journal_updates"] = applied["applied_updates"]
+            report["applied_assignment_updates"] = assignments["applied_assignment_updates"]
             report["applied_exit_updates"] = [
                 update
                 for update in applied["applied_updates"]
                 if update.get("set", {}).get("status") == "CLOSED"
             ]
             report["summary"]["applied_journal_updates"] = len(applied["applied_updates"])
+            report["summary"]["applied_assignment_updates"] = len(assignments["applied_assignment_updates"])
             report["journal_output"] = str(output_path)
             report["database_updated"] = bool(args.db)
     if args.output:

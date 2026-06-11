@@ -18,55 +18,31 @@ the scheduler.
 """
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-PROJECT = Path("/home/chavez_f/code/quant-tools")
+PROJECT = Path(os.environ.get("QUANT_TOOLS_HOME", "/home/chavez_f/code/quant-tools"))
 SCRIPTS = PROJECT / "scripts"
-PY = "/usr/bin/python3.12"
+PY = os.environ.get("QUANT_PYTHON", "/usr/bin/python3.12")
 CONFIG = Path(os.environ.get("QUANT_CONFIG", PROJECT / "config.json"))
 RUN_POINTER = PROJECT / "state" / "latest-planning-run.json"
-TELEGRAM_LIMIT = 4000  # leave headroom under the 4096 hard limit
 
-# Make the toolkit's common.py helpers importable (derive_sizing_mode +
-# parse_regime_from_brief). Cron is at ~/.hermes/scripts/ so the repo-relative
-# path is the only one that works without a symlink or sys.path dance.
 sys.path.insert(0, str(SCRIPTS))
-try:
-    from common import derive_sizing_mode, parse_regime_from_brief, REGIME_TO_SIZING
-except ImportError as e:
-    print(f"⚠️ cron_morning_workflow: cannot import common helpers ({e}); will default to cautious", file=sys.stderr)
-    # Stubs so the script can still run if common.py is unreachable for any
-    # reason — sizing_mode falls through to cautious (the safer default).
-    REGIME_TO_SIZING = {}
-
-    def parse_regime_from_brief(_brief_text: str) -> str | None:  # type: ignore[no-redef]
-        return None
-
-    def derive_sizing_mode(_brief_text: str) -> tuple[str, str | None]:  # type: ignore[no-redef]
-        return "cautious", None
-
-# Reusable default watchlist for the brief; matches the morning brief script's
-# own default plus a few common names so the brief is consistent.
-BRIEF_WATCHLIST = ["SPY", "QQQ", "NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "META", "AMD"]
+from common import derive_sizing_mode
+from hermes_ops import (
+    DEFAULT_WATCHLIST,
+    compose_planning_message,
+    latest_report_dir,
+    read_report,
+    write_run_pointer,
+)
 
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M ET")
-
-
-def latest_report_dir(parent: Path) -> Path | None:
-    """The daily workflow writes into YYYYMMDD-HHMMSS/ subdirs; pick the newest."""
-    if not parent.exists():
-        return None
-    subdirs = [d for d in parent.iterdir() if d.is_dir() and d.name[:8].isdigit()]
-    if not subdirs:
-        return None
-    return sorted(subdirs, key=lambda d: d.name)[-1]
 
 
 def run_pipeline(report_dir: Path, sizing_mode: str) -> tuple[bool, str]:
@@ -107,7 +83,7 @@ def fetch_brief() -> str:
     print(f"[{now_str()}] fetching daily brief", file=sys.stderr)
     try:
         proc = subprocess.run(
-            [PY, "daily_brief.py", "--watchlist", *BRIEF_WATCHLIST],
+            [PY, "daily_brief.py", "--watchlist", *DEFAULT_WATCHLIST],
             capture_output=True, text=True, timeout=180,
             cwd=str(SCRIPTS),
         )
@@ -116,55 +92,6 @@ def fetch_brief() -> str:
     if proc.returncode != 0:
         return f"(brief fetch failed: {proc.stderr.strip()[:200]})"
     return proc.stdout.strip()
-
-
-def format_alerts(report_dir: Path | None) -> str:
-    if not report_dir:
-        return ""
-    alerts_path = report_dir / "alerts.json"
-    if not alerts_path.exists():
-        return ""
-    try:
-        data = json.loads(alerts_path.read_text())
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"  (alerts parse failed: {e})", file=sys.stderr)
-        return ""
-
-    summary = data.get("summary", {})
-    total = int(summary.get("total", 0))
-    if total == 0:
-        return ""
-
-    lines = [f"\n📣 {total} ALERT{'S' if total != 1 else ''} (H:{summary.get('high', 0)} M:{summary.get('medium', 0)} L:{summary.get('low', 0)})"]
-    for a in data.get("alerts", [])[:5]:
-        lines.append(f"  • [{a.get('priority', '?')}] {a.get('title', '')} — {a.get('detail', '')}")
-    return "\n".join(lines)
-
-
-def format_top_tickets(report_dir: Path | None, n: int = 3) -> str:
-    if not report_dir:
-        return ""
-    tickets_path = report_dir / "tickets.json"
-    if not tickets_path.exists():
-        return ""
-    try:
-        data = json.loads(tickets_path.read_text())
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"  (tickets parse failed: {e})", file=sys.stderr)
-        return ""
-
-    tickets = data.get("tickets", [])
-    if not tickets:
-        return ""
-
-    lines = [f"\n🎫 TOP {min(len(tickets), n)} TICKET{'S' if len(tickets) != 1 else ''}"]
-    for t in tickets[:n]:
-        lines.append(
-            f"  • {t.get('decision', '?'):7s} {t.get('ticker', '?'):6s} "
-            f"{t.get('strategy', '?'):9s} {t.get('expiration', '?')} {t.get('strikes', '?'):>10s} "
-            f"limit={t.get('limit_credit', '?')} floor={t.get('do_not_chase_below', '?')}"
-        )
-    return "\n".join(lines)
 
 
 def send_telegram(message: str) -> bool:
@@ -225,7 +152,6 @@ def main() -> int:
         return 1
     brief_path = latest / "morning_brief.txt"
     brief_path.write_text(brief)
-    RUN_POINTER.parent.mkdir(parents=True, exist_ok=True)
     pointer = {
         "profile": "planning",
         "created_at": datetime.now().isoformat(),
@@ -234,19 +160,10 @@ def main() -> int:
         "sizing_mode": sizing_mode,
         "regime": verdict,
     }
-    pointer_tmp = RUN_POINTER.with_suffix(".tmp")
-    pointer_tmp.write_text(json.dumps(pointer, indent=2))
-    pointer_tmp.replace(RUN_POINTER)
+    write_run_pointer(RUN_POINTER, pointer)
 
-    # 3. Planning alerts (compose on top of the brief we already captured)
-    alerts_text = format_alerts(latest)
-
-    # 4. Compose + truncate
-    composed = (brief + alerts_text).strip()
-    if not composed:
-        composed = "(empty morning brief — no content produced)"
-    if len(composed) > TELEGRAM_LIMIT:
-        composed = composed[: TELEGRAM_LIMIT - 60] + "\n... (truncated, full report at " + str(latest) + ")"
+    # 3. Planning alerts and bounded Telegram message
+    composed = compose_planning_message(brief, read_report(latest / "alerts.json"), latest)
 
     # 5. Send
     if not send_telegram(composed):

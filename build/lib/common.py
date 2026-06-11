@@ -188,6 +188,18 @@ def parse_osi_expiration(osi: str) -> str:
     return str(parse_osi_parts(osi).get("expiration") or "")
 
 
+def format_osi_symbol(underlying: str, expiration: str, option_type: str, strike: float) -> str:
+    """Build an OCC/OSI option symbol from normalized ticket fields."""
+    expiry = str(expiration).replace("-", "")
+    if len(expiry) != 8 or not expiry.isdigit():
+        raise ValueError(f"Invalid option expiration: {expiration}")
+    side = str(option_type).strip().upper()
+    if side not in {"C", "P"}:
+        raise ValueError(f"Invalid option type: {option_type}")
+    strike_code = int(round(float(strike) * 1000))
+    return f"{str(underlying).strip().upper()}{expiry[2:]}{side}{strike_code:08d}"
+
+
 def underlying_from_position(pos: dict[str, Any]) -> str:
     if pos.get("type") != "OPTION":
         return str(pos.get("symbol", ""))

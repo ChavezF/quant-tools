@@ -21,7 +21,7 @@ DEFAULT_STATE_FILE = STATE_DIR / "trades.json"
 
 
 def default_state() -> dict[str, Any]:
-    return {"version": 1, "last_updated": None, "trades": []}
+    return {"version": 1, "last_updated": None, "trades": [], "equity_lots": []}
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -41,6 +41,7 @@ def load_state(path: Path) -> dict[str, Any]:
         ) from exc
     state.setdefault("version", 1)
     state.setdefault("trades", [])
+    state.setdefault("equity_lots", [])
     return state
 
 
@@ -53,13 +54,14 @@ def load_backend(state_file: Path, db_path: str | None) -> tuple[dict[str, Any],
     json_state = load_state(state_file)
     if not db_path:
         return json_state, None
-    from storage import connect, export_journal_state, upsert_trades
+    from storage import connect, export_journal_state, upsert_equity_lots, upsert_trades
 
     con = connect(db_path)
     db_state = export_journal_state(con)
     if db_state.get("trades"):
         return db_state, con
     upsert_trades(con, json_state.get("trades", []))
+    upsert_equity_lots(con, json_state.get("equity_lots", []))
     return json_state, con
 
 
@@ -81,9 +83,10 @@ def load_journal(state_file: Path, db_path: str | None = None) -> dict[str, Any]
 def save_backend(state_file: Path, state: dict[str, Any], con: Any = None) -> None:
     save_state(state_file, state)
     if con is not None:
-        from storage import upsert_trades
+        from storage import upsert_equity_lots, upsert_trades
 
         upsert_trades(con, state.get("trades", []))
+        upsert_equity_lots(con, state.get("equity_lots", []))
 
 
 def next_trade_id(trades: list[dict[str, Any]]) -> str:
@@ -319,7 +322,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_repair.add_argument("--json", action="store_true")
 
     p_list = sub.add_parser("list", help="List journaled trades")
-    p_list.add_argument("--status", choices=["OPEN", "CLOSED", "ALL"], default="OPEN")
+    p_list.add_argument("--status", choices=["STAGED", "OPEN", "CLOSED", "ALL"], default="OPEN")
     p_list.add_argument("--json", action="store_true")
 
     p_stats = sub.add_parser("stats", help="Summarize realized journal performance")

@@ -285,6 +285,7 @@ def normalize_lifecycle_events(transactions: list[dict[str, Any]]) -> list[dict[
                 "ticker": parsed.get("underlying") or transaction.get("symbol"),
                 "symbol": transaction.get("symbol"),
                 "expiration": parsed.get("expiration"),
+                "option_type": parsed.get("option_type"),
                 "strike": parsed.get("strike"),
                 "quantity": abs(number(transaction.get("quantity"))),
                 "description": transaction.get("description"),

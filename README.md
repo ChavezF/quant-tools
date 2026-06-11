@@ -256,7 +256,8 @@ The action plan and portfolio allocator consume these adjustments on the next
 run. Execution history can reduce an otherwise approved setup, but it cannot
 override a hard risk rejection.
 
-SQLite retains `PENDING` and `PARTIAL` tickets across operator runs. A later
+SQLite retains `READY`, `SUBMITTED`, `WORKING`, and `PARTIAL` tickets across
+operator runs. A later
 broker snapshot is reconciled against that durable queue, including fills
 already assigned on prior days, so the original timestamped report directory
 does not need to be resubmitted. Ticket IDs include the action-plan issuance
@@ -275,7 +276,21 @@ Inspect or close the queue explicitly:
 Manual lifecycle changes do not place or cancel broker orders. They only record
 the operator's decision in the local execution ledger.
 
-Queue governance defaults to expiring untouched pending tickets after 24 hours
+Stage a single-leg `READY` ticket into an exact, reviewable Public.com helper
+command:
+
+```bash
+python scripts/quant.py stage --ticket-id QTK-ABC123
+python scripts/quant.py stage --ticket-id QTK-ABC123 --confirm
+```
+
+`--confirm` creates one idempotent `STAGED` journal row so a later broker fill
+can populate the actual opening price and timestamp. It still does not submit
+an order. The installed broker helper is single-leg only; spreads are emitted
+as a complete multi-leg payload and are deliberately blocked from being
+submitted as separate legs.
+
+Queue governance defaults to expiring untouched ready tickets after 24 hours
 and flagging partial fills for review after 4 hours. Partial tickets are never
 auto-expired. Equivalent active setups are reported as duplicates but remain
 open until the operator closes them. Configure the thresholds with:
@@ -357,7 +372,9 @@ python scripts/quant.py daily --profile planning
 ```
 
 Planning creates research, risk, allocation-preview, alert, summary, and
-dashboard artifacts without creating or mutating execution tickets.
+dashboard artifacts without creating or mutating execution tickets. Each scan
+stores its normalized option chains in SQLite for later slippage, liquidity,
+and signal research.
 
 Use the executable profile after quotes and positions have refreshed:
 
@@ -376,6 +393,48 @@ python scripts/quant.py ticket-lifecycle \
   --submission-price 1.25
 ```
 
+Review POP calibration, monthly realized return, premium capture, and SPY
+comparison independently:
+
+```bash
+python scripts/quant.py scorecard --json
+```
+
+The planning dashboard and operator summary include these scorecard signals.
+
+## Intraday position guard
+
+Run the quiet open-book sentinel during market hours:
+
+```bash
+python scripts/quant.py sentinel --json
+python scripts/quant.py sentinel --send --json
+```
+
+The sentinel marks open trades, reruns management, measures the short strike's
+distance in implied-volatility standard deviations, checks whether expiration
+spans earnings or a configured FOMC decision, and generates same-delta
+next-cycle roll proposals for supported single-leg positions. Roll proposals
+are shown only when the new position can be opened for more credit than the
+current position costs to close. No order is submitted.
+
+Telegram is quiet by default: the state file records each trade's HIGH-risk
+fingerprint and sends only when the action, strike-threat state, event span, or
+roll availability changes. A typical Hermes schedule is:
+
+```cron
+0 11-15 * * 1-5 /usr/bin/python3.12 /home/chavez_f/.hermes/scripts/cron_intraday_sentinel.py
+```
+
+Copy [ops/hermes/cron_intraday_sentinel.py](ops/hermes/cron_intraday_sentinel.py)
+to the Hermes scripts directory alongside the planning and executable wrappers.
+
+Broker-confirmed short-put assignments are converted into a closed CSP plus an
+open equity lot during storage sync. The option premium is transferred into
+the lot's cost basis (`strike - premium`) instead of being double-counted as
+realized option profit. Exact matching requires ticker, expiration, put type,
+and strike; ambiguous events remain high-priority review items.
+
 Repair an incomplete historical option trade explicitly:
 
 ```bash
@@ -384,3 +443,40 @@ python scripts/quant.py journal repair \
   --expiration 2026-07-17 \
   --strikes 195/190
 ```
+
+## Expected-shortfall allocation
+
+Portfolio allocation consumes the current bootstrap 95% expected shortfall
+from `risk.json` before selecting new trades:
+
+```bash
+python scripts/quant.py allocate \
+  --plan reports/latest/plan.json \
+  --risk reports/latest/risk.json \
+  --json
+```
+
+`portfolio_allocation.max_expected_shortfall_pct` sets the maximum projected
+95% expected shortfall as a fraction of account NAV. Candidate tail-loss
+add-ons cannot push the current book above that budget. When the bootstrap
+report is unavailable or lacks joint return observations, allocation falls
+back to the existing fixed stress proxy and identifies that fallback in
+`limits.risk_model`.
+
+The operator summary and dashboard now include open-position management,
+strike threats, event spans, credit-only roll proposals, the active allocation
+risk model, and projected expected shortfall.
+
+## Hermes wrapper deployment
+
+The planning, executable, and intraday wrappers accept:
+
+- `QUANT_TOOLS_HOME`: repository/runtime root.
+- `QUANT_PYTHON`: Python 3.12 executable.
+- `QUANT_CONFIG`: production configuration file.
+
+Planning and executable wrappers share `scripts/hermes_ops.py` for the default
+watchlist, report discovery, bounded Telegram messages, and atomic planning-run
+pointers. Copy the wrappers from `ops/hermes/` and keep the repository's
+`scripts/` directory available under `QUANT_TOOLS_HOME`. The 10:30 job accepts
+only a same-day planning pointer whose report directory and brief still exist.
