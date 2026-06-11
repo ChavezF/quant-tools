@@ -64,11 +64,34 @@ cd /home/chavez_f/code/quant-tools/scripts
 /usr/bin/python3.12 ~/.hermes/skills/mlops/quant-trading-toolkit/scripts/verify_toolkit.py
 python -m unittest discover -s tests
 python scripts/quant.py verify --json
+ruff check scripts tests ops
 ```
 
 The skill verifier runs 11 smoke tests across all tools. The local unit tests
 cover OSI parsing, candidate scoring, pre-trade checks, journal P&L math, config
-merging, and cache round-trips.
+merging, cache round-trips, state safety, mark-to-market, position management,
+bootstrap VaR, and golden argv-forwarding for every `quant.py` subcommand.
+CI runs three jobs: `verify` (dependency-light, Linux + Windows — the toolkit's
+core logic must work with only the standard library), `lint` (ruff, configured
+in `pyproject.toml`), and `tests-full` (pinned dependencies from
+`requirements.txt` installed, numpy-backed tests included, `pip install .`
+entry-point smoke test).
+
+## Install (optional)
+
+The checkout workflow (`python scripts/quant.py ...`) needs no install.
+To get a `quant` console command in a dedicated venv:
+
+```bash
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt -e .
+.venv/bin/quant --help
+```
+
+Installed runs resolve `config.json`, `state/`, and `reports/` from
+`QUANT_TOOLS_HOME` (or the working directory when unset); a checkout always
+uses the repository root. Dependencies are pinned in `requirements.txt` —
+yfinance in particular breaks its calendar API regularly, so bump it
+deliberately with `quant.py verify` green, not by accident.
 
 ## Config
 

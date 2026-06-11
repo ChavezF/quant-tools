@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-tools"
+version = "1.0.0"
+description = "Public.com options & risk toolkit: screening, risk gating, journaling, execution preparation, operator reporting"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "yfinance>=0.2.50",
+]
+
+[project.optional-dependencies]
+dev = ["ruff==0.14.5"]
+
+[project.scripts]
+quant = "quant:main"
+
+# The toolkit is a flat collection of sibling modules under scripts/ that
+# import each other by top-level name (import common, import storage, ...).
+# Packaging them as py-modules keeps those imports working both from a
+# checkout and from an installed environment. The trade-off is that the
+# module names land at the top level of site-packages — install into a
+# dedicated venv, not a shared interpreter.
+[tool.setuptools]
+package-dir = { "" = "scripts" }
+py-modules = [
+    "action_plan", "adaptive_sizing", "alerts", "broker_reconciliation",
+    "cache_utils", "candidate_scoring", "common", "correlation_risk",
+    "daily_brief", "daily_workflow", "dashboard", "data_reliability",
+    "database_maintenance", "drift_monitor", "earnings_backtest_v2",
+    "earnings_iv_scanner", "execution_analytics", "execution_attribution",
+    "execution_quality", "execution_tickets", "feedback_calibration",
+    "health_check", "historical_analytics", "iv_rank", "macro_overlay",
+    "mark_to_market", "monte_carlo", "operator_summary",
+    "opportunity_discovery", "options_screener", "performance_profiles",
+    "portfolio_allocator", "portfolio_risk", "position_management",
+    "position_tracker", "pretrade_check", "public_fill_ingestion", "quant",
+    "scan_optimizer", "scenario_stress", "storage", "storage_sync",
+    "strategy_screener", "term_structure", "ticket_lifecycle",
+    "toolkit_config", "trade_journal", "trade_stats",
+    "walk_forward_validation",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W"]
+# E402: configure_public_imports() must run before SDK imports, and tests
+# extend sys.path before importing the modules under test — both are the
+# project's import architecture, not style drift.
+ignore = ["E402"]
