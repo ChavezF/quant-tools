@@ -5,6 +5,7 @@ from argparse import Namespace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import sys
 
@@ -2601,6 +2602,52 @@ class CoreWorkflowTests(unittest.TestCase):
             self.assertTrue(missing.is_dir(), "report dir should be auto-created")
             self.assertTrue(written.is_file(), "operator_summary.md should be written")
             self.assertGreater(written.stat().st_size, 0)
+
+    def test_daily_brief_includes_watchlist_stock_prices(self):
+        # Regression: SCAN_DISCREPANCIES_2026-06-11 item #4 — the brief
+        # had a hardcoded MARKETS list (SPY/QQQ/IWM/^VIX/^TNX/DXY/BTC/ETH)
+        # with no individual stocks, so MSFT (and NVDA/AAPL/TSLA) never
+        # appeared with a price. Operators couldn't sanity-check strikes
+        # like "MSFT BULL_PUT 375/370" against spot. Fix adds a
+        # "WATCHLIST STOCKS" block iterating over the watchlist minus the
+        # indices already in MARKETS.
+        import daily_brief
+
+        captured = {
+            "SPY": {"ticker": "SPY", "last": 600.0, "prev": 595.0, "chg": 5.0, "pct": 0.84},
+            "QQQ": {"ticker": "QQQ", "last": 500.0, "prev": 495.0, "chg": 5.0, "pct": 1.01},
+            "IWM": {"ticker": "IWM", "last": 200.0, "prev": 198.0, "chg": 2.0, "pct": 1.01},
+            "MSFT": {"ticker": "MSFT", "last": 387.90, "prev": 397.36, "chg": -9.46, "pct": -2.38},
+            "NVDA": {"ticker": "NVDA", "last": 202.39, "prev": 200.43, "chg": 1.96, "pct": 0.98},
+            "AAPL": {"ticker": "AAPL", "last": 295.57, "prev": 291.57, "chg": 4.0, "pct": 1.37},
+        }
+
+        def fake_snapshot(sym: str) -> dict:
+            return captured.get(sym, {"ticker": sym, "error": "no data"})
+
+        with patch.object(daily_brief, "index_snapshot", side_effect=fake_snapshot), \
+             patch.object(daily_brief, "get_upcoming_earnings", return_value=[]):
+            # Stub the heavy IV + macro paths so the test is offline-only.
+            with patch.object(daily_brief, "get_top_setups", return_value=[]):
+                text = daily_brief.build_brief(["SPY", "QQQ", "NVDA", "AAPL", "MSFT", "TSLA"])
+
+        self.assertIn("📊 WATCHLIST STOCKS", text)
+        # Indices (SPY/QQQ/IWM) appear in the MARKETS block, not duplicated here.
+        # The new block must show the stock-only symbols.
+        for ticker in ("NVDA", "AAPL", "MSFT"):
+            self.assertIn(ticker, text, f"{ticker} should appear in WATCHLIST STOCKS block")
+        # Spot price must be rendered so operators can sanity-check strikes.
+        self.assertIn("387.90", text, "MSFT spot should be in the brief")
+        # TSLA wasn't in the fake snapshot — should be flagged as unavailable,
+        # not silently dropped, so operators know data is missing.
+        self.assertIn("TSLA", text)
+        self.assertIn("(price unavailable)", text)
+        # Indices (already in MARKETS) must NOT be duplicated in the stocks block.
+        # They still appear in MARKETS, so just confirm they're not in the
+        # WATCHLIST STOCKS section as stocks.
+        watchlist_block = text.split("📊 WATCHLIST STOCKS", 1)[1].split("🎯 IV REGIME", 1)[0]
+        for idx in ("SPY", "QQQ", "IWM"):
+            self.assertNotIn(idx, watchlist_block, f"{idx} should be in MARKETS, not duplicated in WATCHLIST STOCKS")
 
 
 if __name__ == "__main__":

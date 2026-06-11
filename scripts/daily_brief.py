@@ -178,6 +178,26 @@ def build_brief(watchlist: list) -> str:
         else:
             lines.append(f"  {emoji} {sym:<8} ${s['last']:>8,.2f}  {chg_sign}{s['pct']:>5.2f}%")
 
+    # Watchlist stocks (MSFT, NVDA, AAPL, TSLA, etc. — anything from the
+    # user's watchlist that isn't already covered by the indices block above).
+    # Without this, the brief had no price for individual tickers like MSFT
+    # (cf. SCAN_DISCREPANCIES_2026-06-11 item #4), making it impossible to
+    # sanity-check a candidate like "MSFT BULL_PUT 375/370" against spot.
+    lines.append("")
+    lines.append("📊 WATCHLIST STOCKS")
+    index_set = {"SPY", "QQQ", "IWM"}
+    stock_symbols = [s for s in watchlist if s not in index_set]
+    if not stock_symbols:
+        lines.append("  (no stocks in watchlist)")
+    for sym in stock_symbols:
+        s = index_snapshot(sym)
+        if "error" in s or "last" not in s:
+            lines.append(f"  ⚪ {sym:<5} (price unavailable)")
+            continue
+        chg_sign = "+" if s["chg"] >= 0 else ""
+        emoji = "🟢" if s["chg"] >= 0 else "🔴"
+        lines.append(f"  {emoji} {sym:<5} ${s['last']:>8,.2f}  {chg_sign}{s['pct']:>5.2f}%")
+
     # IV regime (lazy import to avoid circular)
     lines.append("")
     lines.append("🎯 IV REGIME")
