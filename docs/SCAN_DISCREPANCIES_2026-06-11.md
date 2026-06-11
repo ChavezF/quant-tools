@@ -72,3 +72,15 @@ For honest record — items in my first response that were wrong or unsupported:
 - `scripts/hermes_ops.py` — shared helper for the slim cron wrappers
 - `state/quant_tools.db` — `trades`, `broker_positions`, `tickets` (already inspected: phantom confirmed)
 - `state/positions.json` — point-in-time broker mirror (already inspected: empty)
+
+## Resolution log (added 2026-06-11)
+
+| # | Discrepancy | Status | Fix |
+|---|---|---|---|
+| 1 | Phantom open position (CRITICAL) | **Fixed** in `fa1e567` (already shipped) | `build_management_report` + `mark_open_trades` take a `broker_snapshot`, call `reconcile_open_trades`; MISSING_POSITION → REVIEW/HIGH/PHANTOM (not CLOSE). Surfaces a `position_management_exception` alert and excludes the phantom from journal P&L alerts. |
+| 2 | `reports/cron-2026-06-11/<ts>/` missing | **False alarm** + small robustness fix in `c1b1068` | Artifacts were correctly persisted at `reports/exec-2026-06-11/20260611-103058/` (the executable profile's parent dir is `exec-`, deliberately separate from the morning profile's `cron-`). The doc author looked in the wrong parent dir. Added a `latest_report_dir is None` guard so a future silent empty Telegram is impossible. |
+| 3 | Telegram header "4 approved" but 3 shown | **Fixed** in `fa1e567` (already shipped) | `format_executable_tickets` now shows "showing N of M approved" when truncated. |
+| 4 | MSFT spot missing from morning brief | **Fixed** in `9560cf5` | New `📊 WATCHLIST STOCKS` block in `daily_brief.build_brief` iterates over the watchlist minus indices already in MARKETS, renders the same emoji / chg / pct format, flags missing data as `(price unavailable)` instead of silently dropping. Verified live: MSFT $387.90, NVDA $202.39, AAPL $295.57, TSLA $392.42. |
+| 5 | IVR / score coherence | **Fixed** in `914e4a9` | `format_executable_tickets` and `compose_executable_message` now accept an `iv_ranks: dict[ticker, IVR]`. APPROVE/STRONG tickets with IVR < 50 are demoted from EXECUTABLE to a `HELD BY IVR` section with the regime annotation (e.g. `IVR=43 (below-median (cautious sell))`). Threshold of 50 mirrors the existing portfolio-level IVRank guard in `portfolio_allocator.py:264`. `cron_executable_scan.fetch_iv_ranks_for_tickets` shells out to `iv_rank.py` for the actionable tickers and feeds the result in. End-to-end against the real 10:30 run: 4 candidates → 1 EXECUTABLE (QQQ IVR 88), 3 HELD BY IVR. |
+
+**Test count** at resolution: 153 unit tests pass (was 102 at schema v4, 142 at fa1e567, 147 after c59e8e4, 149 after the three follow-up fixes, 153 after #5).
