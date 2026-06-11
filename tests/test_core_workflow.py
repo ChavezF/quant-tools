@@ -2734,7 +2734,10 @@ class CoreWorkflowTests(unittest.TestCase):
         with patch.object(daily_brief, "index_snapshot", side_effect=fake_snapshot), \
              patch.object(daily_brief, "get_upcoming_earnings", return_value=[]):
             # Stub the heavy IV + macro paths so the test is offline-only.
-            with patch.object(daily_brief, "get_top_setups", return_value=[]):
+            # get_client must be stubbed too: without the broker SDK it raises
+            # SystemExit, which escapes build_brief's except Exception blocks.
+            with patch.object(daily_brief, "get_top_setups", return_value=[]), \
+                 patch.object(daily_brief, "get_client", side_effect=RuntimeError("offline test")):
                 text = daily_brief.build_brief(["SPY", "QQQ", "NVDA", "AAPL", "MSFT", "TSLA"])
 
         self.assertIn("📊 WATCHLIST STOCKS", text)

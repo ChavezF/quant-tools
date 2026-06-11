@@ -260,7 +260,13 @@ class HermesOpsTests(unittest.TestCase):
         # The local _classify_ivr in hermes_ops must stay in lockstep with
         # iv_rank.classify_iv_regime so the HELD BY IVR annotation matches
         # the brief's wording. Test the band boundaries on both sides.
-        from iv_rank import classify_iv_regime
+        # iv_rank imports the broker SDK at module level, so the parity
+        # check can only run where the SDK is installed (operator machine);
+        # CI skips it rather than erroring.
+        try:
+            from iv_rank import classify_iv_regime
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"iv_rank unavailable without broker SDK: {exc}")
 
         for rank in (0, 10, 24.99, 25, 30, 49.99, 50, 60, 74.99, 75, 90, None):
             self.assertEqual(
