@@ -182,6 +182,7 @@ def main():
     p_alerts.add_argument("--validation")
     p_alerts.add_argument("--drift")
     p_alerts.add_argument("--reconciliation")
+    p_alerts.add_argument("--management")
     p_alerts.add_argument("--json", action="store_true")
 
     p_discover = sub.add_parser("discover", help="Discover symbols worth scanning")
@@ -677,6 +678,8 @@ def main():
             cmd += ["--drift", args.drift]
         if args.reconciliation:
             cmd += ["--reconciliation", args.reconciliation]
+        if args.management:
+            cmd += ["--management", args.management]
         extend_opt(cmd, "--journal", journal_path(args.journal))
         extend_opt(cmd, "--db", db_path_arg(args.db))
         if args.json:

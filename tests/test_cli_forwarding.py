@@ -96,6 +96,19 @@ class CliForwardingGoldenTests(unittest.TestCase):
              "--journal", JOURNAL, "--db", DB, "--json"],
         )
 
+    def test_alerts_forwards_management(self):
+        # Regression: `quant.py alerts --management <file>` regressed when the
+        # phantom-position guard (fa1e567) added --management to alerts.py
+        # main() but the quant.py subparser + argv-forwarder were not updated.
+        # Pins the forwarding contract so a future refactor of one without
+        # the other is caught.
+        self.assert_forwards(
+            ["alerts", "--management", "mgmt.json", "--json"],
+            ["alerts.py", "--min-score", "68.0", "--profit-target-pct", "50.0",
+             "--dte-warning", "21", "--management", "mgmt.json",
+             "--journal", JOURNAL, "--db", DB, "--json"],
+        )
+
     def test_analytics(self):
         self.assert_forwards(
             ["analytics", "--json"],
