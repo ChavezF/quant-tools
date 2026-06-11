@@ -43,7 +43,7 @@ CONFIG = Path(os.environ.get("QUANT_CONFIG", PROJECT / "config.json"))
 RUN_POINTER = PROJECT / "state" / "latest-planning-run.json"
 
 sys.path.insert(0, str(SCRIPTS))
-from common import derive_sizing_mode
+from common import atomic_write_json, derive_sizing_mode
 from hermes_ops import (
     DEFAULT_WATCHLIST,
     compose_executable_message,
@@ -257,6 +257,27 @@ def main() -> int:
             f"{len(held)} held by IVR (<50)",
             file=sys.stderr,
         )
+
+    # 2c. Persist the fetched IVR readings (plus the regime/sizing context
+    # this message was composed under) next to tickets.json so offline
+    # consumers — dashboard.py in particular — can reproduce the exact
+    # gate applied here. Non-fatal: the dashboard treats a missing or
+    # empty file as "gate not evaluated", the same semantics as
+    # iv_ranks={} in compose_executable_message.
+    if latest:
+        try:
+            atomic_write_json(
+                latest / "iv_ranks.json",
+                {
+                    "as_of": datetime.now().isoformat(),
+                    "source": "cron_executable_scan",
+                    "regime": verdict,
+                    "sizing_mode": sizing_mode,
+                    "iv_ranks": iv_ranks,
+                },
+            )
+        except OSError as e:
+            print(f"[{now_str()}] could not persist iv_ranks.json: {e}", file=sys.stderr)
 
     # 3. Compose message
     composed = compose_executable_message(

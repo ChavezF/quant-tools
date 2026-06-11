@@ -129,23 +129,25 @@ def _classify_ivr(rank: float | None) -> str:
     return "high (aggressive sell)"
 
 
-def format_executable_tickets(
+def categorize_executable_tickets(
     report: dict[str, Any],
-    limit: int = 3,
-    *,
     iv_ranks: dict[str, float] | None = None,
-) -> str:
-    """Render the candidate-tickets block for the 10:30 Telegram message.
+) -> dict[str, list[dict[str, Any]]]:
+    """Split a tickets report into the 10:30-message categories.
+
+    Single source of truth for the EXECUTABLE / HELD BY IVR / REDUCED
+    split, shared by format_executable_tickets (Telegram) and
+    dashboard.py (HTML) so the two surfaces cannot disagree.
 
     iv_ranks: optional {ticker -> IVR (0-100)}. When provided, tickets
     whose ticker's IVR is below 50 ("low" or "below-median / cautious sell"
     bands per iv_rank.classify_iv_regime) are demoted from EXECUTABLE to
-    a "HELD BY IVR" section with the regime annotation. Mirrors the
-    portfolio-level IVRank guard in portfolio_allocator.py:264
-    ("half size until ... portfolio IVRank > 50"). Tickers missing from
-    the dict are NOT demoted — we don't silently hold on missing data.
-    When iv_ranks is None the gate is bypassed entirely (backward compat
-    for callers / dev runs that don't fetch IVR).
+    HELD BY IVR. Mirrors the portfolio-level IVRank guard in
+    portfolio_allocator.py:264 ("half size until ... portfolio
+    IVRank > 50"). Tickers missing from the dict are NOT demoted — we
+    don't silently hold on missing data. When iv_ranks is None or empty
+    the gate is bypassed entirely (backward compat for callers / dev
+    runs that don't fetch IVR).
     """
     tickets = report.get("tickets", [])
 
@@ -160,23 +162,37 @@ def format_executable_tickets(
         except (TypeError, ValueError):
             return False
 
+    approved_decisions = {"APPROVE", "STRONG"}
+    executable: list[dict[str, Any]] = []
+    held_by_ivr: list[dict[str, Any]] = []
+    reduced: list[dict[str, Any]] = []
+    for ticket in tickets:
+        decision = str(ticket.get("decision", "")).upper()
+        if decision in approved_decisions:
+            (held_by_ivr if _ivr_holds(ticket) else executable).append(ticket)
+        elif decision == "REDUCE":
+            reduced.append(ticket)
+    return {"executable": executable, "held_by_ivr": held_by_ivr, "reduced": reduced}
+
+
+def format_executable_tickets(
+    report: dict[str, Any],
+    limit: int = 3,
+    *,
+    iv_ranks: dict[str, float] | None = None,
+) -> str:
+    """Render the candidate-tickets block for the 10:30 Telegram message.
+
+    Gate semantics live in categorize_executable_tickets (shared with
+    the dashboard); this function only formats.
+    """
+    tickets = report.get("tickets", [])
     if not tickets:
         return "\nNO CANDIDATES TODAY"
-    approved_decisions = {"APPROVE", "STRONG"}
-    actionable = [
-        ticket for ticket in tickets
-        if str(ticket.get("decision", "")).upper() in approved_decisions
-        and not _ivr_holds(ticket)
-    ]
-    held_by_ivr = [
-        ticket for ticket in tickets
-        if str(ticket.get("decision", "")).upper() in approved_decisions
-        and _ivr_holds(ticket)
-    ]
-    reduced = [
-        ticket for ticket in tickets
-        if str(ticket.get("decision", "")).upper() == "REDUCE"
-    ]
+    categories = categorize_executable_tickets(report, iv_ranks)
+    actionable = categories["executable"]
+    held_by_ivr = categories["held_by_ivr"]
+    reduced = categories["reduced"]
     lines = [f"\nCANDIDATES ({len(tickets)})"]
     if actionable:
         shown = min(len(actionable), limit)

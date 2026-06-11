@@ -2362,6 +2362,112 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertIn("Drift Status", html)
         self.assertIn("crash", html)
         self.assertIn("SPY", html)
+        # No iv_ranks.json supplied -> the dashboard must say the gate wasn't
+        # evaluated instead of silently rendering an ungated executable list.
+        self.assertIn("IVR gate NOT evaluated", html)
+
+    def test_dashboard_mirrors_ivr_gate_and_flags_phantoms(self):
+        tickets = {
+            "tickets": [
+                {
+                    "decision": "APPROVE", "ticker": "QQQ", "strategy": "BULL_PUT",
+                    "expiration": "2026-07-17", "strikes": "685/682",
+                    "limit_credit": 0.88, "do_not_chase_below": 0.81, "score": 63.3,
+                },
+                {
+                    "decision": "APPROVE", "ticker": "NVDA", "strategy": "BULL_PUT",
+                    "expiration": "2026-07-17", "strikes": "195/190",
+                    "limit_credit": 1.20, "do_not_chase_below": 1.10, "score": 57.3,
+                },
+                {
+                    "decision": "REDUCE", "ticker": "MSFT", "strategy": "BULL_PUT",
+                    "expiration": "2026-07-17", "strikes": "375/370",
+                    "size_multiplier": 0.5, "score": 62.1,
+                    "rationale": {"profile": "cold streak"},
+                },
+            ]
+        }
+        management = {
+            "summary": {
+                "open_trades": 2, "high_urgency": 1,
+                "phantom_positions": 1, "partial_positions": 0, "unknown_positions": 0,
+            },
+            "broker_snapshot": {
+                "snapshot_at": "2026-06-11T10:25:00",
+                "positions_available": True,
+                "source": "public_fill_ingestion",
+            },
+            "actions": [
+                {
+                    "urgency": "HIGH", "ticker": "NVDA", "strategy": "CSP", "dte": 9,
+                    "unrealized_pnl_pct": None, "action": "REVIEW",
+                    "broker_position_status": "MISSING_POSITION",
+                    "reasons": ["PHANTOM: journal trade has no matching broker position"],
+                },
+                {
+                    "urgency": "LOW", "ticker": "SPY", "strategy": "BULL_PUT", "dte": 30,
+                    "unrealized_pnl_pct": 12, "action": "HOLD",
+                    "broker_position_status": "POSITION_FOUND",
+                    "reasons": ["healthy"],
+                },
+            ],
+        }
+        html = build_dashboard(
+            plan={},
+            alerts={},
+            tickets=tickets,
+            manifest={"created_at": "2026-06-11T10:30:58", "profile": "executable", "reports": {}},
+            base=Path("."),
+            management=management,
+            iv_ranks={
+                "as_of": "2026-06-11T10:30:12",
+                "source": "cron_executable_scan",
+                "regime": "CAUTIOUS",
+                "sizing_mode": "cautious",
+                "iv_ranks": {"QQQ": 88.0, "NVDA": 43.0},
+            },
+        )
+        # The gate matches the 10:30 Telegram message: QQQ executable, NVDA held.
+        self.assertIn("Executable Candidates (1)", html)
+        self.assertIn("Held by IVR (1)", html)
+        self.assertIn("below-median (cautious sell)", html)
+        self.assertIn("IVR gate evaluated", html)
+        self.assertNotIn("IVR gate NOT evaluated", html)
+        # REDUCE ticket surfaces with its rationale.
+        self.assertIn("Reduced Size (1)", html)
+        self.assertIn("cold streak", html)
+        # Phantom position is loud: header exception strip + broker badge.
+        self.assertIn("1 PHANTOM positions", html)
+        self.assertIn("PHANTOM", html)
+        # Cautious regime -> the standing conservative rule is visible.
+        self.assertIn("Half-size until macro FAVORABLE", html)
+        # Read-only constraint: no forms or buttons anywhere.
+        self.assertNotIn("<button", html)
+        self.assertNotIn("<form", html)
+
+    def test_dashboard_full_size_regime_hides_conservative_banner(self):
+        brief = (
+            "🎯 MACRO REGIME\n"
+            "  Verdict: FAVORABLE: normal sizing\n"
+            "\n"
+            "📊 WATCHLIST STOCKS\n"
+            "  🟢 MSFT  $  381.22  +0.45%\n"
+        )
+        html = build_dashboard(
+            plan={},
+            alerts={},
+            tickets={},
+            manifest={"created_at": "2026-06-11T08:31:19", "profile": "planning", "reports": {}},
+            base=Path("."),
+            allocation={"limits": {"sizing_mode": "normal", "sizing_multiplier": 1.0}},
+            brief_text=brief,
+        )
+        self.assertNotIn("Half-size until macro FAVORABLE", html)
+        self.assertIn("FAVORABLE", html)
+        # The brief (with watchlist spot prices) renders in Market Context
+        # instead of any live re-fetch.
+        self.assertIn("WATCHLIST STOCKS", html)
+        self.assertIn("381.22", html)
 
     def test_config_deep_merge(self):
         merged = deep_merge({"a": {"b": 1, "c": 2}, "x": 3}, {"a": {"b": 9}})
@@ -2611,7 +2717,10 @@ class CoreWorkflowTests(unittest.TestCase):
         # like "MSFT BULL_PUT 375/370" against spot. Fix adds a
         # "WATCHLIST STOCKS" block iterating over the watchlist minus the
         # indices already in MARKETS.
-        import daily_brief
+        try:
+            import daily_brief
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"daily_brief needs market-data deps (CI runs dependency-light): {exc}")
 
         captured = {
             "SPY": {"ticker": "SPY", "last": 600.0, "prev": 595.0, "chg": 5.0, "pct": 0.84},
@@ -2628,7 +2737,10 @@ class CoreWorkflowTests(unittest.TestCase):
         with patch.object(daily_brief, "index_snapshot", side_effect=fake_snapshot), \
              patch.object(daily_brief, "get_upcoming_earnings", return_value=[]):
             # Stub the heavy IV + macro paths so the test is offline-only.
-            with patch.object(daily_brief, "get_top_setups", return_value=[]):
+            # get_client must be stubbed too: without the broker SDK it raises
+            # SystemExit, which escapes build_brief's except Exception blocks.
+            with patch.object(daily_brief, "get_top_setups", return_value=[]), \
+                 patch.object(daily_brief, "get_client", side_effect=RuntimeError("offline test")):
                 text = daily_brief.build_brief(["SPY", "QQQ", "NVDA", "AAPL", "MSFT", "TSLA"])
 
         self.assertIn("📊 WATCHLIST STOCKS", text)
