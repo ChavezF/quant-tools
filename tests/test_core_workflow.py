@@ -2717,7 +2717,10 @@ class CoreWorkflowTests(unittest.TestCase):
         # like "MSFT BULL_PUT 375/370" against spot. Fix adds a
         # "WATCHLIST STOCKS" block iterating over the watchlist minus the
         # indices already in MARKETS.
-        import daily_brief
+        try:
+            import daily_brief
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"daily_brief needs market-data deps (CI runs dependency-light): {exc}")
 
         captured = {
             "SPY": {"ticker": "SPY", "last": 600.0, "prev": 595.0, "chg": 5.0, "pct": 0.84},
