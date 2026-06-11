@@ -48,7 +48,7 @@ from feedback_calibration import build_feedback_report
 from historical_analytics import build_analytics
 from opportunity_discovery import score_discovery_metrics
 from order_staging import build_stage_packet, confirm_journal_stage
-from operator_summary import build_summary
+from operator_summary import build_summary, main as operator_summary_main
 from portfolio_allocator import allocate_portfolio
 from public_fill_ingestion import build_snapshot, normalize_fills, normalize_lifecycle_events
 from scenario_stress import build_scenario_report
@@ -2576,6 +2576,31 @@ class CoreWorkflowTests(unittest.TestCase):
             "days_to_earnings": 2,
         })
         self.assertGreater(strong["discovery_score"], weak["discovery_score"])
+
+    def test_operator_summary_creates_missing_report_dir(self):
+        # Regression: scripts/operator_summary.py used to call output.write_text
+        # without ensuring the parent dir existed, so passing a non-existent
+        # --report-dir raised FileNotFoundError. Real callers from
+        # quant.py operator / daily_workflow always pre-create the dir, so the
+        # toolkit's own 142 tests missed it; the skill-level smoke test
+        # verify_toolkit.py caught it. The fix is a single mkdir.
+        with tempfile.TemporaryDirectory() as parent:
+            missing = Path(parent) / "does" / "not" / "exist"
+            self.assertFalse(missing.exists())
+            old_argv = sys.argv
+            try:
+                sys.argv = [
+                    "operator_summary.py",
+                    "--report-dir",
+                    str(missing),
+                ]
+                operator_summary_main()
+            finally:
+                sys.argv = old_argv
+            written = missing / "operator_summary.md"
+            self.assertTrue(missing.is_dir(), "report dir should be auto-created")
+            self.assertTrue(written.is_file(), "operator_summary.md should be written")
+            self.assertGreater(written.stat().st_size, 0)
 
 
 if __name__ == "__main__":

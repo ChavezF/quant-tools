@@ -220,6 +220,7 @@ def main() -> None:
 
     base = Path(args.report_dir)
     output = Path(args.output) if args.output else base / "operator_summary.md"
+    output.parent.mkdir(parents=True, exist_ok=True)
     text = build_summary(
         read_json(base / "plan.json"),
         read_json(base / "alerts.json"),
