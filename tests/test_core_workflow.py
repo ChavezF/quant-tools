@@ -15,7 +15,7 @@ if str(SCRIPTS) not in sys.path:
 
 from cache_utils import cached, read_cache
 from candidate_scoring import score_results
-from common import parse_osi_expiration, parse_osi_parts, parse_osi_strike
+from common import format_osi_symbol, parse_osi_expiration, parse_osi_parts, parse_osi_strike
 from data_reliability import quote_is_stale, retry_call, utc_now_iso
 from correlation_risk import correlation_penalty
 from execution_quality import execution_quality
@@ -33,7 +33,12 @@ from trade_journal import add_trade, close_trade, default_state, journal_stats
 from action_plan import apply_performance_overlay, build_action_plan
 from adaptive_sizing import adaptive_size
 from alerts import build_alerts
-from broker_reconciliation import apply_journal_updates, build_reconciliation
+from broker_reconciliation import (
+    apply_assignment_updates,
+    apply_journal_updates,
+    build_reconciliation,
+    proposed_assignment_updates,
+)
 from dashboard import build_dashboard
 from daily_workflow import build_public_ingestion_cmd, build_storage_cmd, profile_skips
 from database_maintenance import backup_database, maintain_database, prune_backups
@@ -42,10 +47,12 @@ from execution_tickets import build_ticket_report, build_tickets
 from feedback_calibration import build_feedback_report
 from historical_analytics import build_analytics
 from opportunity_discovery import score_discovery_metrics
+from order_staging import build_stage_packet, confirm_journal_stage
 from operator_summary import build_summary
 from portfolio_allocator import allocate_portfolio
 from public_fill_ingestion import build_snapshot, normalize_fills, normalize_lifecycle_events
 from scenario_stress import build_scenario_report
+from model_scorecard import build_scorecard
 from health_check import build_health_report
 from walk_forward_validation import build_walk_forward_report
 from storage import (
@@ -53,6 +60,7 @@ from storage import (
     apply_lifecycle_policy,
     connect,
     export_journal_state,
+    insert_option_chain_snapshot,
     load_active_tickets,
     load_fills_for_reconciliation,
     list_tickets,
@@ -60,6 +68,7 @@ from storage import (
     set_ticket_lifecycle,
     table_counts,
     ticket_lifecycle_counts,
+    upsert_equity_lots,
     upsert_fills,
     upsert_tickets,
     upsert_trades,
@@ -112,6 +121,66 @@ def sample_scan_report():
 
 
 class CoreWorkflowTests(unittest.TestCase):
+    def test_osi_formatting_and_manual_order_staging(self):
+        self.assertEqual(
+            format_osi_symbol("spy", "2026-07-17", "P", 475),
+            "SPY260717P00475000",
+        )
+        ticket = {
+            "ticket_id": "QTK-STAGE",
+            "lifecycle_status": "READY",
+            "ticker": "SPY",
+            "strategy": "CSP",
+            "expiration": "2026-07-17",
+            "strikes": "475",
+            "target_quantity": 1,
+            "limit_credit": 1.2,
+        }
+        packet = build_stage_packet(ticket, "/tmp/place_order.py")
+        self.assertEqual(packet["stage_status"], "READY_FOR_MANUAL_SUBMISSION")
+        self.assertIn("--symbol SPY260717P00475000", packet["place_order_command"])
+        self.assertIn("--limit-price 1.2", packet["place_order_command"])
+        with self.assertRaisesRegex(ValueError, "must be READY"):
+            build_stage_packet({**ticket, "lifecycle_status": "SUBMITTED"})
+
+        spread = build_stage_packet(
+            {
+                **ticket,
+                "strategy": "BULL_PUT",
+                "strikes": "475/470",
+            }
+        )
+        self.assertEqual(spread["stage_status"], "BROKER_HELPER_UNSUPPORTED")
+        self.assertIsNone(spread["place_order_command"])
+        self.assertEqual(len(spread["manual_order"]["legs"]), 2)
+
+    def test_staging_confirmation_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "quant.db"
+            state_path = Path(tmp) / "trades.json"
+            ticket = {
+                "ticket_id": "QTK-STAGED",
+                "lifecycle_status": "READY",
+                "ticker": "SPY",
+                "strategy": "CSP",
+                "expiration": "2026-07-17",
+                "strikes": "475",
+                "target_quantity": 1,
+                "limit_credit": 1.2,
+                "capital_required": 47500,
+            }
+            con = connect(db_path)
+            try:
+                upsert_tickets(con, [ticket])
+            finally:
+                con.close()
+            first, first_created = confirm_journal_stage(ticket, state_path, str(db_path))
+            second, second_created = confirm_journal_stage(ticket, state_path, str(db_path))
+            self.assertTrue(first_created)
+            self.assertFalse(second_created)
+            self.assertEqual(first["id"], second["id"])
+            self.assertEqual(second["status"], "STAGED")
+
     def test_public_history_normalizes_two_leg_bull_put(self):
         transactions = [
             {
@@ -605,6 +674,8 @@ class CoreWorkflowTests(unittest.TestCase):
                         "strategy": "BULL_PUT",
                         "expiration": "2026-07-17",
                         "dte": 43,
+                        "pop_pct": 78,
+                        "ann_roc_pct": 20.4,
                         "short_strike": 475,
                         "long_strike": 470,
                         "execution": {
@@ -627,6 +698,8 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertEqual(tickets[0]["target_quantity"], 1.0)
         self.assertEqual(tickets[0]["strikes"], "475/470")
         self.assertEqual(tickets[0]["portfolio_allocation"]["rank"], 1)
+        self.assertEqual(tickets[0]["pop_pct"], 78)
+        self.assertEqual(tickets[0]["ann_roc_pct"], 20.4)
         self.assertTrue(tickets[0]["ticket_id"].startswith("QTK-"))
 
     def test_ticket_ids_are_distinct_across_plan_issuances(self):
@@ -735,10 +808,31 @@ class CoreWorkflowTests(unittest.TestCase):
             {"tickets": []},
             {"overall": {"count": 3, "win_rate": 66.7, "expectancy": 25, "total_pnl": 75}, "drawdown": {"max_drawdown": 20}},
             {"recommended_min_score": 60},
+            management={
+                "summary": {"open_trades": 1, "high_urgency": 1, "strike_threats": 1},
+                "actions": [
+                    {
+                        "urgency": "HIGH",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "action": "ROLL_OR_CLOSE",
+                        "dte": 12,
+                        "reasons": ["STRIKE_THREAT"],
+                        "strike_threat": {
+                            "status": "THREAT",
+                            "sigma_distance": 0.4,
+                            "option_type": "P",
+                            "short_strike": 475,
+                        },
+                    }
+                ],
+            },
         )
         self.assertIn("Quant Tools Morning Review", text)
         self.assertIn("Recommended minimum score: 60.0", text)
         self.assertIn("Do not place orders without explicit confirmation", text)
+        self.assertIn("Open Position Management", text)
+        self.assertIn("ROLL_OR_CLOSE", text)
 
     def test_sqlite_storage_migrates_and_upserts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -750,11 +844,27 @@ class CoreWorkflowTests(unittest.TestCase):
                 upsert_trades(con, [trade])
                 upsert_trades(con, [{**trade, "status": "CLOSED"}])
                 upsert_tickets(con, [ticket])
+                upsert_equity_lots(
+                    con,
+                    [
+                        {
+                            "id": "LOT-A1",
+                            "ticker": "SPY",
+                            "status": "OPEN",
+                            "quantity": 100,
+                            "cost_basis_per_share": 472.5,
+                            "assignment_event_id": "A1",
+                        }
+                    ],
+                )
                 counts = table_counts(con)
                 self.assertEqual(counts["trades"], 1)
                 self.assertEqual(counts["tickets"], 1)
                 self.assertEqual(export_journal_state(con)["trades"][0]["status"], "CLOSED")
-                self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 4)
+                self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 6)
+                self.assertEqual(counts["option_chain_snapshots"], 0)
+                self.assertEqual(counts["equity_lots"], 1)
+                self.assertEqual(export_journal_state(con)["equity_lots"][0]["quantity"], 100)
             finally:
                 con.close()
 
@@ -788,7 +898,7 @@ class CoreWorkflowTests(unittest.TestCase):
 
             con = connect(db_path)
             try:
-                self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 4)
+                self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 6)
                 self.assertEqual(load_active_tickets(con), [])
                 ticket = list_tickets(con, ["EXPIRED"])[0]
                 self.assertEqual(ticket["ticket_id"], "QTK-LEGACY")
@@ -796,6 +906,86 @@ class CoreWorkflowTests(unittest.TestCase):
                 self.assertEqual(ticket["target_quantity"], 1.0)
             finally:
                 con.close()
+
+    def test_option_chain_snapshots_are_queryable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            con = connect(Path(tmp) / "quant.db")
+            try:
+                inserted = insert_option_chain_snapshot(
+                    con,
+                    captured_at="2026-06-11T10:30:00-04:00",
+                    ticker="SPY",
+                    expiration="2026-07-17",
+                    spot=600,
+                    dte=36,
+                    chain={
+                        "calls": {
+                            610.0: {
+                                "osi": "SPY260717C00610000",
+                                "bid": 4.1,
+                                "ask": 4.3,
+                                "mark": 4.2,
+                                "delta": 0.3,
+                                "theta": -0.12,
+                            }
+                        },
+                        "puts": {
+                            590.0: {
+                                "osi": "SPY260717P00590000",
+                                "bid": 3.8,
+                                "ask": 4.0,
+                                "mark": 3.9,
+                                "delta": -0.28,
+                                "theta": -0.11,
+                            }
+                        },
+                    },
+                )
+                self.assertEqual(inserted, 2)
+                self.assertEqual(table_counts(con)["option_chain_snapshots"], 2)
+                row = con.execute(
+                    "SELECT osi, delta FROM option_chain_snapshots WHERE option_type='PUT'"
+                ).fetchone()
+                self.assertEqual(row["osi"], "SPY260717P00590000")
+                self.assertEqual(row["delta"], -0.28)
+            finally:
+                con.close()
+
+    def test_scorecard_reports_pop_calibration_and_monthly_excess_return(self):
+        report = build_scorecard(
+            {
+                "trades": [
+                    {
+                        "id": "T1",
+                        "status": "CLOSED",
+                        "closed_at": "2026-05-10",
+                        "pop_pct": 70,
+                        "quantity": 1,
+                        "entry_credit": 1.0,
+                        "realized_pnl": 80,
+                    },
+                    {
+                        "id": "T2",
+                        "status": "CLOSED",
+                        "closed_at": "2026-05-20",
+                        "pop_pct": 72,
+                        "quantity": 1,
+                        "entry_credit": 1.0,
+                        "realized_pnl": -40,
+                    },
+                ]
+            },
+            account_nav=10000,
+            spy_returns={"2026-05": 1.0},
+        )
+        bucket = report["pop_calibration"]["buckets"]["65-74"]
+        self.assertEqual(bucket["count"], 2)
+        self.assertEqual(bucket["expected_pop_pct"], 71.0)
+        self.assertEqual(bucket["realized_win_rate_pct"], 50.0)
+        month = report["monthly"]["2026-05"]
+        self.assertEqual(month["realized_pnl"], 40.0)
+        self.assertEqual(month["account_return_pct"], 0.4)
+        self.assertEqual(month["excess_return_vs_spy_pct"], -0.6)
 
     def test_ticket_lifecycle_completes_across_separate_sync_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1217,6 +1407,52 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertEqual(report["summary"]["selected"], 0)
         self.assertIn("tail-loss budget $500", report["excluded"][0]["reasons"])
 
+    def test_portfolio_allocator_caps_projected_bootstrap_expected_shortfall(self):
+        action = {
+            "ticker": "SPY",
+            "strategy": "BULL_PUT",
+            "score": 80,
+            "action_decision": "APPROVE",
+            "action_size_multiplier": 1.0,
+            "capital_required": 1000,
+            "max_loss": 1000,
+            "delta_change": -20,
+            "projected_delta": -20,
+            "correlation": {"groups": [], "penalty": 0},
+            "candidate": {
+                "strategy": "BULL_PUT",
+                "expiration": "2026-07-17",
+                "short_strike": 475,
+                "long_strike": 470,
+                "pop_pct": 75,
+                "ann_roc_pct": 20,
+                "execution": {"execution_score": 80},
+            },
+        }
+        report = allocate_portfolio(
+            {
+                "limits": {"account_nav": 10000, "max_portfolio_delta_abs": 100},
+                "actions": [action],
+            },
+            {
+                "max_expected_shortfall_pct": 0.08,
+                "stress_loss_fraction": 0.65,
+                "max_total_capital_pct": 0.50,
+                "max_ticker_capital_pct": 0.50,
+            },
+            {
+                "risk": {
+                    "var_bootstrap": {
+                        "expected_shortfall_95": 500,
+                        "observations": 250,
+                    }
+                }
+            },
+        )
+        self.assertEqual(report["limits"]["risk_model"], "bootstrap_expected_shortfall")
+        self.assertEqual(report["summary"]["selected"], 0)
+        self.assertIn("expected-shortfall budget $800", report["excluded"][0]["reasons"])
+
     def test_walk_forward_validation_finds_stable_profitable_threshold(self):
         trades = []
         for i in range(20):
@@ -1308,6 +1544,93 @@ class CoreWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(partial["summary"]["partial_positions"], 1)
         self.assertEqual(partial["summary"]["position_exceptions"], 1)
+
+    def test_reconciliation_promotes_staged_trade_when_entry_fills(self):
+        report = build_reconciliation(
+            {
+                "trades": [
+                    {
+                        "id": "T-STAGED",
+                        "ticket_id": "QTK-STAGED",
+                        "status": "STAGED",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                    }
+                ]
+            },
+            {
+                "tickets": [
+                    {
+                        "ticket_id": "QTK-STAGED",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "expiration": "2026-07-17",
+                        "strikes": "475",
+                        "target_quantity": 1,
+                        "limit_credit": 1.2,
+                    }
+                ]
+            },
+            {
+                "positions": [],
+                "fills": [
+                    {
+                        "fill_id": "F-STAGED",
+                        "ticket_id": "QTK-STAGED",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "quantity": 1,
+                        "price": 1.22,
+                        "filled_at": "2026-06-11T15:00:00+00:00",
+                    }
+                ],
+            },
+        )
+        update = report["proposed_journal_updates"][0]["set"]
+        self.assertEqual(update["status"], "OPEN")
+        self.assertEqual(update["opened_at"], "2026-06-11T15:00:00+00:00")
+
+    def test_csp_assignment_becomes_adjusted_basis_equity_lot(self):
+        journal = {
+            "trades": [
+                {
+                    "id": "T-CSP",
+                    "ticket_id": "QTK-CSP",
+                    "status": "OPEN",
+                    "ticker": "SPY",
+                    "strategy": "CSP",
+                    "expiration": "2026-07-17",
+                    "strikes": "475",
+                    "quantity": 1,
+                    "entry_credit": 2.5,
+                    "entry_debit": 0,
+                }
+            ],
+            "equity_lots": [],
+        }
+        events = [
+            {
+                "event_id": "ASSIGN-1",
+                "event_type": "ASSIGNMENT",
+                "occurred_at": "2026-07-18T01:00:00+00:00",
+                "ticker": "SPY",
+                "expiration": "2026-07-17",
+                "option_type": "P",
+                "strike": 475,
+                "quantity": 100,
+            }
+        ]
+        proposed = proposed_assignment_updates(journal, events)
+        self.assertEqual(len(proposed), 1)
+        self.assertEqual(proposed[0]["equity_lot"]["cost_basis_per_share"], 472.5)
+        applied = apply_assignment_updates(journal, proposed)
+        self.assertEqual(applied["journal"]["trades"][0]["status"], "CLOSED")
+        self.assertEqual(applied["journal"]["trades"][0]["realized_pnl"], 0.0)
+        lot = applied["journal"]["equity_lots"][0]
+        self.assertEqual(lot["quantity"], 100)
+        self.assertEqual(lot["broker_reported_quantity"], 100)
+        self.assertTrue(lot["covered_call_ready"])
+        self.assertEqual(apply_assignment_updates(applied["journal"], proposed)["applied_assignment_updates"], [])
 
     def test_reconciliation_aggregates_partial_fills_by_target_quantity(self):
         tickets = {
@@ -1874,6 +2197,8 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertFalse(executable["skip_storage"])
         self.assertTrue(executable["skip_discovery"])
         self.assertTrue(executable["skip_dashboard"])
+        self.assertTrue(executable["skip_scorecard"])
+        self.assertFalse(planning["skip_scorecard"])
 
     def test_action_plan_applies_execution_attribution(self):
         limits = RiskLimits(account_nav=30000)
@@ -2001,10 +2326,33 @@ class CoreWorkflowTests(unittest.TestCase):
                 "summary": {"status": "STABLE", "severity": "LOW"},
                 "comparison": {"expectancy_change": 5},
             },
+            management={
+                "summary": {
+                    "open_trades": 1,
+                    "high_urgency": 1,
+                    "strike_threats": 1,
+                    "event_spans": 1,
+                },
+                "actions": [
+                    {
+                        "urgency": "HIGH",
+                        "ticker": "SPY",
+                        "strategy": "CSP",
+                        "dte": 12,
+                        "unrealized_pnl_pct": -20,
+                        "action": "ROLL_OR_CLOSE",
+                        "strike_threat": {"status": "THREAT"},
+                        "event_span": [{"event_type": "FOMC", "date": "2026-06-17"}],
+                        "reasons": ["STRIKE_THREAT"],
+                    }
+                ],
+            },
         )
         self.assertIn("Quant Tools Dashboard", html)
         self.assertIn("Action Plan", html)
         self.assertIn("Score-Band Performance", html)
+        self.assertIn("Open Position Management", html)
+        self.assertIn("ROLL_OR_CLOSE", html)
         self.assertIn("Strategy Calibration", html)
         self.assertIn("Execution Tickets", html)
         self.assertIn("Scenario Stress", html)
@@ -2057,6 +2405,7 @@ class CoreWorkflowTests(unittest.TestCase):
             "max_positions": 6,
             "max_total_capital_pct": 0.35,
             "max_tail_loss_pct": 0.08,
+            "max_expected_shortfall_pct": 0.08,
             "max_ticker_capital_pct": 0.15,
             "max_group_exposure_pct": 0.35,
         }
@@ -2064,6 +2413,7 @@ class CoreWorkflowTests(unittest.TestCase):
         cautious = apply_sizing_mode(config, "cautious")
         self.assertAlmostEqual(cautious["max_total_capital_pct"], 0.175)  # 0.35 * 0.5
         self.assertAlmostEqual(cautious["max_tail_loss_pct"], 0.04)
+        self.assertAlmostEqual(cautious["max_expected_shortfall_pct"], 0.04)
         self.assertAlmostEqual(cautious["max_ticker_capital_pct"], 0.075)
         self.assertEqual(cautious["sizing_mode"], "cautious")
         self.assertEqual(cautious["sizing_multiplier"], 0.5)

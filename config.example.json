@@ -96,6 +96,7 @@
     "max_positions": 6,
     "max_total_capital_pct": 0.35,
     "max_tail_loss_pct": 0.08,
+    "max_expected_shortfall_pct": 0.08,
     "max_ticker_capital_pct": 0.15,
     "max_group_exposure_pct": 0.35,
     "stress_loss_fraction": 0.65,
@@ -118,6 +119,16 @@
     "profit_target_pct": 50.0,
     "stop_loss_pct": 200.0,
     "manage_dte": 21,
-    "urgent_dte": 7
+    "urgent_dte": 7,
+    "strike_threat_sigma": 0.5,
+    "roll_min_dte": 28,
+    "roll_max_dte": 50,
+    "fomc_dates": [
+      "2026-06-17",
+      "2026-07-29",
+      "2026-09-16",
+      "2026-10-28",
+      "2026-12-09"
+    ]
   }
 }

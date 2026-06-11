@@ -64,7 +64,7 @@ class CliForwardingGoldenTests(unittest.TestCase):
              "--watchlist", "SPY", "QQQ", "--strategies", "csp", "cc", "bull_put",
              "--min-dte", "21", "--max-dte", "45", "--target-delta", "0.3",
              "--min-oi", "50", "--max-expirations", "2",
-             "--wing-widths", "2.5", "5", "10", "--ranked", "--json"],
+             "--wing-widths", "2.5", "5", "10", "--db", DB, "--ranked", "--json"],
         )
 
     def test_pretrade_pulls_risk_limits_from_config(self):
@@ -133,7 +133,7 @@ class CliForwardingGoldenTests(unittest.TestCase):
         )
         self.assert_forwards(
             ["manage", "--json"],
-            ["position_management.py", "--journal", JOURNAL, "--db", DB,
+            ["position_management.py", "--config", CONFIG, "--journal", JOURNAL, "--db", DB,
              "--profit-target-pct", "50.0", "--stop-loss-pct", "200.0",
              "--manage-dte", "21", "--urgent-dte", "7", "--json"],
         )
@@ -143,6 +143,34 @@ class CliForwardingGoldenTests(unittest.TestCase):
             ["tickets", "--plan", "plan.json", "--json"],
             ["execution_tickets.py", "--plan", "plan.json", "--db", DB,
              "--pending-expiry-hours", "24", "--partial-review-hours", "4", "--json"],
+        )
+
+    def test_stage(self):
+        self.assert_forwards(
+            ["stage", "--ticket-id", "QTK-1", "--confirm", "--json"],
+            ["order_staging.py", "--ticket-id", "QTK-1", "--db", DB,
+             "--journal", JOURNAL, "--confirm", "--json"],
+        )
+
+    def test_scorecard(self):
+        self.assert_forwards(
+            ["scorecard", "--json"],
+            ["model_scorecard.py", "--journal", JOURNAL, "--db", DB,
+             "--account-nav", "30000", "--json"],
+        )
+
+    def test_allocate_forwards_bootstrap_risk_report(self):
+        self.assert_forwards(
+            ["allocate", "--plan", "plan.json", "--risk", "risk.json", "--json"],
+            ["portfolio_allocator.py", "--plan", "plan.json", "--config", CONFIG,
+             "--risk", "risk.json", "--json"],
+        )
+
+    def test_intraday_sentinel(self):
+        self.assert_forwards(
+            ["sentinel", "--send", "--json"],
+            ["intraday_sentinel.py", "--config", CONFIG, "--journal", JOURNAL,
+             "--db", DB, "--send", "--json"],
         )
 
     def test_storage(self):

@@ -28,10 +28,13 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import date, datetime
+import math
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from mark_to_market import trade_legs
+from toolkit_config import add_config_argument, load_config
 from trade_journal import DEFAULT_STATE_FILE, load_journal
 
 
@@ -40,6 +43,9 @@ DEFAULT_THRESHOLDS = {
     "stop_loss_pct": 200.0,
     "manage_dte": 21,
     "urgent_dte": 7,
+    "strike_threat_sigma": 0.5,
+    "roll_min_dte": 28,
+    "roll_max_dte": 50,
 }
 
 
@@ -57,6 +63,7 @@ def evaluate_trade(
     trade: dict[str, Any],
     thresholds: dict[str, Any],
     today: date,
+    market: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply the management rules to one open trade."""
     dte = trade_dte(trade, today)
@@ -66,6 +73,7 @@ def evaluate_trade(
     action = "HOLD"
     urgency = "LOW"
     reasons = []
+    market = market or {}
 
     if pnl_pct is not None and pnl_pct <= -float(thresholds["stop_loss_pct"]):
         action = "CLOSE"
@@ -98,6 +106,26 @@ def evaluate_trade(
         urgency = "HIGH"
         reasons.append(f"URGENT: {dte} DTE <= {int(thresholds['urgent_dte'])}")
 
+    threat = strike_threat(trade, market, dte, float(thresholds["strike_threat_sigma"]))
+    if threat["status"] in {"THREAT", "BREACHED"}:
+        urgency = "HIGH"
+        if action == "HOLD":
+            action = "ROLL_OR_CLOSE"
+        reasons.append(threat["reason"])
+
+    events = event_span(trade, market.get("events", []), today)
+    if events:
+        urgency = (
+            "HIGH"
+            if any(event["event_type"] == "EARNINGS" for event in events)
+            else max_urgency(urgency, "MEDIUM")
+        )
+        if action == "HOLD":
+            action = "REVIEW"
+        reasons.append(
+            "EVENT_SPAN: " + ", ".join(f"{event['event_type']} {event['date']}" for event in events)
+        )
+
     return {
         "trade_id": trade.get("id"),
         "ticket_id": trade.get("ticket_id"),
@@ -111,18 +139,116 @@ def evaluate_trade(
         "action": action,
         "urgency": urgency,
         "reasons": reasons,
+        "market": {
+            "spot": market.get("spot"),
+            "iv": market.get("iv"),
+        },
+        "strike_threat": threat,
+        "event_span": events,
+        "roll_proposal": market.get("roll_proposal"),
     }
+
+
+def max_urgency(left: str, right: str) -> str:
+    rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+    return left if rank.get(left, 0) >= rank.get(right, 0) else right
+
+
+def short_option_identity(trade: dict[str, Any]) -> tuple[str, float] | None:
+    legs, _ = trade_legs(trade)
+    if not legs:
+        return None
+    short_legs = [piece for piece in legs if piece["side"] == "SHORT"]
+    if not short_legs:
+        return None
+    if len(short_legs) == 1:
+        piece = short_legs[0]
+        return str(piece["option_type"]), float(piece["strike"])
+    return None
+
+
+def strike_threat(
+    trade: dict[str, Any],
+    market: dict[str, Any],
+    dte: int | None,
+    warning_sigma: float,
+) -> dict[str, Any]:
+    identity = short_option_identity(trade)
+    try:
+        spot = float(market.get("spot"))
+        iv = float(market.get("iv"))
+    except (TypeError, ValueError):
+        return {"status": "UNKNOWN", "sigma_distance": None, "reason": "spot or IV unavailable"}
+    if not identity or spot <= 0 or iv <= 0 or dte is None:
+        return {"status": "UNKNOWN", "sigma_distance": None, "reason": "short strike risk unavailable"}
+    option_type, strike = identity
+    one_sigma = spot * iv * math.sqrt(max(dte, 1) / 365)
+    distance = spot - strike if option_type == "P" else strike - spot
+    sigma_distance = distance / one_sigma if one_sigma else None
+    if sigma_distance is None:
+        status = "UNKNOWN"
+    elif sigma_distance <= 0:
+        status = "BREACHED"
+    elif sigma_distance <= warning_sigma:
+        status = "THREAT"
+    else:
+        status = "CLEAR"
+    reason = (
+        f"STRIKE_{status}: spot {spot:.2f}, short {option_type}{strike:g}, "
+        f"distance {sigma_distance:.2f}σ"
+        if sigma_distance is not None
+        else "short strike risk unavailable"
+    )
+    return {
+        "status": status,
+        "option_type": option_type,
+        "short_strike": strike,
+        "spot": spot,
+        "iv": iv,
+        "one_sigma_move": round(one_sigma, 4),
+        "sigma_distance": round(sigma_distance, 3) if sigma_distance is not None else None,
+        "warning_sigma": warning_sigma,
+        "reason": reason,
+    }
+
+
+def event_span(trade: dict[str, Any], events: list[dict[str, Any]], today: date) -> list[dict[str, Any]]:
+    expiration = trade_dte(trade, today)
+    if expiration is None:
+        return []
+    end = today + timedelta(days=expiration)
+    ticker = str(trade.get("ticker") or "").upper()
+    out = []
+    for event in events:
+        try:
+            event_date = date.fromisoformat(str(event.get("date") or "")[:10])
+        except ValueError:
+            continue
+        event_ticker = str(event.get("ticker") or "").upper()
+        if event_ticker and event_ticker != ticker:
+            continue
+        if today <= event_date <= end:
+            out.append(
+                {
+                    "event_type": str(event.get("event_type") or "EVENT").upper(),
+                    "date": event_date.isoformat(),
+                    "ticker": event_ticker or None,
+                    "detail": event.get("detail"),
+                }
+            )
+    return sorted(out, key=lambda row: (row["date"], row["event_type"]))
 
 
 def build_management_report(
     state: dict[str, Any],
     thresholds: dict[str, Any] | None = None,
     today: date | None = None,
+    market_contexts: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     thresholds = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
     today = today or date.today()
     actions = [
-        evaluate_trade(trade, thresholds, today)
+        evaluate_trade(trade, thresholds, today, (market_contexts or {}).get(str(trade.get("id")), {}))
         for trade in state.get("trades", [])
         if trade.get("status") == "OPEN"
     ]
@@ -139,9 +265,178 @@ def build_management_report(
             "review": sum(1 for row in actions if row["action"] == "REVIEW"),
             "hold": sum(1 for row in actions if row["action"] == "HOLD"),
             "high_urgency": sum(1 for row in actions if row["urgency"] == "HIGH"),
+            "strike_threats": sum(
+                1 for row in actions if row["strike_threat"]["status"] in {"THREAT", "BREACHED"}
+            ),
+            "event_spans": sum(1 for row in actions if row["event_span"]),
+            "credit_rolls": sum(
+                1 for row in actions if (row.get("roll_proposal") or {}).get("status") == "CREDIT_AVAILABLE"
+            ),
         },
         "actions": actions,
     }
+
+
+class LiveManagementSource:
+    """Cached Public/yfinance context for breach, event, and roll decisions."""
+
+    def __init__(self, cfg: dict[str, Any], today: date | None = None):
+        from common import get_public_client
+
+        self.client = get_public_client()
+        self.cfg = cfg
+        self.today = today or date.today()
+        self.reliability = cfg.get("data_reliability", {})
+        self.thresholds = cfg.get("position_management", {})
+        self._quotes: dict[str, float | None] = {}
+        self._expirations: dict[str, list[str]] = {}
+        self._chains: dict[tuple[str, str], dict[str, Any]] = {}
+        self._earnings: dict[str, str | None] = {}
+
+    def spot(self, ticker: str) -> float | None:
+        if ticker not in self._quotes:
+            from options_screener import fetch_quote
+
+            quote = fetch_quote(self.client, ticker, self.reliability)
+            self._quotes[ticker] = quote.get("last") or quote.get("bid")
+        return self._quotes[ticker]
+
+    def chain(self, ticker: str, expiration: str) -> dict[str, Any]:
+        key = (ticker, expiration)
+        if key not in self._chains:
+            from options_screener import fetch_chain_with_greeks
+
+            spot = self.spot(ticker)
+            self._chains[key] = (
+                fetch_chain_with_greeks(self.client, ticker, expiration, spot, reliability_cfg=self.reliability)
+                if spot
+                else {"calls": {}, "puts": {}}
+            )
+        return self._chains[key]
+
+    def expirations(self, ticker: str) -> list[str]:
+        if ticker not in self._expirations:
+            from options_screener import fetch_option_expirations
+
+            self._expirations[ticker] = fetch_option_expirations(self.client, ticker, self.reliability)
+        return self._expirations[ticker]
+
+    def earnings_date(self, ticker: str) -> str | None:
+        if ticker not in self._earnings:
+            from options_screener import fetch_underlying_metrics
+
+            metrics = fetch_underlying_metrics(ticker, ttl_seconds=900)
+            self._earnings[ticker] = metrics.get("earnings", {}).get("next")
+        return self._earnings[ticker]
+
+    def events(self, ticker: str) -> list[dict[str, Any]]:
+        events = [
+            {"event_type": "FOMC", "date": value, "detail": "Scheduled FOMC decision"}
+            for value in self.thresholds.get("fomc_dates", [])
+        ]
+        earnings = self.earnings_date(ticker)
+        if earnings:
+            events.append({"event_type": "EARNINGS", "date": earnings, "ticker": ticker})
+        return events
+
+    def context(self, trade: dict[str, Any]) -> dict[str, Any]:
+        ticker = str(trade.get("ticker") or "").upper()
+        expiration = str(trade.get("expiration") or "")[:10]
+        spot = self.spot(ticker)
+        chain = self.chain(ticker, expiration) if spot and expiration else {"calls": {}, "puts": {}}
+        identity = short_option_identity(trade)
+        leg = {}
+        if identity:
+            option_type, strike = identity
+            leg = chain.get("puts" if option_type == "P" else "calls", {}).get(strike, {})
+        context = {
+            "spot": spot,
+            "iv": leg.get("iv"),
+            "events": self.events(ticker),
+        }
+        dte = trade_dte(trade, self.today)
+        threat = strike_threat(
+            trade,
+            context,
+            dte,
+            float(self.thresholds.get("strike_threat_sigma", 0.5)),
+        )
+        if (
+            dte is not None
+            and (
+                dte <= int(self.thresholds.get("manage_dte", 21))
+                or threat.get("status") in {"THREAT", "BREACHED"}
+            )
+        ):
+            context["roll_proposal"] = self.roll_proposal(trade, chain)
+        return context
+
+    def roll_proposal(self, trade: dict[str, Any], current_chain: dict[str, Any]) -> dict[str, Any] | None:
+        if trade_dte(trade, self.today) is None:
+            return None
+        legs, _ = trade_legs(trade)
+        if not legs or len(legs) != 1:
+            return {"status": "UNSUPPORTED", "reason": "defined-risk multi-leg roll requires broker combo support"}
+        identity = short_option_identity(trade)
+        if not identity:
+            return {"status": "UNSUPPORTED", "reason": "roll proposals currently require one short option leg"}
+        ticker = str(trade.get("ticker") or "").upper()
+        current_expiration = str(trade.get("expiration") or "")[:10]
+        candidates = []
+        for raw in self.expirations(ticker):
+            try:
+                dte = (date.fromisoformat(raw) - self.today).days
+            except ValueError:
+                continue
+            if (
+                raw > current_expiration
+                and int(self.thresholds.get("roll_min_dte", 28)) <= dte <= int(self.thresholds.get("roll_max_dte", 50))
+            ):
+                candidates.append((dte, raw))
+        if not candidates:
+            return {"status": "NO_NEXT_CYCLE", "reason": "no next expiration in configured roll window"}
+        next_dte, next_expiration = min(candidates)
+        option_type, current_strike = identity
+        side = "puts" if option_type == "P" else "calls"
+        current_leg = current_chain.get(side, {}).get(current_strike, {})
+        target_delta = current_leg.get("delta")
+        next_chain = self.chain(ticker, next_expiration)
+        spot = self.spot(ticker) or 0
+        eligible = [
+            (strike, leg)
+            for strike, leg in next_chain.get(side, {}).items()
+            if (
+                leg.get("delta") is not None
+                and float(leg.get("bid") or 0) > 0
+                and (
+                    (option_type == "P" and float(strike) < spot * 1.005)
+                    or (option_type == "C" and float(strike) > spot * 0.995)
+                )
+            )
+        ]
+        if target_delta is None or not eligible:
+            return {"status": "NO_LIQUID_MATCH", "reason": "same-delta next-cycle strike unavailable"}
+        next_strike, next_leg = min(
+            eligible,
+            key=lambda item: abs(float(item[1]["delta"]) - float(target_delta)),
+        )
+        close_debit = float(current_leg.get("ask") or current_leg.get("mark") or 0)
+        open_credit = float(next_leg.get("bid") or 0)
+        net_credit = open_credit - close_debit
+        return {
+            "status": "CREDIT_AVAILABLE" if net_credit > 0 else "DEBIT_ONLY",
+            "from_expiration": current_expiration,
+            "from_strike": current_strike,
+            "to_expiration": next_expiration,
+            "to_dte": next_dte,
+            "to_strike": next_strike,
+            "target_delta": round(float(target_delta), 4),
+            "matched_delta": round(float(next_leg["delta"]), 4),
+            "close_debit": round(close_debit, 4),
+            "open_credit": round(open_credit, 4),
+            "net_credit": round(net_credit, 4),
+            "rule": "ROLL_ONLY_FOR_CREDIT",
+        }
 
 
 def print_report(report: dict[str, Any]) -> None:
@@ -169,24 +464,63 @@ def print_report(report: dict[str, Any]) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    add_config_argument(ap)
     ap.add_argument("--journal", default=str(DEFAULT_STATE_FILE))
     ap.add_argument("--db", help="Optional SQLite database; authoritative over the JSON journal when set")
-    ap.add_argument("--profit-target-pct", type=float, default=DEFAULT_THRESHOLDS["profit_target_pct"])
-    ap.add_argument("--stop-loss-pct", type=float, default=DEFAULT_THRESHOLDS["stop_loss_pct"])
-    ap.add_argument("--manage-dte", type=int, default=DEFAULT_THRESHOLDS["manage_dte"])
-    ap.add_argument("--urgent-dte", type=int, default=DEFAULT_THRESHOLDS["urgent_dte"])
+    ap.add_argument("--profit-target-pct", type=float)
+    ap.add_argument("--stop-loss-pct", type=float)
+    ap.add_argument("--manage-dte", type=int)
+    ap.add_argument("--urgent-dte", type=int)
+    ap.add_argument("--strike-threat-sigma", type=float)
+    ap.add_argument("--no-live-context", action="store_true")
     ap.add_argument("--output")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
+    cfg = load_config(args.config)
+    management_cfg = cfg.get("position_management", {})
+    state = load_journal(Path(args.journal), args.db)
+    thresholds = {
+            "profit_target_pct": (
+                args.profit_target_pct
+                if args.profit_target_pct is not None
+                else management_cfg.get("profit_target_pct", DEFAULT_THRESHOLDS["profit_target_pct"])
+            ),
+            "stop_loss_pct": (
+                args.stop_loss_pct
+                if args.stop_loss_pct is not None
+                else management_cfg.get("stop_loss_pct", DEFAULT_THRESHOLDS["stop_loss_pct"])
+            ),
+            "manage_dte": (
+                args.manage_dte
+                if args.manage_dte is not None
+                else management_cfg.get("manage_dte", DEFAULT_THRESHOLDS["manage_dte"])
+            ),
+            "urgent_dte": (
+                args.urgent_dte
+                if args.urgent_dte is not None
+                else management_cfg.get("urgent_dte", DEFAULT_THRESHOLDS["urgent_dte"])
+            ),
+            "strike_threat_sigma": (
+                args.strike_threat_sigma
+                if args.strike_threat_sigma is not None
+                else management_cfg.get("strike_threat_sigma", 0.5)
+            ),
+            "roll_min_dte": management_cfg.get("roll_min_dte", 28),
+            "roll_max_dte": management_cfg.get("roll_max_dte", 50),
+        }
+    contexts = {}
+    open_trades = [trade for trade in state.get("trades", []) if trade.get("status") == "OPEN"]
+    if open_trades and not args.no_live_context:
+        source = LiveManagementSource(cfg)
+        contexts = {
+            str(trade.get("id")): source.context(trade)
+            for trade in open_trades
+        }
     report = build_management_report(
-        load_journal(Path(args.journal), args.db),
-        thresholds={
-            "profit_target_pct": args.profit_target_pct,
-            "stop_loss_pct": args.stop_loss_pct,
-            "manage_dte": args.manage_dte,
-            "urgent_dte": args.urgent_dte,
-        },
+        state,
+        thresholds=thresholds,
+        market_contexts=contexts,
     )
     if args.output:
         Path(args.output).write_text(json.dumps(report, indent=2, default=str))

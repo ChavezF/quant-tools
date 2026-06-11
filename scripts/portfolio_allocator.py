@@ -15,6 +15,7 @@ DEFAULT_LIMITS: dict[str, Any] = {
     "max_positions": 6,
     "max_total_capital_pct": 0.35,
     "max_tail_loss_pct": 0.08,
+    "max_expected_shortfall_pct": 0.08,
     "max_ticker_capital_pct": 0.15,
     "max_group_exposure_pct": 0.35,
     "stress_loss_fraction": 0.65,
@@ -65,7 +66,18 @@ def current_portfolio_delta(actions: list[dict[str, Any]]) -> float:
     return 0.0
 
 
-def allocate_portfolio(plan: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
+def bootstrap_expected_shortfall(risk_report: dict[str, Any] | None) -> float | None:
+    risk = (risk_report or {}).get("risk", risk_report or {})
+    empirical = risk.get("var_bootstrap", {}) if isinstance(risk, dict) else {}
+    value = as_float(empirical.get("expected_shortfall_95"), -1.0)
+    return value if value >= 0 and empirical.get("observations") else None
+
+
+def allocate_portfolio(
+    plan: dict[str, Any],
+    config: dict[str, Any] | None = None,
+    risk_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     configured = config or {}
     limits = {name: configured.get(name, default) for name, default in DEFAULT_LIMITS.items()}
     account_nav = as_float(plan.get("limits", {}).get("account_nav"))
@@ -77,6 +89,10 @@ def allocate_portfolio(plan: dict[str, Any], config: dict[str, Any] | None = Non
 
     capital_budget = account_nav * as_float(limits["max_total_capital_pct"])
     tail_budget = account_nav * as_float(limits["max_tail_loss_pct"])
+    current_expected_shortfall = bootstrap_expected_shortfall(risk_report)
+    expected_shortfall_budget = account_nav * as_float(limits["max_expected_shortfall_pct"])
+    empirical_risk = current_expected_shortfall is not None and account_nav > 0
+    risk_model = "bootstrap_expected_shortfall" if empirical_risk else "fixed_stress_proxy"
     ticker_budget = account_nav * as_float(limits["max_ticker_capital_pct"])
     group_budget_pct = as_float(limits["max_group_exposure_pct"])
     stress_fraction = as_float(limits["stress_loss_fraction"])
@@ -115,7 +131,12 @@ def allocate_portfolio(plan: dict[str, Any], config: dict[str, Any] | None = Non
             reasons.append(f"position limit {int(limits['max_positions'])}")
         if total_capital + capital > capital_budget:
             reasons.append(f"capital budget ${capital_budget:,.0f}")
-        if total_tail_loss + tail_loss > tail_budget:
+        projected_tail_loss = total_tail_loss + tail_loss
+        if empirical_risk:
+            projected_expected_shortfall = current_expected_shortfall + projected_tail_loss
+            if projected_expected_shortfall > expected_shortfall_budget:
+                reasons.append(f"expected-shortfall budget ${expected_shortfall_budget:,.0f}")
+        elif projected_tail_loss > tail_budget:
             reasons.append(f"tail-loss budget ${tail_budget:,.0f}")
         if ticker_capital.get(ticker, 0.0) + capital > ticker_budget:
             reasons.append(f"{ticker} allocation budget ${ticker_budget:,.0f}")
@@ -185,6 +206,11 @@ def allocate_portfolio(plan: dict[str, Any], config: dict[str, Any] | None = Non
             "account_nav": account_nav,
             "capital_budget": round(capital_budget, 2),
             "tail_loss_budget": round(tail_budget, 2),
+            "risk_model": risk_model,
+            "baseline_expected_shortfall_95": (
+                round(current_expected_shortfall, 2) if current_expected_shortfall is not None else None
+            ),
+            "expected_shortfall_budget": round(expected_shortfall_budget, 2),
         },
         "summary": {
             "eligible": len(eligible),
@@ -194,6 +220,14 @@ def allocate_portfolio(plan: dict[str, Any], config: dict[str, Any] | None = Non
             "capital_utilization_pct": round(total_capital / capital_budget * 100, 2) if capital_budget else 0.0,
             "tail_loss_allocated": round(total_tail_loss, 2),
             "tail_budget_utilization_pct": round(total_tail_loss / tail_budget * 100, 2) if tail_budget else 0.0,
+            "projected_expected_shortfall_95": (
+                round(current_expected_shortfall + total_tail_loss, 2) if empirical_risk else None
+            ),
+            "expected_shortfall_budget_utilization_pct": (
+                round((current_expected_shortfall + total_tail_loss) / expected_shortfall_budget * 100, 2)
+                if empirical_risk and expected_shortfall_budget
+                else None
+            ),
             "base_delta": round(base_delta, 2),
             "projected_delta": round(projected_delta, 2),
         },
@@ -246,7 +280,12 @@ def apply_sizing_mode(config: dict[str, Any], sizing_mode: str) -> dict[str, Any
     if multiplier == 1.0:
         return config
     scaled = dict(config)
-    for key in ("max_total_capital_pct", "max_tail_loss_pct", "max_ticker_capital_pct"):
+    for key in (
+        "max_total_capital_pct",
+        "max_tail_loss_pct",
+        "max_expected_shortfall_pct",
+        "max_ticker_capital_pct",
+    ):
         if key in scaled:
             scaled[key] = min(1.0, float(scaled[key]) * multiplier)
     scaled["sizing_mode"] = sizing_mode
@@ -258,6 +297,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     add_config_argument(ap)
     ap.add_argument("--plan", required=True, help="Path to action_plan --json output")
+    ap.add_argument("--risk", help="Path to portfolio_risk --json output")
     ap.add_argument("--sizing-mode", choices=sorted(SIZING_MODE_MULTIPLIERS),
                     default="normal",
                     help="Scale per-NAV caps: cautious=0.5x, normal=1.0x, aggressive=1.5x")
@@ -270,6 +310,7 @@ def main() -> None:
     report = allocate_portfolio(
         json.loads(Path(args.plan).read_text()),
         alloc_cfg,
+        json.loads(Path(args.risk).read_text()) if args.risk else None,
     )
     if args.output:
         Path(args.output).write_text(json.dumps(report, indent=2, default=str))

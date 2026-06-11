@@ -7,7 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from broker_reconciliation import build_reconciliation
+from broker_reconciliation import apply_assignment_updates, build_reconciliation, proposed_assignment_updates
+from common import state_lock
 from storage import (
     DEFAULT_DB_FILE,
     apply_ticket_lifecycle,
@@ -22,10 +23,11 @@ from storage import (
     table_counts,
     ticket_lifecycle_counts,
     upsert_fills,
+    upsert_equity_lots,
     upsert_tickets,
     upsert_trades,
 )
-from trade_journal import DEFAULT_STATE_FILE, load_state
+from trade_journal import DEFAULT_STATE_FILE, load_backend, load_state, save_backend
 
 
 def read_json(path: str | None) -> dict[str, Any]:
@@ -58,6 +60,7 @@ def sync_artifacts(
     try:
         imported = {
             "trades": upsert_trades(con, journal.get("trades", [])),
+            "equity_lots": upsert_equity_lots(con, journal.get("equity_lots", [])),
             "tickets": upsert_tickets(con, tickets),
             "positions": record_position_snapshot(
                 con,
@@ -125,6 +128,11 @@ def main() -> None:
     ap.add_argument("--export-journal")
     ap.add_argument("--pending-expiry-hours", type=float, default=24)
     ap.add_argument("--partial-review-hours", type=float, default=4)
+    ap.add_argument(
+        "--apply-assignments",
+        action="store_true",
+        help="Apply exact broker-confirmed CSP assignments into equity lots",
+    )
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -160,6 +168,18 @@ def main() -> None:
         pending_expiry_hours=args.pending_expiry_hours,
         partial_review_hours=args.partial_review_hours,
     )
+    if args.apply_assignments and lifecycle_events:
+        with state_lock("journal"):
+            current, con = load_backend(Path(args.journal), args.db)
+            try:
+                proposals = proposed_assignment_updates(current, lifecycle_events)
+                assignments = apply_assignment_updates(current, proposals)
+                if assignments["applied_assignment_updates"]:
+                    save_backend(Path(args.journal), assignments["journal"], con)
+                result["applied_assignment_updates"] = assignments["applied_assignment_updates"]
+            finally:
+                if con is not None:
+                    con.close()
     if args.export_journal:
         con = connect(args.db)
         try:
