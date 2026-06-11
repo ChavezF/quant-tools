@@ -50,11 +50,19 @@ def candidate_alerts(plan: dict[str, Any], min_score: float) -> list[dict[str, A
     return out
 
 
-def journal_alerts(journal_state: dict[str, Any], profit_target_pct: float, dte_warning: int) -> list[dict[str, Any]]:
+def journal_alerts(
+    journal_state: dict[str, Any],
+    profit_target_pct: float,
+    dte_warning: int,
+    excluded_trade_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
     out = []
     today = date.today()
+    excluded_trade_ids = excluded_trade_ids or set()
     for trade in journal_state.get("trades", []):
         if trade.get("status") != "OPEN":
+            continue
+        if str(trade.get("id")) in excluded_trade_ids:
             continue
         trade_id = trade.get("id")
         ticker = trade.get("ticker")
@@ -90,6 +98,24 @@ def journal_alerts(journal_state: dict[str, Any], profit_target_pct: float, dte_
                     f"{trade_id} expires in {dte} days",
                     trade,
                 ))
+    return out
+
+
+def management_exception_alerts(management: dict[str, Any] | None) -> list[dict[str, Any]]:
+    out = []
+    for row in (management or {}).get("actions", []):
+        status = row.get("broker_position_status")
+        if status not in {"MISSING_POSITION", "PARTIAL_POSITION", "POSITION_UNKNOWN"}:
+            continue
+        out.append(
+            alert(
+                "MEDIUM" if status == "POSITION_UNKNOWN" else "HIGH",
+                "position_management_exception",
+                f"{row.get('ticker')} {row.get('strategy')}: {status}",
+                (row.get("reasons") or ["Management action withheld"])[0],
+                row,
+            )
+        )
     return out
 
 
@@ -189,12 +215,26 @@ def build_alerts(
     validation: dict[str, Any] | None = None,
     drift: dict[str, Any] | None = None,
     reconciliation: dict[str, Any] | None = None,
+    management: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     alerts = []
     if plan:
         alerts.extend(candidate_alerts(plan, min_score))
     if journal_state:
-        alerts.extend(journal_alerts(journal_state, profit_target_pct, dte_warning))
+        excluded_trade_ids = {
+            str(row.get("trade_id"))
+            for row in (management or {}).get("actions", [])
+            if row.get("broker_position_status") not in {None, "POSITION_FOUND"}
+        }
+        alerts.extend(
+            journal_alerts(
+                journal_state,
+                profit_target_pct,
+                dte_warning,
+                excluded_trade_ids,
+            )
+        )
+    alerts.extend(management_exception_alerts(management))
     alerts.extend(model_health_alerts(validation, drift))
     alerts.extend(execution_exception_alerts(reconciliation))
 
@@ -238,6 +278,7 @@ def main() -> None:
     ap.add_argument("--validation")
     ap.add_argument("--drift")
     ap.add_argument("--reconciliation")
+    ap.add_argument("--management")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -254,6 +295,11 @@ def main() -> None:
         if args.reconciliation and Path(args.reconciliation).exists()
         else None
     )
+    management = (
+        json.loads(Path(args.management).read_text())
+        if args.management and Path(args.management).exists()
+        else None
+    )
     report = build_alerts(
         plan,
         journal_state,
@@ -263,6 +309,7 @@ def main() -> None:
         validation,
         drift,
         reconciliation,
+        management,
     )
     if args.json:
         print(json.dumps(report, indent=2, default=str))

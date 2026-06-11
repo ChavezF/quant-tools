@@ -401,6 +401,41 @@ def record_position_snapshot(
     con.commit()
     return inserted
 
+def load_latest_position_snapshot(con: sqlite3.Connection) -> dict[str, Any]:
+    """Load the latest broker position snapshot, including valid empty states."""
+    latest = con.execute(
+        """
+        SELECT snapshot_at, available, position_count, source
+        FROM broker_position_snapshots
+        ORDER BY snapshot_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if latest is None:
+        return {
+            "snapshot_at": None,
+            "positions_available": False,
+            "position_count": 0,
+            "source": None,
+            "positions": [],
+        }
+    rows = con.execute(
+        """
+        SELECT payload_json
+        FROM broker_positions
+        WHERE snapshot_at = ?
+        ORDER BY symbol
+        """,
+        (latest["snapshot_at"],),
+    ).fetchall()
+    return {
+        "snapshot_at": latest["snapshot_at"],
+        "positions_available": bool(latest["available"]),
+        "position_count": int(latest["position_count"]),
+        "source": latest["source"],
+        "positions": [json.loads(row["payload_json"]) for row in rows],
+    }
+
 
 def insert_option_chain_snapshot(
     con: sqlite3.Connection,

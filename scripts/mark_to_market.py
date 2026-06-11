@@ -34,6 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from broker_reconciliation import reconcile_open_trades
 from common import parse_osi_parts, state_lock
 from data_reliability import retry_call
 from trade_journal import DEFAULT_STATE_FILE, load_backend, save_backend
@@ -154,13 +155,50 @@ def mark_open_trades(
     state: dict[str, Any],
     mark_lookup: MarkLookup,
     now_iso: str | None = None,
+    broker_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     now_iso = now_iso or datetime.now().isoformat()
-    rows = [
-        mark_trade(trade, mark_lookup, now_iso)
-        for trade in state.get("trades", [])
+    open_trades = [
+        trade for trade in state.get("trades", [])
         if trade.get("status") == "OPEN"
     ]
+    position_rows = (
+        reconcile_open_trades(
+            open_trades,
+            broker_snapshot.get("positions", []),
+            positions_available=bool(broker_snapshot.get("positions_available", False)),
+        )
+        if broker_snapshot is not None
+        else []
+    )
+    positions_by_trade = {
+        str(row.get("trade_id")): row
+        for row in position_rows
+    }
+    rows = []
+    for trade in open_trades:
+        position = positions_by_trade.get(str(trade.get("id")))
+        if position and position["status"] != "POSITION_FOUND":
+            status = position["status"]
+            rows.append(
+                {
+                    "trade_id": trade.get("id"),
+                    "ticket_id": trade.get("ticket_id"),
+                    "ticker": trade.get("ticker"),
+                    "strategy": trade.get("strategy"),
+                    "status": "SKIPPED",
+                    "reason": (
+                        "journal trade has no matching broker position"
+                        if status == "MISSING_POSITION"
+                        else "broker position does not fully match journal trade"
+                        if status == "PARTIAL_POSITION"
+                        else "broker position snapshot unavailable"
+                    ),
+                    "broker_position_status": status,
+                }
+            )
+            continue
+        rows.append(mark_trade(trade, mark_lookup, now_iso))
     return {
         "as_of": now_iso,
         "summary": {
@@ -168,6 +206,9 @@ def mark_open_trades(
             "marked": sum(1 for row in rows if row["status"] == "MARKED"),
             "unmarked": sum(1 for row in rows if row["status"] == "UNMARKED"),
             "skipped": sum(1 for row in rows if row["status"] == "SKIPPED"),
+            "phantom_positions": sum(
+                1 for row in rows if row.get("broker_position_status") == "MISSING_POSITION"
+            ),
         },
         "marks": rows,
     }
@@ -255,12 +296,25 @@ def main() -> None:
     with nullcontext() if args.dry_run else state_lock("journal"):
         state, con = load_backend(state_file, args.db)
         has_open = any(trade.get("status") == "OPEN" for trade in state.get("trades", []))
+        broker_snapshot = None
+        if con is not None:
+            from storage import load_latest_position_snapshot
+
+            broker_snapshot = load_latest_position_snapshot(con)
         if has_open:
             from common import get_public_client
 
-            report = mark_open_trades(state, ChainMarkSource(get_public_client()))
+            report = mark_open_trades(
+                state,
+                ChainMarkSource(get_public_client()),
+                broker_snapshot=broker_snapshot,
+            )
         else:
-            report = mark_open_trades(state, lambda *parts: None)
+            report = mark_open_trades(
+                state,
+                lambda *parts: None,
+                broker_snapshot=broker_snapshot,
+            )
         if not args.dry_run and report["summary"]["marked"]:
             save_backend(state_file, state, con)
         if con is not None:

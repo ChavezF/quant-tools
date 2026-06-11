@@ -102,3 +102,24 @@ class HermesOpsTests(unittest.TestCase):
         self.assertIn("10:30 EXECUTABLE SCAN - 2026-06-11 10:30 ET", message)
         self.assertIn("OPEN POSITIONS (1): 0 close, 1 roll", message)
         self.assertIn("QQQ BULL_PUT 2026-07-17 475/470", message)
+
+    def test_executable_message_labels_truncated_candidate_list(self):
+        tickets = [
+            {
+                "decision": "APPROVE",
+                "ticker": ticker,
+                "strategy": "BULL_PUT",
+                "expiration": "2026-07-17",
+                "strikes": "100/95",
+            }
+            for ticker in ("AAPL", "MSFT", "NVDA", "QQQ")
+        ]
+        message = compose_executable_message(
+            timestamp="2026-06-11 10:30 ET",
+            regime="CAUTIOUS",
+            sizing_mode="cautious",
+            management={},
+            tickets={"tickets": tickets},
+            report_dir=Path("/reports/run"),
+        )
+        self.assertIn("EXECUTABLE (showing 3 of 4 approved)", message)

@@ -124,8 +124,14 @@ def format_executable_tickets(report: dict[str, Any], limit: int = 3) -> str:
     ]
     lines = [f"\nCANDIDATES ({len(tickets)})"]
     if actionable:
-        lines.append(f"  EXECUTABLE ({len(actionable)} approved):")
-        for ticket in actionable[:limit]:
+        shown = min(len(actionable), limit)
+        count_text = (
+            f"{len(actionable)} approved"
+            if shown == len(actionable)
+            else f"showing {shown} of {len(actionable)} approved"
+        )
+        lines.append(f"  EXECUTABLE ({count_text}):")
+        for ticket in actionable[:shown]:
             lines.append(
                 f"    {ticket.get('ticker', '?')} {ticket.get('strategy', '?')} "
                 f"{ticket.get('expiration', '?')} {ticket.get('strikes', '?')} "

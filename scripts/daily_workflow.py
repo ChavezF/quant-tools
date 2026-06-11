@@ -374,6 +374,7 @@ def build_alerts_cmd(
     args: argparse.Namespace,
     plan_report: Path,
     reconciliation_report: Path | None = None,
+    management_report: Path | None = None,
 ) -> list[str]:
     alert_cfg = cfg.get("alerts", {})
     journal = args.journal or cfg.get("journal", {}).get("path")
@@ -392,6 +393,8 @@ def build_alerts_cmd(
     cmd += ["--db", storage_db_path(cfg)]
     if reconciliation_report:
         cmd += ["--reconciliation", str(reconciliation_report)]
+    if management_report:
+        cmd += ["--management", str(management_report)]
     return cmd
 
 
@@ -852,6 +855,7 @@ def main() -> None:
                 args,
                 plan_report,
                 reconciliation_report if storage_enabled else None,
+                management_report if management_enabled else None,
             )
             manifest["steps"].append(run_command("alerts", alerts_cmd, run_dir, dry_run=True))
         elif plan_report.exists():
@@ -860,6 +864,7 @@ def main() -> None:
                 args,
                 plan_report,
                 reconciliation_report if reconciliation_report.exists() else None,
+                management_report if management_report.exists() else None,
             )
             alerts_meta = run_command("alerts", alerts_cmd, run_dir, dry_run=False)
             manifest["steps"].append(alerts_meta)

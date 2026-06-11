@@ -225,8 +225,30 @@ class MarkToMarketTests(unittest.TestCase):
         closed = open_trade(id="T-CLOSED", status="CLOSED", realized_pnl=80.0)
         state = {"trades": [open_trade(entry_credit=2.0), closed]}
         report = mark_open_trades(state, lookup_from({("P", 475.0): 1.0}), now_iso="now")
-        self.assertEqual(report["summary"], {"open_trades": 1, "marked": 1, "unmarked": 0, "skipped": 0})
+        self.assertEqual(
+            report["summary"],
+            {
+                "open_trades": 1,
+                "marked": 1,
+                "unmarked": 0,
+                "skipped": 0,
+                "phantom_positions": 0,
+            },
+        )
         self.assertNotIn("marked_at", closed)
+
+    def test_mark_skips_trade_missing_from_available_broker_snapshot(self):
+        trade = open_trade()
+        report = mark_open_trades(
+            {"trades": [trade]},
+            lookup_from({("P", 475.0): 1.0}),
+            now_iso="now",
+            broker_snapshot={"positions_available": True, "positions": []},
+        )
+        self.assertEqual(report["summary"]["marked"], 0)
+        self.assertEqual(report["summary"]["phantom_positions"], 1)
+        self.assertEqual(report["marks"][0]["broker_position_status"], "MISSING_POSITION")
+        self.assertNotIn("marked_at", trade)
 
     def test_marked_journal_fires_profit_target_alert(self):
         # End-to-end for the management rule: mark at 50% decay, alert fires.
@@ -253,6 +275,25 @@ class MarkToMarketTests(unittest.TestCase):
         )
         kinds = {alert["kind"] for alert in report["alerts"]}
         self.assertNotIn("profit_target", kinds)
+
+    def test_phantom_management_suppresses_journal_pnl_alert(self):
+        trade = open_trade(unrealized_pnl_pct=75.0)
+        management = build_management_report(
+            {"trades": [trade]},
+            today=date(2026, 6, 11),
+            broker_snapshot={"positions_available": True, "positions": []},
+        )
+        report = build_alerts(
+            plan=None,
+            journal_state={"trades": [trade]},
+            min_score=68.0,
+            profit_target_pct=50.0,
+            dte_warning=0,
+            management=management,
+        )
+        kinds = {alert["kind"] for alert in report["alerts"]}
+        self.assertNotIn("profit_target", kinds)
+        self.assertIn("position_management_exception", kinds)
 
 
 class PositionManagementTests(unittest.TestCase):
@@ -371,6 +412,29 @@ class PositionManagementTests(unittest.TestCase):
         self.assertEqual(rows["NOMARK"]["action"], "REVIEW")
         self.assertEqual(rows["NODATA"]["action"], "REVIEW")
         self.assertEqual(report["summary"]["review"], 2)
+
+    def test_missing_broker_position_is_reviewed_not_closed(self):
+        trade = open_trade(
+            id="PHANTOM",
+            expiration="2026-07-17",
+            unrealized_pnl_pct=-580.0,
+        )
+        report = build_management_report(
+            {"trades": [trade]},
+            today=self.TODAY,
+            broker_snapshot={
+                "snapshot_at": "2026-06-11T10:16:35",
+                "positions_available": True,
+                "positions": [],
+            },
+        )
+        row = report["actions"][0]
+        self.assertEqual(row["action"], "REVIEW")
+        self.assertEqual(row["urgency"], "HIGH")
+        self.assertEqual(row["broker_position_status"], "MISSING_POSITION")
+        self.assertIn("PHANTOM", row["reasons"][0])
+        self.assertEqual(report["summary"]["close"], 0)
+        self.assertEqual(report["summary"]["phantom_positions"], 1)
 
     def test_closed_trades_are_ignored_and_high_urgency_sorts_first(self):
         _, report = self.manage(

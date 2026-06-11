@@ -105,7 +105,6 @@ def run_executable_pipeline(report_dir: Path, sizing_mode: str) -> tuple[bool, s
         return False, proc.stderr.strip()[:300]
     return True, ""
 
-
 def send_telegram(message: str) -> bool:
     if not message.strip():
         return False

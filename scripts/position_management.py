@@ -33,6 +33,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from broker_reconciliation import reconcile_open_trades
 from mark_to_market import trade_legs
 from toolkit_config import add_config_argument, load_config
 from trade_journal import DEFAULT_STATE_FILE, load_journal
@@ -244,19 +245,77 @@ def build_management_report(
     thresholds: dict[str, Any] | None = None,
     today: date | None = None,
     market_contexts: dict[str, dict[str, Any]] | None = None,
+    broker_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     thresholds = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
     today = today or date.today()
-    actions = [
-        evaluate_trade(trade, thresholds, today, (market_contexts or {}).get(str(trade.get("id")), {}))
-        for trade in state.get("trades", [])
+    open_trades = [
+        trade for trade in state.get("trades", [])
         if trade.get("status") == "OPEN"
     ]
+    position_rows = (
+        reconcile_open_trades(
+            open_trades,
+            broker_snapshot.get("positions", []),
+            positions_available=bool(broker_snapshot.get("positions_available", False)),
+        )
+        if broker_snapshot is not None
+        else []
+    )
+    positions_by_trade = {
+        str(row.get("trade_id")): row
+        for row in position_rows
+    }
+    actions = []
+    for trade in open_trades:
+        position = positions_by_trade.get(str(trade.get("id")))
+        if position and position["status"] != "POSITION_FOUND":
+            status = position["status"]
+            if status == "MISSING_POSITION":
+                reason = "PHANTOM: journal trade has no matching broker position"
+                urgency = "HIGH"
+            elif status == "PARTIAL_POSITION":
+                reason = "BROKER_MISMATCH: only part of the journal structure is held"
+                urgency = "HIGH"
+            else:
+                reason = "BROKER_UNKNOWN: position snapshot unavailable; management action withheld"
+                urgency = "MEDIUM"
+            actions.append(
+                {
+                    **evaluate_trade(
+                        trade,
+                        thresholds,
+                        today,
+                        (market_contexts or {}).get(str(trade.get("id")), {}),
+                    ),
+                    "action": "REVIEW",
+                    "urgency": urgency,
+                    "reasons": [reason],
+                    "broker_position_status": status,
+                    "position_symbols": position.get("position_symbols", []),
+                }
+            )
+            continue
+        row = evaluate_trade(
+            trade,
+            thresholds,
+            today,
+            (market_contexts or {}).get(str(trade.get("id")), {}),
+        )
+        if position:
+            row["broker_position_status"] = position["status"]
+            row["position_symbols"] = position.get("position_symbols", [])
+        actions.append(row)
     urgency_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     actions.sort(key=lambda row: (urgency_order.get(row["urgency"], 9), row["dte"] if row["dte"] is not None else 9999))
     return {
         "as_of": datetime.now().isoformat(),
         "today": today.isoformat(),
+        "broker_snapshot": {
+            "snapshot_at": (broker_snapshot or {}).get("snapshot_at"),
+            "positions_available": (broker_snapshot or {}).get("positions_available"),
+            "source": (broker_snapshot or {}).get("source"),
+        },
         "thresholds": thresholds,
         "summary": {
             "open_trades": len(actions),
@@ -271,6 +330,15 @@ def build_management_report(
             "event_spans": sum(1 for row in actions if row["event_span"]),
             "credit_rolls": sum(
                 1 for row in actions if (row.get("roll_proposal") or {}).get("status") == "CREDIT_AVAILABLE"
+            ),
+            "phantom_positions": sum(
+                1 for row in actions if row.get("broker_position_status") == "MISSING_POSITION"
+            ),
+            "partial_positions": sum(
+                1 for row in actions if row.get("broker_position_status") == "PARTIAL_POSITION"
+            ),
+            "unknown_positions": sum(
+                1 for row in actions if row.get("broker_position_status") == "POSITION_UNKNOWN"
             ),
         },
         "actions": actions,
@@ -509,6 +577,15 @@ def main() -> None:
             "roll_min_dte": management_cfg.get("roll_min_dte", 28),
             "roll_max_dte": management_cfg.get("roll_max_dte", 50),
         }
+    broker_snapshot = None
+    if args.db:
+        from storage import connect, load_latest_position_snapshot
+
+        con = connect(args.db)
+        try:
+            broker_snapshot = load_latest_position_snapshot(con)
+        finally:
+            con.close()
     contexts = {}
     open_trades = [trade for trade in state.get("trades", []) if trade.get("status") == "OPEN"]
     if open_trades and not args.no_live_context:
@@ -521,6 +598,7 @@ def main() -> None:
         state,
         thresholds=thresholds,
         market_contexts=contexts,
+        broker_snapshot=broker_snapshot,
     )
     if args.output:
         Path(args.output).write_text(json.dumps(report, indent=2, default=str))
