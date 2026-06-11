@@ -160,6 +160,19 @@ def main() -> int:
         return 1
 
     latest = latest_report_dir(report_dir)
+    if not latest:
+        # Mirror cron_morning_workflow.py: failing loud beats a silent empty
+        # Telegram message. The pipeline subprocess reported success but
+        # produced no timestamped subdir under report_dir.
+        send_failure_alert(
+            "manifest",
+            f"executable pipeline reported success but no timestamped subdir under {report_dir}",
+        )
+        print(
+            f"⚠️ Executable scan failed at manifest: no subdir under {report_dir}",
+            file=sys.stderr,
+        )
+        return 1
 
     # 3. Compose message
     composed = compose_executable_message(
