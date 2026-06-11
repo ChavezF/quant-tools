@@ -110,13 +110,68 @@ def format_management(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_executable_tickets(report: dict[str, Any], limit: int = 3) -> str:
+def _classify_ivr(rank: float | None) -> str:
+    """Local mirror of iv_rank.classify_iv_regime — keep in sync.
+
+    Kept local so hermes_ops stays a pure helper (no yfinance / network
+    deps) and the test suite can pin the bands here directly. The test
+    test_ivr_classifier_matches_iv_rank_module asserts parity with
+    scripts/iv_rank.py so a drift in either side fails loudly.
+    """
+    if rank is None:
+        return "?"
+    if rank < 25:
+        return "low (buy premium)"
+    if rank < 50:
+        return "below-median (cautious sell)"
+    if rank < 75:
+        return "above-median (sell premium)"
+    return "high (aggressive sell)"
+
+
+def format_executable_tickets(
+    report: dict[str, Any],
+    limit: int = 3,
+    *,
+    iv_ranks: dict[str, float] | None = None,
+) -> str:
+    """Render the candidate-tickets block for the 10:30 Telegram message.
+
+    iv_ranks: optional {ticker -> IVR (0-100)}. When provided, tickets
+    whose ticker's IVR is below 50 ("low" or "below-median / cautious sell"
+    bands per iv_rank.classify_iv_regime) are demoted from EXECUTABLE to
+    a "HELD BY IVR" section with the regime annotation. Mirrors the
+    portfolio-level IVRank guard in portfolio_allocator.py:264
+    ("half size until ... portfolio IVRank > 50"). Tickers missing from
+    the dict are NOT demoted — we don't silently hold on missing data.
+    When iv_ranks is None the gate is bypassed entirely (backward compat
+    for callers / dev runs that don't fetch IVR).
+    """
     tickets = report.get("tickets", [])
+
+    def _ivr_holds(ticket: dict[str, Any]) -> bool:
+        if not iv_ranks:
+            return False
+        ticker = str(ticket.get("ticker", "")).upper()
+        if ticker not in iv_ranks:
+            return False
+        try:
+            return float(iv_ranks[ticker]) < 50.0
+        except (TypeError, ValueError):
+            return False
+
     if not tickets:
         return "\nNO CANDIDATES TODAY"
+    approved_decisions = {"APPROVE", "STRONG"}
     actionable = [
         ticket for ticket in tickets
-        if str(ticket.get("decision", "")).upper() in {"APPROVE", "STRONG"}
+        if str(ticket.get("decision", "")).upper() in approved_decisions
+        and not _ivr_holds(ticket)
+    ]
+    held_by_ivr = [
+        ticket for ticket in tickets
+        if str(ticket.get("decision", "")).upper() in approved_decisions
+        and _ivr_holds(ticket)
     ]
     reduced = [
         ticket for ticket in tickets
@@ -138,6 +193,17 @@ def format_executable_tickets(report: dict[str, Any], limit: int = 3) -> str:
                 f"credit>={ticket.get('limit_credit', '?')} "
                 f"floor={ticket.get('do_not_chase_below', '?')} score={ticket.get('score', '?')}"
             )
+    if held_by_ivr:
+        iv_ranks_map = iv_ranks or {}
+        lines.append(f"  HELD BY IVR ({len(held_by_ivr)}):")
+        for ticket in held_by_ivr[:limit]:
+            ticker = str(ticket.get("ticker", "?")).upper()
+            ivr = float(iv_ranks_map.get(ticker, 0))
+            lines.append(
+                f"    {ticker} {ticket.get('strategy', '?')} "
+                f"{ticket.get('expiration', '?')} {ticket.get('strikes', '?')} "
+                f"score={ticket.get('score', '?')}: IVR={ivr:.0f} ({_classify_ivr(ivr)})"
+            )
     if reduced:
         lines.append(f"  REDUCED SIZE ({len(reduced)} flagged):")
         for ticket in reduced[:limit]:
@@ -157,7 +223,7 @@ def format_executable_tickets(report: dict[str, Any], limit: int = 3) -> str:
                 f"size x{ticket.get('size_multiplier', '?')} score={ticket.get('score', '?')}: "
                 f"{' | '.join(reasons)[:80] or 'see plan for details'}"
             )
-    if not actionable and not reduced:
+    if not actionable and not reduced and not held_by_ivr:
         lines.append(f"  All {len(tickets)} candidates are HOLD.")
     return "\n".join(lines)
 
@@ -189,11 +255,12 @@ def compose_executable_message(
     tickets: dict[str, Any],
     report_dir: Path | None,
     limit: int = TELEGRAM_LIMIT,
+    iv_ranks: dict[str, float] | None = None,
 ) -> str:
     message = (
         f"10:30 EXECUTABLE SCAN - {timestamp}\n"
         f"Regime: {regime or 'UNKNOWN'} | sizing: {sizing_mode}"
         f"{format_management(management)}"
-        f"{format_executable_tickets(tickets)}"
+        f"{format_executable_tickets(tickets, iv_ranks=iv_ranks)}"
     ).strip()
     return truncate_message(message, report_dir, limit)

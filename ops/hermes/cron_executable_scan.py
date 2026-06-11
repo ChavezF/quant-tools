@@ -28,11 +28,13 @@ exit = error alert via the scheduler.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 PROJECT = Path(os.environ.get("QUANT_TOOLS_HOME", "/home/chavez_f/code/quant-tools"))
 SCRIPTS = PROJECT / "scripts"
@@ -105,6 +107,67 @@ def run_executable_pipeline(report_dir: Path, sizing_mode: str) -> tuple[bool, s
         return False, proc.stderr.strip()[:300]
     return True, ""
 
+def fetch_iv_ranks_for_tickets(
+    tickets_report: dict[str, Any],
+    *,
+    timeout: int = 120,
+) -> dict[str, float]:
+    """Fetch live IVR for the actionable tickers in a tickets report.
+
+    Returns a {ticker_upper: iv_rank} dict for the IVR-gate in
+    compose_executable_message. Returns {} on any failure so the gate
+    is bypassed (backward compat — see format_executable_tickets).
+
+    Only APPROVE/STRONG tickets are queried, to minimize API calls.
+    Duplicate tickers are deduped. The iv_rank.py subprocess is run from
+    SCRIPTS so the existing import path resolves.
+    """
+    if not tickets_report:
+        return {}
+    seen: set[str] = set()
+    for ticket in tickets_report.get("tickets", []):
+        if str(ticket.get("decision", "")).upper() not in {"APPROVE", "STRONG"}:
+            continue
+        ticker = str(ticket.get("ticker", "")).strip().upper()
+        if ticker:
+            seen.add(ticker)
+    if not seen:
+        return {}
+    try:
+        proc = subprocess.run(
+            [PY, "iv_rank.py", "--tickers", *sorted(seen), "--json"],
+            capture_output=True, text=True, timeout=timeout,
+            cwd=str(SCRIPTS),
+        )
+    except subprocess.TimeoutExpired:
+        print(f"[{now_str()}] IVR fetch timed out after {timeout}s; gate bypassed", file=sys.stderr)
+        return {}
+    except Exception as e:
+        print(f"[{now_str()}] IVR fetch failed: {e}; gate bypassed", file=sys.stderr)
+        return {}
+    if proc.returncode != 0:
+        print(
+            f"[{now_str()}] iv_rank.py exited {proc.returncode}: {proc.stderr.strip()[:200]}; gate bypassed",
+            file=sys.stderr,
+        )
+        return {}
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        print(f"[{now_str()}] iv_rank.py output not JSON: {e}; gate bypassed", file=sys.stderr)
+        return {}
+    out: dict[str, float] = {}
+    for ticker, metrics in (payload.get("tickers") or {}).items():
+        rank = metrics.get("iv_rank")
+        if rank is None:
+            continue
+        try:
+            out[str(ticker).upper()] = float(rank)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def send_telegram(message: str) -> bool:
     if not message.strip():
         return False
@@ -174,14 +237,36 @@ def main() -> int:
         )
         return 1
 
+    tickets_report = read_report(latest / "tickets.json") if latest else {}
+    management_report = read_report(latest / "management.json") if latest else {}
+
+    # 2b. Fetch live IVR for actionable tickers so the IVR gate in
+    # compose_executable_message (format_executable_tickets) can demote
+    # IVR<50 candidates from EXECUTABLE to HELD BY IVR. SCAN_DISCREPANCIES
+    # item #5. Failure to fetch is non-fatal — an empty iv_ranks dict
+    # bypasses the gate (backward compat).
+    iv_ranks = fetch_iv_ranks_for_tickets(tickets_report)
+    if iv_ranks:
+        held = [
+            t for t in tickets_report.get("tickets", [])
+            if str(t.get("decision", "")).upper() in {"APPROVE", "STRONG"}
+            and float(iv_ranks.get(str(t.get("ticker", "")).upper(), 100)) < 50
+        ]
+        print(
+            f"[{now_str()}] IVR gate: {len(iv_ranks)} tickers checked, "
+            f"{len(held)} held by IVR (<50)",
+            file=sys.stderr,
+        )
+
     # 3. Compose message
     composed = compose_executable_message(
         timestamp=now_str(),
         regime=verdict,
         sizing_mode=sizing_mode,
-        management=read_report(latest / "management.json") if latest else {},
-        tickets=read_report(latest / "tickets.json") if latest else {},
+        management=management_report,
+        tickets=tickets_report,
         report_dir=latest,
+        iv_ranks=iv_ranks,
     )
 
     # 4. Send

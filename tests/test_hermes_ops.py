@@ -11,6 +11,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from hermes_ops import (
+    _classify_ivr,
     compose_executable_message,
     compose_planning_message,
     planning_brief,
@@ -123,3 +124,121 @@ class HermesOpsTests(unittest.TestCase):
             report_dir=Path("/reports/run"),
         )
         self.assertIn("EXECUTABLE (showing 3 of 4 approved)", message)
+
+    def test_executable_message_holds_ivr_below_fifty(self):
+        # Regression: SCAN_DISCREPANCIES_2026-06-11 item #5 — the executable
+        # scan promoted NVDA (IVR 43) and MSFT (IVR 45) bull puts despite
+        # the brief classifying both as "below-median (cautious sell)".
+        # Fix: when iv_ranks is provided, tickets whose ticker's IVR is
+        # below 50 are demoted from EXECUTABLE into a "HELD BY IVR" line
+        # with the reason rendered. Mirrors the existing portfolio-level
+        # IVRank guard in portfolio_allocator.py:264 ("half size until
+        # ... portfolio IVRank > 50").
+        tickets = [
+            {
+                "decision": "APPROVE", "ticker": "QQQ", "strategy": "BULL_PUT",
+                "expiration": "2026-07-17", "strikes": "685/682",
+                "limit_credit": 0.88, "do_not_chase_below": 0.81, "score": 63.3,
+            },
+            {
+                "decision": "APPROVE", "ticker": "NVDA", "strategy": "BULL_PUT",
+                "expiration": "2026-07-17", "strikes": "195/190",
+                "limit_credit": 1.20, "do_not_chase_below": 1.10, "score": 57.3,
+            },
+            {
+                "decision": "APPROVE", "ticker": "MSFT", "strategy": "BULL_PUT",
+                "expiration": "2026-07-17", "strikes": "375/370",
+                "limit_credit": 1.36, "do_not_chase_below": 1.24, "score": 62.1,
+            },
+        ]
+        message = compose_executable_message(
+            timestamp="2026-06-11 10:30 ET",
+            regime="AGGRESSIVE",
+            sizing_mode="aggressive",
+            management={},
+            tickets={"tickets": tickets},
+            report_dir=Path("/reports/run"),
+            iv_ranks={"QQQ": 88.0, "NVDA": 43.0, "MSFT": 45.0},
+        )
+        # QQQ (IVR 88, above-median) stays in EXECUTABLE
+        self.assertIn("EXECUTABLE", message)
+        self.assertRegex(
+            message,
+            r"EXECUTABLE \([01] approved\):",
+            "EXECUTABLE header should show only the surviving approved count",
+        )
+        self.assertIn("QQQ BULL_PUT 2026-07-17 685/682", message)
+        # NVDA + MSFT (IVR < 50) are demoted to HELD BY IVR
+        self.assertIn("HELD BY IVR", message)
+        held_block = message.split("HELD BY IVR", 1)[1]
+        # The held block lists both tickers with their IVRs and the regime.
+        self.assertIn("NVDA", held_block)
+        self.assertIn("MSFT", held_block)
+        self.assertIn("43", held_block, "NVDA IVR 43 should appear in held block")
+        self.assertIn("45", held_block, "MSFT IVR 45 should appear in held block")
+        self.assertIn("cautious", held_block.lower(), "regime annotation should mention cautious")
+
+    def test_executable_message_keeps_all_when_no_iv_ranks(self):
+        # Backward compat: callers that don't supply iv_ranks (or whose
+        # lookup returns nothing) get the old behavior — every APPROVE
+        # ticket stays in EXECUTABLE. Important for the dev path and
+        # for runs where the IVR fetch fails.
+        tickets = [
+            {
+                "decision": "APPROVE", "ticker": "NVDA", "strategy": "BULL_PUT",
+                "expiration": "2026-07-17", "strikes": "195/190",
+                "limit_credit": 1.20, "do_not_chase_below": 1.10, "score": 57.3,
+            },
+        ]
+        message = compose_executable_message(
+            timestamp="2026-06-11 10:30 ET",
+            regime="AGGRESSIVE",
+            sizing_mode="aggressive",
+            management={},
+            tickets={"tickets": tickets},
+            report_dir=Path("/reports/run"),
+        )
+        self.assertIn("EXECUTABLE (1 approved):", message)
+        self.assertNotIn("HELD BY IVR", message)
+
+    def test_executable_message_ignores_tickers_missing_from_iv_ranks(self):
+        # If a ticket's ticker isn't in the iv_ranks dict (data unavailable
+        # for that symbol), it stays in EXECUTABLE — we don't silently
+        # demote on missing data.
+        tickets = [
+            {
+                "decision": "APPROVE", "ticker": "QQQ", "strategy": "BULL_PUT",
+                "expiration": "2026-07-17", "strikes": "685/682",
+                "limit_credit": 0.88, "do_not_chase_below": 0.81, "score": 63.3,
+            },
+            {
+                "decision": "APPROVE", "ticker": "NEWCO", "strategy": "BULL_PUT",
+                "expiration": "2026-07-17", "strikes": "50/45",
+                "limit_credit": 0.50, "do_not_chase_below": 0.45, "score": 70.0,
+            },
+        ]
+        message = compose_executable_message(
+            timestamp="2026-06-11 10:30 ET",
+            regime="AGGRESSIVE",
+            sizing_mode="aggressive",
+            management={},
+            tickets={"tickets": tickets},
+            report_dir=Path("/reports/run"),
+            iv_ranks={"QQQ": 88.0},  # NEWCO missing
+        )
+        self.assertIn("EXECUTABLE (2 approved):", message)
+        self.assertIn("NEWCO", message)
+        self.assertNotIn("HELD BY IVR", message)
+
+    def test_ivr_classifier_matches_iv_rank_module(self):
+        # The local _classify_ivr in hermes_ops must stay in lockstep with
+        # iv_rank.classify_iv_regime so the HELD BY IVR annotation matches
+        # the brief's wording. Test the band boundaries on both sides.
+        from iv_rank import classify_iv_regime
+
+        for rank in (0, 10, 24.99, 25, 30, 49.99, 50, 60, 74.99, 75, 90, None):
+            self.assertEqual(
+                _classify_ivr(rank),
+                classify_iv_regime(rank),
+                f"band mismatch at rank={rank}",
+            )
